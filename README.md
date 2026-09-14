@@ -60,6 +60,12 @@ merge:
 real bug in this codebase so far — see the ADRs for each one — so it's required rather than
 main-only.
 
+`main` is branch-protected: all four jobs above are required status checks (with "require branches
+to be up to date" on), force pushes and branch deletion are disabled, and `enforce_admins` is on —
+so even the repo owner pushes through a PR, not directly to `main`. This PR is the first one opened
+after that was turned on, specifically to prove the required-checks gate actually blocks a merge
+until all four jobs are green.
+
 ## Repository layout
 
 ```
