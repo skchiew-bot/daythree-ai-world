@@ -21,3 +21,15 @@ class TaskResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     created_at: datetime
+
+
+class TaskCompleteExternalRequest(BaseModel):
+    """See routes/tasks.py::complete_task_external — for a task assigned to an
+    externally-executed agent (runtime_adapter != "custom_durable"), the caller has
+    already done the real work outside Daythree and is reporting the result."""
+
+    output_text: str
+
+
+class TaskFailExternalRequest(BaseModel):
+    reason: str
