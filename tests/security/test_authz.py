@@ -116,25 +116,60 @@ async def test_viewer_cannot_create_an_agent(client, two_tenants):
 
 
 @pytest.mark.asyncio
-async def test_admin_can_create_an_agent(client, two_tenants):
-    token = await _login(client, two_tenants["admin_a"].email)
-    policy_id = new_id()  # no real ModelPolicy row — see the assertion note below
+async def test_admin_can_create_an_agent(client, two_tenants, db_session):
+    from common.db.models import ModelPolicy
 
+    policy = ModelPolicy(
+        id=new_id(), tenant_id=two_tenants["tenant_a"].id, name="test-policy",
+        primary_provider="mock", primary_model="mock-model",
+    )
+    db_session.add(policy)
+    await db_session.commit()
+
+    token = await _login(client, two_tenants["admin_a"].email)
     response = await client.post(
         "/api/v1/agents",
         headers={"Authorization": f"Bearer {token}"},
         json={
             "agent_code": "AGT-VALID", "display_name": "Valid Agent",
             "version": {
-                "model_policy_id": str(policy_id),
+                "system_prompt": "Say hi.",
+                "model_policy_id": str(policy.id),
                 "tool_policy": {"allow": ["artifact.write"], "deny": ["*"]},
             },
         },
     )
-    # No such model_policy row exists yet, so this is expected to fail at the DB FK
-    # level (409/500) rather than at the authz layer (403) — the point of this test is
-    # that a tenant_admin is NOT blocked by role, unlike the viewer above.
-    assert response.status_code != 403
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_reference_another_tenants_model_policy(client, two_tenants, db_session):
+    """guardian-gatekeeper (PATCH /model-policies gate review, finding FP-2): before the
+    fix, model_policy_id was accepted from the client with only an FK check — no tenant
+    predicate — so tenant A could silently bind an agent to tenant B's policy row."""
+    from common.db.models import ModelPolicy
+
+    tenant_b_policy = ModelPolicy(
+        id=new_id(), tenant_id=two_tenants["tenant_b"].id, name="tenant-b-policy",
+        primary_provider="mock", primary_model="mock-model",
+    )
+    db_session.add(tenant_b_policy)
+    await db_session.commit()
+
+    token_a = await _login(client, two_tenants["admin_a"].email)
+    response = await client.post(
+        "/api/v1/agents",
+        headers={"Authorization": f"Bearer {token_a}"},
+        json={
+            "agent_code": "AGT-CROSS-TENANT", "display_name": "Cross Tenant",
+            "version": {
+                "system_prompt": "Say hi.",
+                "model_policy_id": str(tenant_b_policy.id),
+                "tool_policy": {"allow": ["artifact.write"], "deny": ["*"]},
+            },
+        },
+    )
+    assert response.status_code == 400
 
 
 @pytest.mark.asyncio

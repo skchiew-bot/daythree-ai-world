@@ -131,6 +131,11 @@ class EventType(str, Enum):
     runtime_checkpoint_created = "runtime.checkpoint_created"
     runtime_recovered = "runtime.recovered"
 
+    # guardian-gatekeeper (2026-09-15, "PATCH /model-policies" gate review): a
+    # ModelPolicy is created-only, never edited in place (see routes.model_policies) —
+    # this is its one lifecycle event, mirroring agent.created's role for Agent.
+    model_policy_created = "model_policy.created"
+
     model_requested = "model.requested"
     model_completed = "model.completed"
     model_failed = "model.failed"
