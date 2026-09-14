@@ -1,5 +1,18 @@
 {
-  "_comment": "Copy this to .claude/settings.local.json (gitignored — never commit real credentials) to have this Claude Code session automatically report its status into the running daythree-ai-world stack's 3D World page. Requires the stack to be up locally (docker compose up -d) and DAYTHREE_ADMIN_PASSWORD to match your seeded admin password. Adjust DAYTHREE_API_BASE_URL if your API isn't on the default port (e.g. a XAMPP/other-service port conflict, see docker-compose.override.yml.example if present).",
+  "_comment": "Copy this to .claude/settings.local.json (gitignored — never commit real credentials) to have this Claude Code session automatically report its status into the running daythree-ai-world stack's 3D World page.",
+  "_setup": [
+    "1. Bring the stack up locally: docker compose up -d (then run migrations + seed).",
+    "2. Copy .claude/hook_working.sh.example -> .claude/hook_working.sh and .claude/hook_stop.sh.example -> .claude/hook_stop.sh, editing DAYTHREE_API_BASE_URL/DAYTHREE_ADMIN_PASSWORD for your machine (they're gitignored too).",
+    "3. Copy this file to .claude/settings.local.json, adjusting the two absolute paths below (to bash.exe and to the hook_*.sh scripts) for your machine.",
+    "4. Start a NEW Claude Code session in this project — settings appear to load once at session start, not hot-reload mid-session."
+  ],
+  "_why_this_shape": [
+    "The hook `command` is a single simple 'bash.exe --login \"path\"' invocation with no nested quoting, env-var-prefix syntax, or backgrounding ('&') — all three were tried and failed on Windows:",
+    "- A trailing '&' to background the curl calls got killed before completing, apparently because the hook runner tears down the process tree before an orphaned background job finishes.",
+    "- An unqualified `bash` (no path) inside the script resolved to Windows' own WSL bash launcher (C:\\Windows\\System32\\bash.exe), not Git Bash — WSL has a completely different filesystem view where 'C:/...' paths don't exist, producing a confusing 'No such file or directory' for a file that's actually there. Fix: always use the fully-qualified Git Bash path.",
+    "- Without '--login', Git Bash's own coreutils (dirname/date/sed) weren't on PATH, since normal profile setup didn't run. Fix: pass --login to bash.exe.",
+    "All the machine-specific config (base URL, admin password) lives in the small hook_working.sh/hook_stop.sh wrapper scripts, not inline in this JSON — much easier to get the quoting right with one thing changing (the wrapper's path) instead of several."
+  ],
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,8 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DAYTHREE_API_BASE_URL=http://localhost:8000 DAYTHREE_ADMIN_PASSWORD=ChangeMe123! bash scripts/report_claude_status.sh working 'Responding in Claude Code' >/dev/null 2>&1 &",
-            "timeout": 5
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/.claude/hook_working.sh\"",
+            "timeout": 8
           }
         ]
       }
@@ -19,8 +32,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "DAYTHREE_API_BASE_URL=http://localhost:8000 DAYTHREE_ADMIN_PASSWORD=ChangeMe123! bash scripts/report_claude_status.sh done 'Finished responding' >/dev/null 2>&1 &",
-            "timeout": 5
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/.claude/hook_stop.sh\"",
+            "timeout": 8
           }
         ]
       }
