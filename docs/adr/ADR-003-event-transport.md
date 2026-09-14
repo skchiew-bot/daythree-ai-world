@@ -41,6 +41,16 @@ event broadcast — no Celery, no Dramatiq.
 
 ## Consequences
 
+- **The Redis client used for `BRPOP` must be constructed with `socket_timeout=None`.**
+  redis-py applies its own client-side socket read timeout independently of a blocking
+  command's own `timeout` argument; whichever is shorter wins, and a default/finite
+  socket_timeout races BRPOP's server-side block and raises `redis.exceptions.
+  TimeoutError` on nearly every poll. Combined with `docker-compose.yml`'s `restart:
+  unless-stopped` on the worker (added for an unrelated startup-ordering race), this
+  crash-looped the worker container indefinitely — found by CI's E2E job, whose
+  longer sustained-polling runtime exposed it in a way the resilience suite's one-shot
+  `docker compose kill worker` never would have. Fixed in `services/worker/deps.py::
+  build_redis_client`.
 - No built-in task scheduling/cron, priority queues, or multi-queue routing — none of
   which Phase 0 needs (one task type, one queue).
 - Horizontal scaling of the worker (multiple replicas) works today (Redis `BRPOP` is

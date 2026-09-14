@@ -58,7 +58,16 @@ async def run_forever() -> None:
             pass  # Windows: signal handlers for SIGTERM aren't supported in the event loop
 
     while not stop_event.is_set():
-        task_id = await dequeue_task(redis_client, timeout_seconds=5)
+        try:
+            task_id = await dequeue_task(redis_client, timeout_seconds=5)
+        except Exception:
+            # A transient Redis hiccup here must not crash the whole process — that
+            # would discard in-memory loop state for no reason now that the queue
+            # client itself no longer races its own blocking timeout (see
+            # `worker.deps.build_redis_client`). Log and retry the poll.
+            logger.exception("dequeue_failed")
+            await asyncio.sleep(1)
+            continue
         if task_id is None:
             continue
 

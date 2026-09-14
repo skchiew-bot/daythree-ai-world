@@ -39,7 +39,20 @@ def build_object_store(settings: Settings) -> ObjectStore:
 
 
 def build_redis_client(settings: Settings) -> redis_asyncio.Redis:
-    return redis_asyncio.from_url(settings.redis_url)
+    # socket_timeout=None is required, not optional: this client issues BRPOP with a
+    # server-side blocking `timeout` of several seconds (see mission_engine.engine.
+    # queue.dequeue_task), and redis-py applies its own client-side socket read
+    # timeout independently of that argument. Whichever one is shorter wins — a
+    # default/finite socket_timeout races the blocking command's own timeout and
+    # raises `redis.exceptions.TimeoutError` on almost every poll cycle instead of
+    # ever legitimately timing out empty. Found by CI: this crash-looped the worker
+    # container indefinitely (every restart re-hit the same race on its very first
+    # poll), which a plain `docker compose kill worker` in the resilience suite would
+    # never have exposed the way a sustained polling loop under the E2E job's longer
+    # runtime did. Safe to disable entirely here because BRPOP already self-bounds via
+    # its own `timeout` argument, and this client's only other use (EventPublisher's
+    # XADD) is a fast, non-blocking call.
+    return redis_asyncio.from_url(settings.redis_url, socket_timeout=None)
 
 
 def build_engine_deps(settings: Settings) -> EngineDeps:
