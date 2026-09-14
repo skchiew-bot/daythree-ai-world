@@ -105,7 +105,8 @@ async def run_demo() -> None:
 
         print(f"--- Audit timeline ({len(timeline)} events) ---")
         for event in timeline:
-            print(f"{event.occurred_at.isoformat()}  {event.event_type}")
+            suffix = f"  {json.dumps(event.payload)}" if event.payload else ""
+            print(f"{event.occurred_at.isoformat()}  {event.event_type}{suffix}")
 
     await redis_client.aclose()
 
