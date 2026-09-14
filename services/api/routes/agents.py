@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,10 +16,24 @@ from api.dependencies.auth import get_current_user, get_tenant_scoped_or_404, re
 from api.dependencies.db import get_db_session
 from api.dependencies.events import get_event_publisher
 from api.schemas.agents import AgentCreateRequest, AgentResponse, AgentVersionCreateRequest, AgentVersionResponse
+from api.services.room_assignment import ensure_assignment, release_assignment
 
 router = APIRouter(prefix="/api/v1/agents", tags=["agents"])
+logger = logging.getLogger(__name__)
 
 MUTATORS = require_role(UserRole.platform_admin, UserRole.tenant_admin, UserRole.operator)
+
+
+async def _try_room_assignment(coro, *, agent_id: EntityId) -> None:
+    """ADR-009: room assignment must never take down agent registration/activation/
+    suspension. `ensure_assignment`/`release_assignment` already catch their own
+    exceptions internally, but this call site wraps them too (belt-and-suspenders,
+    per the ADR-009 implementation plan) so registration survives even a future
+    change to that module that removes its own guard."""
+    try:
+        await coro
+    except Exception:
+        logger.exception("room_assignment_call_failed", extra={"agent_id": str(agent_id)})
 
 
 async def _publish(publisher, session, event_type, tenant_id, actor, agent_id, data=None):
@@ -77,6 +93,8 @@ async def create_agent(
     # `updated_at` and raises `MissingGreenlet` — found by CI's first real run of this
     # exact route (create → activate in one request).
     await session.refresh(agent)
+    # ADR-009: assignment never gates registration.
+    await _try_room_assignment(ensure_assignment(session, user.tenant_id, agent.id), agent_id=agent.id)
     return agent
 
 
@@ -155,6 +173,10 @@ async def activate_agent(
         agent.id, data={"active_version_id": str(version.id)},
     )
     await session.refresh(agent)  # see create_agent's comment on the same pattern
+    # ADR-009 D2: a reactivated agent may land in a different room than before if its
+    # old one was taken while it was suspended — ensure_assignment is a no-op if it
+    # already holds an active room.
+    await _try_room_assignment(ensure_assignment(session, user.tenant_id, agent.id), agent_id=agent.id)
     return agent
 
 
@@ -169,6 +191,9 @@ async def suspend_agent(
 
     agent.lifecycle_state = AgentLifecycleState.suspended.value
     await session.flush()
+    # ADR-009: suspending frees the room for reassignment — there's no delete route
+    # for agents, so this is the only deallocation path that exists today.
+    await _try_room_assignment(release_assignment(session, user.tenant_id, agent.id), agent_id=agent.id)
 
     await _publish(
         publisher, session, EventType.agent_suspended, user.tenant_id, Actor(type=ActorType.user, id=user.id), agent.id

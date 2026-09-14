@@ -119,3 +119,47 @@ async def test_tenants_do_not_see_each_others_external_agents(client, two_tenant
     listing_b = await client.get("/api/v1/external-agents", headers={"Authorization": f"Bearer {token_b}"})
     assert listing_b.status_code == 200
     assert listing_b.json() == []
+
+
+@pytest.mark.asyncio
+async def test_viewer_role_cannot_push_status(client, db_session):
+    """ADR-010 gate review C1: the write route used to accept any authenticated role;
+    it must now reject a read-only role the same way agents.py's MUTATORS does."""
+    tenant = Tenant(id=new_id(), code="ext-tenant-viewer", name="Viewer Tenant")
+    db_session.add(tenant)
+    await db_session.flush()
+    viewer = User(
+        id=new_id(), tenant_id=tenant.id, email="ext-viewer@test.local", display_name="Viewer",
+        role=UserRole.viewer.value, status=UserStatus.active.value, password_hash=hash_password(PASSWORD),
+    )
+    db_session.add(viewer)
+    await db_session.commit()
+
+    token = await _login(client, viewer.email)
+    response = await client.put(
+        "/api/v1/external-agents/claude-code/status",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"status": "working"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_status_updates_are_rate_limited(client, two_tenants):
+    """ADR-010 gate review C1: unlimited PUTs to this route (each optionally a new
+    `name`) was the capacity-DoS path flagged against ADR-009's room pool. A fixed
+    window of _RATE_LIMIT_MAX_REQUESTS per tenant per minute bounds it."""
+    from api.routes.external_agents import _RATE_LIMIT_MAX_REQUESTS
+
+    token = await _login(client, two_tenants["admin_a"].email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    last_status = None
+    for _ in range(_RATE_LIMIT_MAX_REQUESTS + 1):
+        last_status = (
+            await client.put(
+                "/api/v1/external-agents/claude-code/status", headers=headers, json={"status": "working"}
+            )
+        ).status_code
+
+    assert last_status == 429

@@ -23,12 +23,15 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -295,9 +298,10 @@ class ExternalAgentStatus(Base):
     """Not in spec §8 — a Phase 0-adjacent addition (see the 3D World page) for
     agents that live *outside* Daythree's own governed mission engine (a Claude Code
     session, an external script) to report a live status so they can be visualized
-    alongside Atlas. Deliberately outside the governed loop: no budget/permission
-    enforcement, no audit_events entries — just a last-known-status row any
-    authenticated caller can push to."""
+    alongside Atlas. Deliberately outside the governed loop: no budget enforcement,
+    no audit_events entries — just a last-known-status row. The write endpoint
+    (`PUT /{name}/status`) is role-gated and rate-limited (ADR-010 gate review, C1);
+    it is not open to every authenticated caller."""
 
     __tablename__ = "external_agent_statuses"
     __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_external_agent_statuses_tenant_name"),)
@@ -308,3 +312,42 @@ class ExternalAgentStatus(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     job_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+
+
+class AgentRoomAssignment(Base):
+    """Per-tenant apartment room for a governed agent (ADR-009). Presentation-layer
+    only — never gates `POST /api/v1/agents` (spec's admission control is untouched).
+    `packages/common/rooms.py` owns the floor/room slot math; this table just persists
+    the assignment so a returning agent gets back the *same* room rather than a
+    recomputed one.
+
+    The two partial unique indexes below (active rows only, `released_at IS NULL`)
+    are the actual concurrency guarantee — not application-level check-then-act,
+    consistent with the idempotency approach used elsewhere (artifacts' commit
+    constraint, tasks' idempotency_key): one prevents two agents double-booking the
+    same room, the other prevents one agent from holding two active rooms at once.
+    """
+
+    __tablename__ = "agent_room_assignments"
+    __table_args__ = (
+        CheckConstraint("room_index >= 1 AND room_index <= 4", name="ck_agent_room_assignments_room_index"),
+        CheckConstraint("floor >= 1", name="ck_agent_room_assignments_floor"),
+        Index(
+            "uq_agent_room_assignments_active_room",
+            "tenant_id", "floor", "room_index",
+            unique=True, postgresql_where=text("released_at IS NULL"),
+        ),
+        Index(
+            "uq_agent_room_assignments_active_agent",
+            "tenant_id", "agent_id",
+            unique=True, postgresql_where=text("released_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    agent_id: Mapped[EntityId] = mapped_column(ForeignKey("agents.id"), nullable=False)
+    floor: Mapped[int] = mapped_column(Integer, nullable=False)
+    room_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    released_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
