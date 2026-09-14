@@ -5,7 +5,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.db.models import Mission, User
+from common.db.models import Agent, AgentVersion, Mission, User
 from contracts.enums import EventType, MissionStatus, UserRole
 from contracts.events import Actor, ActorType, build_event
 from contracts.ids import EntityId
@@ -109,7 +109,20 @@ async def start_mission_route(
         # `TaskExecutionError: Task ... does not exist` (found by CI's E2E job; see
         # `mission_service.start_mission`'s docstring for the full explanation).
         await session.commit()
-        await enqueue_task(redis_client, result.task.id)
+
+        # An externally-executed agent (runtime_adapter != "custom_durable" — see
+        # routes/tasks.py's complete-external/fail-external) has no internal worker
+        # to hand this off to; enqueueing it would just sit in Redis forever since
+        # nothing ever BRPOPs it for that adapter type. Leave the task `queued` for
+        # the external agent to report back on directly.
+        agent = await session.get(Agent, result.task.assigned_agent_id)
+        agent_version = (
+            await session.get(AgentVersion, agent.active_version_id)
+            if agent is not None and agent.active_version_id is not None
+            else None
+        )
+        if agent_version is not None and agent_version.runtime_adapter == "custom_durable":
+            await enqueue_task(redis_client, result.task.id)
     return result.mission
 
 
