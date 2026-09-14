@@ -6,6 +6,7 @@ from api.routes import (
     audit,
     auth,
     dashboard,
+    external_agents,
     health,
     missions,
     model_invocations,
@@ -26,3 +27,4 @@ api_router.include_router(artifacts.router)
 api_router.include_router(audit.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(model_invocations.router)
+api_router.include_router(external_agents.router)

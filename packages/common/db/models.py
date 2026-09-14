@@ -289,3 +289,22 @@ class ModelInvocation(Base):
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     response_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+
+
+class ExternalAgentStatus(Base):
+    """Not in spec §8 — a Phase 0-adjacent addition (see the 3D World page) for
+    agents that live *outside* Daythree's own governed mission engine (a Claude Code
+    session, an external script) to report a live status so they can be visualized
+    alongside Atlas. Deliberately outside the governed loop: no budget/permission
+    enforcement, no audit_events entries — just a last-known-status row any
+    authenticated caller can push to."""
+
+    __tablename__ = "external_agent_statuses"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_external_agent_statuses_tenant_name"),)
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    job_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
