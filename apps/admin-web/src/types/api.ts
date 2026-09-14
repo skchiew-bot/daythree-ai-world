@@ -138,6 +138,13 @@ export interface ModelInvocation {
   created_at: string;
 }
 
+export interface ExternalAgentStatus {
+  name: string;
+  status: "idle" | "working" | "done" | "failed";
+  job_description: string | null;
+  updated_at: string;
+}
+
 export interface DashboardSummary {
   total_agents: number;
   active_missions: number;

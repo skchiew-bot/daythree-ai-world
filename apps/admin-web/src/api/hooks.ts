@@ -8,6 +8,7 @@ import type {
   AuditEvent,
   CurrentUser,
   DashboardSummary,
+  ExternalAgentStatus,
   Mission,
   MissionCreateRequest,
   ModelInvocation,
@@ -150,6 +151,14 @@ export function useMissionModelInvocations(missionId: string | undefined) {
     queryFn: () => api.get<ModelInvocation[]>(`/api/v1/missions/${missionId}/model-invocations`),
     enabled: !!missionId,
     refetchInterval: 5_000,
+  });
+}
+
+export function useExternalAgentStatuses() {
+  return useQuery({
+    queryKey: ["external-agents"],
+    queryFn: () => api.get<ExternalAgentStatus[]>("/api/v1/external-agents"),
+    refetchInterval: 3_000,
   });
 }
 

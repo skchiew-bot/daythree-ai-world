@@ -173,7 +173,8 @@ th {
 }
 
 .badge.status-completed,
-.badge.status-active {
+.badge.status-active,
+.badge.status-done {
   background: #e3f6ed;
   color: var(--success);
 }
@@ -184,14 +185,16 @@ th {
 }
 
 .badge.status-running,
-.badge.status-queued {
+.badge.status-queued,
+.badge.status-working {
   background: #eaf1fd;
   color: var(--accent);
 }
 
 .badge.status-draft,
 .badge.status-suspended,
-.badge.status-cancelled {
+.badge.status-cancelled,
+.badge.status-idle {
   background: #f1f1f1;
   color: var(--text-muted);
 }
