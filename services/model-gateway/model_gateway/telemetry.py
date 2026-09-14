@@ -15,6 +15,8 @@ _PRICING_PER_1K_TOKENS: dict[tuple[str, str], tuple[Decimal, Decimal]] = {
     ("anthropic", "claude-sonnet-5"): (Decimal("0.003"), Decimal("0.015")),
     ("anthropic", "claude-haiku-4-5-20251001"): (Decimal("0.001"), Decimal("0.005")),
     ("anthropic", "claude-opus-5"): (Decimal("0.015"), Decimal("0.075")),
+    ("openai", "gpt-4o-mini"): (Decimal("0.00015"), Decimal("0.0006")),
+    ("openai", "gpt-4o"): (Decimal("0.0025"), Decimal("0.01")),
 }
 _DEFAULT_PRICE = (Decimal("0.003"), Decimal("0.015"))
 

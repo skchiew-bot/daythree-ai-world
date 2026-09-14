@@ -16,9 +16,17 @@ error normalization, a circuit breaker, and request/response hashing.
 
 ## Decision
 
-Option 1. Two providers are implemented: `MockModelProvider` (default, zero external
-dependencies, deterministic schema-valid output) and `AnthropicProvider` (real, gated on
-`ANTHROPIC_API_KEY` being non-empty).
+Option 1. Three providers are implemented: `MockModelProvider` (default, zero external
+dependencies, deterministic schema-valid output), `AnthropicProvider`, and `OpenAIProvider`
+(both real, each gated on its own API key — `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` — being
+non-empty). `OpenAIProvider` uses the Chat Completions API (not Responses) for parity with
+`AnthropicProvider`'s shape — one system message, one user message, one response — and
+defaults to `gpt-4o-mini` for the demonstration mission as the cheaper of the two real
+providers to smoke-test with. CI's `e2e-and-resilience` job can run the spec §19
+demonstration mission against the real OpenAI provider via a `workflow_dispatch` input
+(`real_model_provider: openai`), gated on the `OPENAI_API_KEY` repository secret — never
+automatic on a push or PR, so no CI run spends real API money without a human explicitly
+asking for that run.
 
 ## Rationale
 

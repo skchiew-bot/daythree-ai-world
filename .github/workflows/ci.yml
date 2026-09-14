@@ -5,7 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      real_model_provider:
+        description: "Run the demo mission against a REAL model provider instead of the mock (costs real API $$) — only takes effect on a manual run"
+        required: false
+        type: choice
+        options: ["none", "openai"]
+        default: "none"
 
 # Cancel superseded runs on the same branch/PR so pushes don't queue up stale CI.
 concurrency:
@@ -116,8 +123,25 @@ jobs:
       - name: Install Playwright browser (chromium)
         run: python -m playwright install --with-deps chromium
 
-      - name: Configure environment (mock model provider — no API key needed)
-        run: cp .env.example .env
+      - name: Configure environment
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          cp .env.example .env
+          # `inputs.*` is only populated for workflow_dispatch — on push/pull_request it's
+          # empty, so this never fires except on an explicit manual run that asked for it.
+          if [ "${{ inputs.real_model_provider }}" = "openai" ]; then
+            if [ -z "$OPENAI_API_KEY" ]; then
+              echo "::error::real_model_provider=openai requested but the OPENAI_API_KEY repo secret is not set." >&2
+              exit 1
+            fi
+            sed -i "s|^OPENAI_API_KEY=.*|OPENAI_API_KEY=$OPENAI_API_KEY|" .env
+            sed -i "s|^DEFAULT_MODEL_PROVIDER=.*|DEFAULT_MODEL_PROVIDER=openai|" .env
+            sed -i "s|^DEFAULT_MODEL_NAME=.*|DEFAULT_MODEL_NAME=gpt-4o-mini|" .env
+            echo "Using the REAL OpenAI provider (gpt-4o-mini) for this run."
+          else
+            echo "Using MockModelProvider (default) — no external calls, no cost."
+          fi
 
       - name: Build and start the full compose stack
         run: docker compose up -d --build

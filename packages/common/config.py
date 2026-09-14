@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     object_store_signed_url_ttl_seconds: int = 300
 
     anthropic_api_key: str = ""
+    openai_api_key: str = ""
     default_model_provider: str = "mock"
     default_model_name: str = "claude-sonnet-5"
 
