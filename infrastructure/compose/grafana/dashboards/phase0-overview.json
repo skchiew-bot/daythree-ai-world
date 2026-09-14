@@ -1,0 +1,56 @@
+{
+  "title": "Daythree Phase 0 — Overview",
+  "uid": "daythree-phase0",
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1, "title": "API request rate", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum(rate(daythree_http_requests_total[1m])) by (status)" }]
+    },
+    {
+      "id": 2, "title": "Missions started / completed / failed", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sum(rate(daythree_missions_started_total[5m]))", "legendFormat": "started" },
+        { "expr": "sum(rate(daythree_missions_completed_total[5m]))", "legendFormat": "completed" },
+        { "expr": "sum(rate(daythree_missions_failed_total[5m]))", "legendFormat": "failed" }
+      ]
+    },
+    {
+      "id": 3, "title": "Model invocations & cost", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "sum(rate(daythree_model_invocations_total[5m])) by (status)", "legendFormat": "{{status}}" },
+        { "expr": "sum(rate(daythree_model_cost_usd_total[5m]))", "legendFormat": "cost_usd/s" }
+      ]
+    },
+    {
+      "id": 4, "title": "Task duration (p50/p95)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(daythree_task_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(daythree_task_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" }
+      ]
+    },
+    {
+      "id": 5, "title": "Retries & recoveries", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sum(rate(daythree_task_retries_total[5m]))", "legendFormat": "retries" },
+        { "expr": "sum(rate(daythree_runtime_recoveries_total[5m]))", "legendFormat": "recoveries" }
+      ]
+    },
+    {
+      "id": 6, "title": "Budget exceeded / tool denied events", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "sum(rate(daythree_budget_exceeded_total[5m]))", "legendFormat": "budget_exceeded" },
+        { "expr": "sum(rate(daythree_tool_denied_total[5m]))", "legendFormat": "tool_denied" }
+      ]
+    }
+  ]
+}

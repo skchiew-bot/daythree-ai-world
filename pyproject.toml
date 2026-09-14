@@ -1,0 +1,39 @@
+[project]
+name = "daythree-ai-world"
+version = "0.1.0"
+description = "Daythree AI World — Phase 0: governed, auditable digital agent runtime"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["packages", "services", "tests"]
+pythonpath = [
+    "packages",
+    "packages/policy-sdk",
+    "packages/tool-sdk",
+    "services",
+    "services/mission-engine",
+    "services/agent-runtime",
+    "services/model-gateway",
+    "services/event-service",
+    "services/artifact-service",
+]
+markers = [
+    "unit: pure-domain unit tests, no external services required",
+    "integration: requires Postgres/Redis/MinIO (Docker)",
+    "e2e: requires the full docker-compose stack + Playwright",
+    "resilience: kills/restarts real processes, requires Docker",
+    "security: authz/authn/secret-redaction tests",
+]
+[tool.coverage.run]
+source = ["packages", "services"]
+omit = ["*/tests/*", "*/alembic/*"]
+
+[tool.coverage.report]
+# No blanket fail_under here: this source set includes API routes, the worker loop,
+# and DB/object-store-backed code that spec §27 assigns to the *integration* suite
+# (needs a real Postgres/Redis/MinIO), not the unit suite — gating the whole repo at
+# 80% here would fail for a reason unrelated to code quality whenever Docker isn't
+# available. The 80% target spec §27 actually states ("core domain logic") is enforced
+# narrowly by `make test-coverage-core` instead — see the Makefile.
+show_missing = true
