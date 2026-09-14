@@ -28,6 +28,40 @@ was written *before* that verification) is kept for the record of what self-revi
 code/security review caught before Docker execution ever ran; treat the CI run, not this
 paragraph's original claims, as the current source of truth on what is verified.
 
+**Second update — the model gateway has now been verified against a real LLM, not just
+`MockModelProvider`.** A second provider, `OpenAIProvider` ([PR #2](https://github.com/skchiew-bot/daythree-ai-world/pull/2)),
+was added and wired behind `OPENAI_API_KEY`. Branch protection on `main` now requires all four CI
+jobs to pass (`enforce_admins` included, so this applies to every contributor) — every change below
+went through that gate. `workflow_dispatch`'s opt-in `real_model_provider=openai` input was used to
+run the spec §19 demonstration mission against the live OpenAI API, and this surfaced **three more
+real bugs**, none reachable by any test that only exercises `MockModelProvider` (it needs no key, so
+a real-provider wiring gap is invisible until a real key is actually used):
+
+1. Neither `worker.Dockerfile` nor `api.Dockerfile` set `PYTHONUNBUFFERED=1`, so container stdout
+   was block-buffered and the worker's diagnostic output for a failing task never reached
+   `docker compose logs`. Fixed in [PR #3](https://github.com/skchiew-bot/daythree-ai-world/pull/3).
+2. `infrastructure/scripts/run_demo_mission.py` printed each audit event's `event_type` but
+   discarded its `payload`, so the one field carrying the actual failure reason (`data.error`) never
+   reached the CI log. Fixed in [PR #4](https://github.com/skchiew-bot/daythree-ai-world/pull/4).
+3. **The actual root cause**: `docker-compose.yml`'s shared `&backend-env` anchor (used by both
+   `api` and `worker`) forwarded `ANTHROPIC_API_KEY` into the containers but was never updated to
+   also forward `OPENAI_API_KEY` when `OpenAIProvider` was added — so `settings.openai_api_key` was
+   always empty inside the containers regardless of the repo secret or `.env`, and
+   `build_model_gateway` never registered the `"openai"` provider. Every real-provider attempt
+   failed with `"No provider registered for 'openai'."` (visible only once bug 2 was fixed) in
+   milliseconds — too fast to be a real network call, which was the tell. Fixed in
+   [PR #5](https://github.com/skchiew-bot/daythree-ai-world/pull/5).
+
+With all three fixed, [CI run 34824743746](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34824743746)
+ran fully green with `real_model_provider=openai`: the demonstration mission completed against real
+`gpt-4o-mini`, producing a schema-valid, non-mock artifact and the full 7-event audit trail
+(`task.started` → `model.requested` → `model.completed` → `runtime.checkpoint_created` →
+`artifact.created` → `task.completed` → `mission.completed`) — see "Model Usage & Cost" for the
+artifact content and timing. This is the strongest evidence yet that the walking skeleton's
+provider-agnostic model gateway (spec §11) actually holds: the same mission engine, budget
+evaluator, output validator, and audit pipeline that worked against the mock provider worked
+unmodified against a live LLM.
+
 ## Build Version
 
 - Repository: `daythree-ai-world`, git-initialized, no commits made yet (left for the operator to
@@ -41,11 +75,13 @@ paragraph's original claims, as the current source of truth on what is verified.
 Built on Windows 11 (native Windows Python, not WSL) with Git Bash — Docker Desktop was installed
 but its daemon was not running at build time, so the initial implementation and self-review
 happened without it. **Verification against Docker happened in CI** (GitHub-hosted `ubuntu-latest`
-runners, real Docker) rather than in that interactive environment — see "Gate Decision." No
-`ANTHROPIC_API_KEY` is configured anywhere (not in CI, not locally); the demonstration path and all
-CI runs use `MockModelProvider` (see `docs/adr/ADR-005-model-gateway.md`) — the real
-`AnthropicProvider` code path is implemented and unit-tested but has never been exercised against
-the live Anthropic API.
+runners, real Docker) rather than in that interactive environment — see "Gate Decision." Routine CI
+runs (every push/PR) still use `MockModelProvider` by default (see
+`docs/adr/ADR-005-model-gateway.md`) — zero cost, zero external dependency, zero flakiness on the
+required gate. `OPENAI_API_KEY` is configured as a repo secret and has been exercised end-to-end
+against the live OpenAI API via the opt-in `workflow_dispatch` path (see the Executive Summary's
+second update). No `ANTHROPIC_API_KEY` is configured anywhere; `AnthropicProvider` is implemented
+and unit-tested but has never been exercised against the live Anthropic API.
 
 ## Delivered Components
 
@@ -56,7 +92,7 @@ the live Anthropic API.
 | DB schema (11 tables) + Alembic migration | `packages/common/db/`, `infrastructure/migrations/` | Done — migration runs clean in CI against a real Postgres |
 | Permission + budget evaluators | `packages/policy-sdk/` | Done, 100% unit-tested |
 | Tool registry + 4 Phase 0 tools | `packages/tool-sdk/` | Done, unit-tested |
-| Model Gateway (mock + Anthropic providers, retry, circuit breaker, telemetry) | `services/model-gateway/` | Done, unit-tested |
+| Model Gateway (mock + Anthropic + OpenAI providers, retry, circuit breaker, telemetry) | `services/model-gateway/` | Done, unit-tested; OpenAI path also verified live in CI (see Executive Summary) |
 | Event publisher (DB + Redis Stream) | `services/event-service/` | Done, unit-tested |
 | Agent Runtime (durable adapter, checkpoints, prompt assembly) | `services/agent-runtime/` | Done, unit-tested (execute + both resume paths) |
 | Mission Engine + Worker (state machine, idempotency, task executor, restart recovery) | `services/mission-engine/`, `services/worker/` | Done, verified in CI (integration + resilience) |
@@ -176,11 +212,31 @@ test (`test_audit_timeline_reconstructs_full_lifecycle_tc_p0_013`) that has not 
 
 ## Model Usage & Cost
 
-Demonstration path uses `MockModelProvider`: **$0.00 cost, zero external calls**. The real
-`AnthropicProvider` is implemented and gated on `ANTHROPIC_API_KEY`; it has not been exercised
-against the live Anthropic API in this session (no key was available). Cost accounting
+Routine (default) demonstration path uses `MockModelProvider`: **$0.00 cost, zero external calls**.
+
+**Live verification against OpenAI** ([CI run 34824743746](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34824743746),
+`workflow_dispatch` with `real_model_provider=openai`): the spec §19 demonstration mission
+(`MSN-DEMO-PHASE0`) completed against real `gpt-4o-mini`. The model call itself took ~6.1s
+(08:52:51.974 `model.requested` → 08:52:58.088 `model.completed`) — a real network round trip,
+unlike the millisecond-scale local failures the three bugs above produced. Cost is bounded well
+under $0.01 given `gpt-4o-mini`'s $0.00015/$0.0006 per-1K-token input/output pricing
+(`model_gateway/telemetry.py`) and the single short call this mission makes; exact token counts are
+recorded per-call in `model_invocations` (not captured in this CI log extraction). The resulting
+artifact — "Business and Technical Requirements for Analyzing Customer Interactions"
+(`mission_output`, v1) — is real, schema-valid, non-mock content, e.g.:
+
+> *"This document outlines the essential data, integrations, controls, KPIs, and risks to consider
+> when analyzing repeated customer interactions across voice and digital channels..."*
+
+with populated `Data Requirements`, `Integrations`, `Controls`, and `Key Performance Indicators`
+sections. The output validator (spec §21 schema) accepted it on the first attempt — no repair
+re-prompt was needed.
+
+The real `AnthropicProvider` is implemented and gated on `ANTHROPIC_API_KEY`; it has not been
+exercised against the live Anthropic API (no key configured). Cost accounting
 (`model_gateway/telemetry.py`) is unit-tested for the mock provider's $0 path and the retry/
-circuit-breaker paths; live pricing accuracy for the Anthropic path is not independently verified.
+circuit-breaker paths; live pricing accuracy is now verified end-to-end for OpenAI, not yet for
+Anthropic.
 
 ## Known Defects
 
@@ -202,7 +258,8 @@ non-blocking items:
   `docs/adr/ADR-002-database.md`) — irrelevant to Phase 0 (no vector columns exist) but relevant to
   Phase 1 readiness.
 - The real `AnthropicProvider` path has never been exercised against the live API (no key
-  configured anywhere) — implemented and unit-tested, not live-verified.
+  configured anywhere) — implemented and unit-tested, not live-verified. (`OpenAIProvider` *has*
+  been live-verified — see Executive Summary and "Model Usage & Cost.")
 
 No P0/P1 defect (per spec §30's definitions) is open.
 
@@ -266,6 +323,21 @@ written and follow the spec §25 topology (`admin-web`, `api`, `worker`, `postgr
 - `passlib` 1.7.x's bcrypt backend probes `bcrypt.__about__.__version__`, which bcrypt 4.1+/5.x no
   longer exposes — calling `bcrypt` directly sidesteps an abandoned compatibility shim rather than
   pinning to an old, unmaintained `bcrypt` version.
+- **A mock provider that needs no credentials structurally cannot catch a credential-wiring bug.**
+  `MockModelProvider` requires no API key, so `docker-compose.yml`'s missing `OPENAI_API_KEY`
+  forward (see Executive Summary, bug 3) passed every CI run — unit, integration, security,
+  frontend, and even the full E2E+resilience job — because none of them ever needed the key to be
+  present. The gap only became visible the moment a real provider was actually exercised. The
+  practical implication: adding a new `ModelProvider` isn't done when its own class and unit tests
+  pass — every layer the key has to cross (`.env.example`, `Settings`, the CI workflow's env
+  injection, *and* `docker-compose.yml`'s container env forwarding) needs its own explicit check,
+  because the default test path will never exercise the last one.
+- Diagnosing the real-provider failures took three iterations because the first two fixes attacked
+  *observability* (unbuffered stdout, printed audit payloads) before the underlying bug was known,
+  rather than being able to see the actual error message on the first attempt. In hindsight, having
+  `run_demo_mission.py` print full audit event payloads (not just event types) from the start would
+  have made the very first real-provider CI run self-diagnosing instead of requiring two follow-up
+  PRs just to see the error text.
 
 ## Gate Decision
 
@@ -291,6 +363,10 @@ satisfied:
   start on a placeholder secret outside `dev`).
 - `README.md`'s quickstart brings up the environment from a clean checkout — CI *is* that quickstart,
   automated.
+- The model gateway's provider-agnostic contract (spec §11) is proven, not just asserted: the
+  identical mission engine, budget evaluator, output validator, and audit pipeline ran unmodified
+  against both `MockModelProvider` (every routine CI run) and live `gpt-4o-mini`
+  ([run 34824743746](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34824743746)).
 
 Ready for the spec §35 management review checklist and Phase 1 — Agent Creation Studio.
 
