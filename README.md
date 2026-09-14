@@ -45,19 +45,20 @@ in the `Makefile`.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push/PR to `main` (plus manual dispatch):
+`.github/workflows/ci.yml` runs on every push/PR to `main` (plus manual dispatch), and all four
+jobs are required status checks on `main`'s branch protection — none of them can be skipped to
+merge:
 
-| Job | Runs on | What it proves |
-|---|---|---|
-| `unit` | every push/PR | Full unit suite + the spec §27 80%-core-domain-coverage gate |
-| `integration-and-security` | every push/PR | TC-P0-001/003/004/010/011/012/013 etc. against a real, throwaway Postgres (testcontainers — no compose stack needed) |
-| `frontend` | every push/PR | Admin web type-checks and builds |
-| `e2e-and-resilience` | push to `main` + manual dispatch only | Brings up the **entire** `docker-compose.yml` stack, seeds it, runs the spec §19 demo mission, the spec §27 Playwright journey, and the TC-P0-006/007 container-kill resilience tests |
+| Job | What it proves |
+|---|---|
+| `unit` | Full unit suite + the spec §27 80%-core-domain-coverage gate |
+| `integration-and-security` | TC-P0-001/003/004/010/011/012/013 etc. against a real, throwaway Postgres (testcontainers — no compose stack needed) |
+| `frontend` | Admin web type-checks and builds |
+| `e2e-and-resilience` | Brings up the **entire** `docker-compose.yml` stack, seeds it, runs the spec §19 demo mission, the spec §27 Playwright journey, and the TC-P0-006/007 container-kill resilience tests |
 
-The last job is restricted to `main` (not every PR) so day-to-day CI feedback stays fast — it's
-the whole-stack gate, not the first thing a contributor waits on. Trigger it manually from the
-Actions tab (`workflow_dispatch`) to verify a branch before merging without waiting for a push to
-`main`.
+`e2e-and-resilience` adds a few minutes to every PR, but it's the job that has actually found every
+real bug in this codebase so far — see the ADRs for each one — so it's required rather than
+main-only.
 
 ## Repository layout
 

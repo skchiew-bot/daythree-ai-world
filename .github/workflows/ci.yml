@@ -94,14 +94,14 @@ jobs:
   # The heavy, whole-stack proof: brings up every service in docker-compose.yml
   # (Postgres, Redis, MinIO, otel-collector, prometheus, grafana, api, worker,
   # admin-web), seeds it, then runs the Playwright E2E journey (spec §27) and the
-  # resilience suite (TC-P0-006/007 — real container kill/restart). Restricted to
-  # pushes to main and manual runs so PR feedback from the three jobs above stays
-  # fast; this is the gate before something is trusted as "actually works end to end,"
-  # not the first thing a contributor waits on.
+  # resilience suite (TC-P0-006/007 — real container kill/restart). Runs on every PR
+  # too (required by main's branch protection) — this job is the one that has
+  # actually found every real bug so far (see the ADRs), so gating merges on the
+  # other three jobs alone would let the same class of bug back in. The ~3 extra
+  # minutes this adds to every PR is the deliberate trade for that.
   e2e-and-resilience:
     name: Full stack — E2E + resilience
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
