@@ -376,3 +376,87 @@ Once the Docker-gated verification above passes: proceed to **Phase 1 — Agent 
 Before doing so, resolve the three "Known Defects" items that are Phase-1-relevant (pgvector image
 swap, worker task lease mechanism, shared circuit-breaker state) if Phase 1's scope touches them —
 none block Phase 0 sign-off, but a couple would compound if left for Phase 2.
+
+## Beyond Phase 0: Live Extensions
+
+Everything below was built **after** Phase 0 sign-off, at the user's explicit request, and is
+called out separately because none of it is in `PHASE_0_BUILD_SPEC.md` — the build spec explicitly
+excludes a 3D world, and neither an external-agent integration nor a second registered agent type
+were ever in scope. Each is additive: none of it modifies the governed Phase 0 loop's behavior for
+Atlas or `MockModelProvider`/`AnthropicProvider`/`OpenAIProvider` missions, and every change went
+through the same required branch → PR → 4-job CI → merge flow as Phase 0 itself.
+
+### 3D World visualization ([PR #7](https://github.com/skchiew-bot/daythree-ai-world/pull/7))
+
+A sixth admin-web page (`/world`), explicitly labeled in its own UI as not part of the spec. A
+Three.js scene renders the agent as a simple avatar (capsule + sphere + a status-colored light)
+next to a desk; its state (idle/thinking/working/completed/failed) is derived entirely from real
+mission/task data polled through the existing `useMissions`/`useMissionTimeline` API hooks — no
+scripted or randomized behavior. Verified live: created and started a real mission through Mission
+Control, watched the avatar walk to the desk, react to the mission's actual `running`→`completed`
+transition (green status light + expanding ring), then settle back to idle.
+
+One real bug found and fixed during verification: TanStack Query v5's tracked-fields optimization
+means a component doesn't re-render when a poll returns structurally-identical data (an
+already-completed mission's data is byte-identical poll to poll, so query v5 keeps the same object
+reference) — the "revert to idle after a hold window" transition never fired as a result. Fixed
+with a local `setInterval`-driven clock, decoupled from query refetch timing, so the transition is
+driven by real elapsed time rather than an assumption that a new poll implies a new render.
+
+### External-agent status feed ([PR #8](https://github.com/skchiew-bot/daythree-ai-world/pull/8))
+
+Answers "how do I connect a Claude Code session (or any external process) to the 3D world":
+`PUT /api/v1/external-agents/{name}/status` lets any authenticated caller upsert
+`{status: idle|working|done|failed, job_description}` for itself; each reporting name gets its own
+avatar in `/world`, in its own row, reacting to the same feed. New table `external_agent_statuses`
+(migration 0002). Deliberately outside the governed mission engine — no budget/permission
+enforcement, no `audit_events` entries, just a last-known-status row per `(tenant, name)`.
+
+Verified live end-to-end by pinging **the Claude Code session that built this feature** in as
+`claude-code`: `working` with a real job description → avatar appeared with a yellow light and the
+description in the table → `done` → green completion ring → settled back to idle.
+
+### Claude Code auto-report hook ([PR #9](https://github.com/skchiew-bot/daythree-ai-world/pull/9))
+
+`scripts/report_claude_status.sh` (tracked, no secrets — reads its target URL and credentials from
+env vars, always exits 0) wired via a `UserPromptSubmit` hook (`working`) and a `Stop` hook
+(`done`) in `.claude/settings.local.json` (gitignored; `.example` version tracked) so a Claude Code
+session reports its own status automatically instead of needing a manual `curl` each time.
+
+**Not verified working automatically** — Claude Code appears to load hook configuration at session
+start rather than hot-reloading it mid-session, and the file was created mid-session, so the hook
+was never registered for the session that authored it. The script itself is directly verified (both
+its success and silent-no-op-on-missing-credentials paths were run by hand and produced the correct
+result); whether the hook actually fires on a fresh session, and whether its bash-style command
+syntax executes as written on Windows (undocumented which shell runs a hook's `command` string
+there), is pending real-world confirmation in a new session.
+
+### Claude Code as a registered, governed Agent ([PR #10](https://github.com/skchiew-bot/daythree-ai-world/pull/10))
+
+The heavier follow-up, scoped out in conversation before building: rather than only being
+visualized, a Claude Code session can now be a first-class Daythree `Agent`
+(`AGT-CLAUDE-CODE`, seeded alongside Atlas) whose missions go through the real
+Agent/Mission/Task/Artifact/audit-event schema — not the lightweight side table above.
+
+`AgentVersion.runtime_adapter` — a plain string column that existed since Phase 0 but that nothing
+ever branched on (every task always ran through `DurableAgentRuntimeAdapter`) — is now meaningful:
+`"external_manual"` marks an agent as executed outside Daythree's own worker.
+`start_mission_route` checks it and skips the internal Redis enqueue for such a task (nothing would
+ever `BRPOP` it), leaving the task `queued`. Two new routes let the agent report back:
+`POST /api/v1/tasks/{id}/complete-external` (validates output against the same spec §21 schema,
+writes the artifact via the same `artifact_service.commit_artifact`, emits the same
+`task.started`/`artifact.created`/`task.completed`/`mission.completed` event sequence as the
+internal path) and `.../fail-external` (the failure mirror). Both return 409 for a task whose agent
+is actually internally-executed, so neither can be used to bypass the real worker's governed path.
+
+**Honesty over plumbing**: the seeded Agent's `description` states plainly that its
+`tool_policy`/`budget_policy` are advisory only — Daythree has no way to observe or enforce a
+Claude Code session's real tool calls or model usage, so this produces a real audit *record*
+(identical in shape to Atlas's), not real governance. It would be easy to make this *look*
+equivalent to Atlas by reusing the same schema; it is not equivalent, and the report says so.
+
+6 new integration tests against real Postgres (testcontainers): enqueue skipped for external agents
+but not internal ones, a full `complete-external` run producing a real artifact and the expected
+8-event timeline, invalid-output rejection (422), the internal-agent 409 guard on both new routes,
+and `fail-external`. Full unit + integration + security suite (74 tests) passed locally before this
+PR was opened, in addition to CI's own 4 jobs.
