@@ -10,6 +10,8 @@ COPY infrastructure/migrations ./infrastructure/migrations
 COPY alembic.ini .
 
 ENV PYTHONPATH=/repo/packages:/repo/packages/policy-sdk:/repo/packages/tool-sdk:/repo/services:/repo/services/mission-engine:/repo/services/agent-runtime:/repo/services/model-gateway:/repo/services/event-service:/repo/services/artifact-service
+# See worker.Dockerfile — same stdout-buffering hazard applies here.
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 CMD ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
