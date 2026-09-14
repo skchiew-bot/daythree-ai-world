@@ -22,6 +22,10 @@ def build_model_gateway(settings: Settings) -> ModelGateway:
         from model_gateway.providers.anthropic_provider import AnthropicProvider
 
         providers["anthropic"] = AnthropicProvider(api_key=settings.anthropic_api_key)
+    if settings.openai_api_key:
+        from model_gateway.providers.openai_provider import OpenAIProvider
+
+        providers["openai"] = OpenAIProvider(api_key=settings.openai_api_key)
     return ModelGateway(providers=providers)
 
 
