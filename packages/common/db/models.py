@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
+    DateTime,
     ForeignKey,
     Integer,
     Numeric,
@@ -50,6 +51,15 @@ from contracts.enums import (
 )
 from contracts.ids import EntityId, new_id
 
+# Every timestamp in this app is timezone-aware (contracts.events uses
+# datetime.now(timezone.utc) everywhere) — without an explicit timezone=True here,
+# SQLAlchemy maps Mapped[datetime] to Postgres TIMESTAMP WITHOUT TIME ZONE, and
+# asyncpg's codec raises `can't subtract offset-naive and offset-aware datetimes`
+# the moment an aware Python datetime (e.g. AuditEvent.occurred_at from an
+# EventEnvelope) is bound to it. Found via CI's first real run against Postgres —
+# no unit test catches this since none of them touch a real asyncpg codec.
+TZDateTime = DateTime(timezone=True)
+
 UUIDPK = Mapped[EntityId]
 
 
@@ -64,8 +74,8 @@ class Tenant(Base):
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[TenantStatus] = mapped_column(String(32), default=TenantStatus.active)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now(), onupdate=func.now())
 
 
 class User(Base):
@@ -78,8 +88,8 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(String(32), nullable=False)
     status: Mapped[UserStatus] = mapped_column(String(32), default=UserStatus.active)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (UniqueConstraint("tenant_id", "email", name="uq_users_tenant_email"),)
 
@@ -98,7 +108,7 @@ class ModelPolicy(Base):
     max_cost_per_task: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("2.00"))
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=60)
     retry_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
 
 class Agent(Base):
@@ -118,8 +128,8 @@ class Agent(Base):
         UUID(as_uuid=True), ForeignKey("agent_versions.id", use_alter=True), nullable=True
     )
     created_by: Mapped[Optional[EntityId]] = mapped_column(UUID(as_uuid=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now(), onupdate=func.now())
 
     versions: Mapped[list["AgentVersion"]] = relationship(
         back_populates="agent", foreign_keys="AgentVersion.agent_id"
@@ -143,7 +153,7 @@ class AgentVersion(Base):
     settings: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     created_by: Mapped[Optional[EntityId]] = mapped_column(UUID(as_uuid=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
     agent: Mapped["Agent"] = relationship(back_populates="versions", foreign_keys=[agent_id])
 
@@ -166,9 +176,9 @@ class Mission(Base):
     assigned_agent_id: Mapped[Optional[EntityId]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    started_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    started_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
 
 
 class Task(Base):
@@ -185,9 +195,9 @@ class Task(Base):
     budget_policy: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     input_context: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     output_artifact_id: Mapped[Optional[EntityId]] = mapped_column(UUID(as_uuid=True), nullable=True)
-    started_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    started_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
 
 class RuntimeCheckpoint(Base):
@@ -202,7 +212,7 @@ class RuntimeCheckpoint(Base):
     status: Mapped[RuntimeCheckpointStatus] = mapped_column(
         String(32), default=RuntimeCheckpointStatus.created
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
     __table_args__ = (
         UniqueConstraint("task_id", "checkpoint_sequence", name="uq_checkpoints_task_sequence"),
@@ -226,7 +236,7 @@ class Artifact(Base):
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1)
     artifact_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
     __table_args__ = (
         UniqueConstraint(
@@ -258,7 +268,7 @@ class AuditEvent(Base):
     correlation_id: Mapped[EntityId] = mapped_column(UUID(as_uuid=True), nullable=False)
     causation_id: Mapped[Optional[EntityId]] = mapped_column(UUID(as_uuid=True), nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    occurred_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    occurred_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
 
 class ModelInvocation(Base):
@@ -278,4 +288,4 @@ class ModelInvocation(Base):
     status: Mapped[ModelInvocationStatus] = mapped_column(String(32), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     response_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())

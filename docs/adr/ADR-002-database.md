@@ -40,6 +40,15 @@ never substituted anywhere, including in tests.
 
 ## Consequences
 
+- **Every timestamp column is explicitly `DateTime(timezone=True)`** (a module-level
+  `TZDateTime` alias in `packages/common/db/models.py`), not the bare
+  `Mapped[datetime]` default. This was *not* how the schema first shipped: CI's first
+  real run against a live Postgres caught `asyncpg.exceptions.DataError: can't
+  subtract offset-naive and offset-aware datetimes` on the very first `audit_events`
+  insert, because SQLAlchemy maps an untyped `Mapped[datetime]` to `TIMESTAMP WITHOUT
+  TIME ZONE` on Postgres while the rest of the app (`contracts.events` in particular)
+  produces timezone-aware `datetime.now(timezone.utc)` values everywhere. No unit test
+  could have caught this — it only manifests once a real asyncpg codec is involved.
 - `docker-compose.yml` currently runs the plain `postgres:16-alpine` image, **not**
   `pgvector/pgvector:pg16` — since no Phase 0 table has a vector column, the extension
   isn't installed yet. Swapping the compose image and running `CREATE EXTENSION
