@@ -46,6 +46,15 @@ mission_engine/`).
 
 ## Consequences
 
+- **Async SQLAlchemy + FastAPI response models need an explicit `session.refresh(obj)`
+  before returning any ORM object that was mutated (not just freshly inserted) and has
+  a `server_default`/`onupdate`-computed column** (e.g. `updated_at`). FastAPI's
+  response-model serialization runs in a sync context; if such a column's value isn't
+  already loaded, SQLAlchemy's async engine can't perform the implicit lazy-load and
+  raises `MissingGreenlet` instead. Found by CI's first real run of `POST /api/v1/
+  agents` (an INSERT immediately followed by an UPDATE in the same request) — fixed in
+  the three `services/api/routes/agents.py` routes with this exact pattern
+  (`create_agent`, `activate_agent`, `suspend_agent`).
 - Local dev requires one `pip install -r requirements.txt`, not per-service installs.
 - A future Phase 1+ decision to split a service into its own deployable unit (e.g. the
   model gateway, if it needs independent scaling) requires adding a `pyproject.toml` to

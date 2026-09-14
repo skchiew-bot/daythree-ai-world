@@ -68,6 +68,15 @@ async def create_agent(
         publisher, session, EventType.agent_version_created, user.tenant_id, actor, agent.id,
         data={"version": version.version, "checksum": version.checksum},
     )
+    # Explicit refresh, not just the flush() above: `agent.updated_at` has
+    # `onupdate=func.now()`, and this UPDATE flush is the SECOND flush against this
+    # object (after the INSERT flush) — asyncpg's async ORM doesn't reliably populate
+    # that server-computed value back into the Python object across a later flush the
+    # way it does for a fresh INSERT's RETURNING. Without this, FastAPI's response-
+    # model serialization (which runs in a sync context) tries to lazily load
+    # `updated_at` and raises `MissingGreenlet` — found by CI's first real run of this
+    # exact route (create → activate in one request).
+    await session.refresh(agent)
     return agent
 
 
@@ -145,6 +154,7 @@ async def activate_agent(
         publisher, session, EventType.agent_activated, user.tenant_id, Actor(type=ActorType.user, id=user.id),
         agent.id, data={"active_version_id": str(version.id)},
     )
+    await session.refresh(agent)  # see create_agent's comment on the same pattern
     return agent
 
 
@@ -163,4 +173,5 @@ async def suspend_agent(
     await _publish(
         publisher, session, EventType.agent_suspended, user.tenant_id, Actor(type=ActorType.user, id=user.id), agent.id
     )
+    await session.refresh(agent)  # see create_agent's comment on the same pattern
     return agent
