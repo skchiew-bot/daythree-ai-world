@@ -8,6 +8,7 @@ import { Dashboard } from "@/pages/Dashboard";
 import { Login } from "@/pages/Login";
 import { MissionControl } from "@/pages/MissionControl";
 import { MissionDetail } from "@/pages/MissionDetail";
+import { World } from "@/pages/World";
 
 export default function App() {
   const { isAuthenticated, isLoading } = useAuth();
@@ -25,6 +26,7 @@ export default function App() {
         <Route path="/agents/new" element={<CreateAgent />} />
         <Route path="/missions" element={<MissionControl />} />
         <Route path="/missions/:missionId" element={<MissionDetail />} />
+        <Route path="/world" element={<World />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
