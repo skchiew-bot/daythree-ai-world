@@ -191,6 +191,11 @@ th {
   color: var(--accent);
 }
 
+.badge.status-assigned {
+  background: #f1ecfe;
+  color: #7c3aed;
+}
+
 .badge.status-draft,
 .badge.status-suspended,
 .badge.status-cancelled,
