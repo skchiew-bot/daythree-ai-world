@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Copy to .claude/hook_working.sh (gitignored) and fill in your own values. Called
+# by the UserPromptSubmit hook in .claude/settings.local.json.
+export DAYTHREE_API_BASE_URL="http://localhost:8000"
+export DAYTHREE_ADMIN_PASSWORD="ChangeMe123!"
+# Fully-qualified bash path, not a bare `bash` -- an unqualified `bash` can resolve
+# to Windows' own WSL launcher (C:\Windows\System32\bash.exe) instead of Git Bash,
+# which has a totally different filesystem view. Adjust this path to wherever Git
+# Bash is installed on your machine if it isn't the default location.
+exec "C:/Program Files/Git/usr/bin/bash.exe" "/absolute/path/to/daythree-ai-world/scripts/report_claude_status.sh" working "Responding in Claude Code"

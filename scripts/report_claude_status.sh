@@ -20,6 +20,14 @@ set -u
 STATUS="${1:-idle}"
 DESCRIPTION="${2:-}"
 
+# Unconditional debug trail: written before anything that could fail or no-op, so
+# `tail scripts/.report_claude_status.log` can distinguish "the hook never invoked
+# this script at all" from "it ran but curl/auth failed" -- the two failure modes
+# look identical from the outside (silent, exit 0) otherwise.
+mkdir -p "$(dirname "$0")/../.hook-debug" 2>/dev/null
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) invoked: status=$STATUS desc=$DESCRIPTION pid=$$" \
+  >> "$(dirname "$0")/../.hook-debug/report_claude_status.log" 2>/dev/null
+
 BASE_URL="${DAYTHREE_API_BASE_URL:-http://localhost:8000}"
 AGENT_NAME="${DAYTHREE_AGENT_NAME:-claude-code}"
 EMAIL="${DAYTHREE_ADMIN_EMAIL:-admin@daythree.local}"
