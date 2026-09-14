@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy this to .claude/settings.local.json (gitignored — never commit real credentials) to have this Claude Code session automatically report its status into the running daythree-ai-world stack's 3D World page. Requires the stack to be up locally (docker compose up -d) and DAYTHREE_ADMIN_PASSWORD to match your seeded admin password. Adjust DAYTHREE_API_BASE_URL if your API isn't on the default port (e.g. a XAMPP/other-service port conflict, see docker-compose.override.yml.example if present).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "DAYTHREE_API_BASE_URL=http://localhost:8000 DAYTHREE_ADMIN_PASSWORD=ChangeMe123! bash scripts/report_claude_status.sh working 'Responding in Claude Code' >/dev/null 2>&1 &",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "DAYTHREE_API_BASE_URL=http://localhost:8000 DAYTHREE_ADMIN_PASSWORD=ChangeMe123! bash scripts/report_claude_status.sh done 'Finished responding' >/dev/null 2>&1 &",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
