@@ -277,6 +277,13 @@ what is already written":
    management review checklist (spec §35); if anything fails, fix it and re-run this report's
    test table before proceeding to Phase 1.
 
+**Update**: `.github/workflows/ci.yml` now runs steps (1)-(5) automatically — the `unit` and
+`integration-and-security` jobs run on every push/PR (Docker via testcontainers, no compose stack
+needed), and `e2e-and-resilience` runs the full compose stack + `make`-equivalent migrate/seed/demo
++ Playwright + resilience suite on every push to `main` and on manual dispatch. The first CI run
+against `main` is the actual execution of this Gate Decision's remaining conditions — check the
+Actions tab for its result rather than re-deriving it from this static report once that run exists.
+
 ## Recommendation for Phase 1
 
 Once the Docker-gated verification above passes: proceed to **Phase 1 — Agent Creation Studio**.

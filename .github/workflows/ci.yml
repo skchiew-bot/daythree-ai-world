@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Cancel superseded runs on the same branch/PR so pushes don't queue up stale CI.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "24"
+
+jobs:
+  # Fast feedback for every push/PR: pure-domain unit tests + the spec §27 core-domain
+  # coverage gate. No Docker needed — this is the suite that must always be green.
+  unit:
+    name: Unit tests + core-domain coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run full unit suite
+        run: pytest -m unit -v --cov=packages --cov=services --cov-report=term-missing
+
+      - name: Enforce spec §27's 80% core-domain-logic coverage gate
+        run: >
+          pytest -m unit -q
+          --cov=policy_sdk
+          --cov=contracts.events
+          --cov=contracts.output_contract
+          --cov=services/mission-engine/mission_engine/states
+          --cov=services/agent-runtime/agent_runtime/adapters
+          --cov=model_gateway.gateway
+          --cov=services/model-gateway/model_gateway/routing
+          --cov-report=term-missing --cov-fail-under=80
+
+  # Integration + security suites use testcontainers to spin up a real, throwaway
+  # Postgres — no docker-compose stack needed, since GitHub-hosted runners already
+  # have Docker available for testcontainers to use directly.
+  integration-and-security:
+    name: Integration + security tests (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration suite (real Postgres via testcontainers)
+        run: pytest -m integration -v
+
+      - name: Run security suite (cross-tenant, RBAC, JWT, secret redaction)
+        run: pytest -m security -v
+
+  # Admin UI: type-check and production build. Doesn't need the backend running.
+  frontend:
+    name: Admin web — typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/admin-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/admin-web/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  # The heavy, whole-stack proof: brings up every service in docker-compose.yml
+  # (Postgres, Redis, MinIO, otel-collector, prometheus, grafana, api, worker,
+  # admin-web), seeds it, then runs the Playwright E2E journey (spec §27) and the
+  # resilience suite (TC-P0-006/007 — real container kill/restart). Restricted to
+  # pushes to main and manual runs so PR feedback from the three jobs above stays
+  # fast; this is the gate before something is trusted as "actually works end to end,"
+  # not the first thing a contributor waits on.
+  e2e-and-resilience:
+    name: Full stack — E2E + resilience
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser (chromium)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Configure environment (mock model provider — no API key needed)
+        run: cp .env.example .env
+
+      - name: Build and start the full compose stack
+        run: docker compose up -d --build
+
+      - name: Wait for API and admin-web to become ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health/live >/dev/null && curl -sf http://localhost:5173 >/dev/null; then
+              echo "Stack is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Stack did not become ready in time." >&2
+          docker compose logs
+          exit 1
+
+      - name: Run DB migrations and seed data
+        env:
+          PYTHONPATH: packages:packages/policy-sdk:packages/tool-sdk:services:services/mission-engine:services/agent-runtime:services/model-gateway:services/event-service:services/artifact-service
+        run: |
+          alembic upgrade head
+          python infrastructure/scripts/seed.py
+
+      - name: Run the demonstration mission (spec §19) end-to-end
+        env:
+          PYTHONPATH: packages:packages/policy-sdk:packages/tool-sdk:services:services/mission-engine:services/agent-runtime:services/model-gateway:services/event-service:services/artifact-service
+        run: python infrastructure/scripts/run_demo_mission.py
+
+      - name: Run E2E journey (spec §27 script)
+        run: pytest -m e2e -v
+
+      - name: Run resilience suite (TC-P0-006/007 — real container kill/restart)
+        run: pytest -m resilience -v -s
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color > compose-logs.txt
+
+      - name: Upload compose logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+
+      - name: Tear down the stack
+        if: always()
+        run: docker compose down -v

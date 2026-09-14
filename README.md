@@ -1,5 +1,7 @@
 # Daythree AI World — Phase 0
 
+[![CI](https://github.com/skchiew-bot/daythree-ai-world/actions/workflows/ci.yml/badge.svg)](https://github.com/skchiew-bot/daythree-ai-world/actions/workflows/ci.yml)
+
 Foundation & walking skeleton for a durable, governed, auditable digital-agent runtime. Phase 0 proves
 one loop end-to-end:
 
@@ -40,6 +42,22 @@ make test-coverage-core    # spec §27's actual gate: >=80% on permission evalua
 `make` package, `choco install make`, etc.), run the command each target wraps directly —
 e.g. `test-coverage-core` is just the `pytest ... --cov=... --cov-fail-under=80` invocation
 in the `Makefile`.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main` (plus manual dispatch):
+
+| Job | Runs on | What it proves |
+|---|---|---|
+| `unit` | every push/PR | Full unit suite + the spec §27 80%-core-domain-coverage gate |
+| `integration-and-security` | every push/PR | TC-P0-001/003/004/010/011/012/013 etc. against a real, throwaway Postgres (testcontainers — no compose stack needed) |
+| `frontend` | every push/PR | Admin web type-checks and builds |
+| `e2e-and-resilience` | push to `main` + manual dispatch only | Brings up the **entire** `docker-compose.yml` stack, seeds it, runs the spec §19 demo mission, the spec §27 Playwright journey, and the TC-P0-006/007 container-kill resilience tests |
+
+The last job is restricted to `main` (not every PR) so day-to-day CI feedback stays fast — it's
+the whole-stack gate, not the first thing a contributor waits on. Trigger it manually from the
+Actions tab (`workflow_dispatch`) to verify a branch before merging without waiting for a push to
+`main`.
 
 ## Repository layout
 
