@@ -25,7 +25,10 @@ def test_full_phase0_journey(page: Page):
     page.get_by_label("Email").fill(ADMIN_EMAIL)
     page.get_by_label("Password").fill(ADMIN_PASSWORD)
     page.get_by_role("button", name="Sign in").click()
-    expect(page.get_by_text("Dashboard")).to_be_visible(timeout=10_000)
+    # Not get_by_text("Dashboard") — that matches both the nav link and the <h2>
+    # heading and trips Playwright's strict-mode ambiguity check (found by CI's first
+    # real run of this test). The heading role is unambiguous.
+    expect(page.get_by_role("heading", name="Dashboard")).to_be_visible(timeout=10_000)
 
     # 2. Create agent
     page.get_by_role("link", name="Create Agent").click()
@@ -52,11 +55,19 @@ def test_full_phase0_journey(page: Page):
     # 4. Start mission
     row = page.locator("tr", has_text=mission_title)
     row.get_by_role("button", name="Start").click()
-    expect(row.get_by_text("running")).to_be_visible(timeout=10_000)
+    # Scoped to the status badge's own class, not get_by_text("running") — the
+    # Overview tab (reached in step 5) also renders a "Started:" label, which a
+    # case-insensitive substring match on "running" wouldn't hit, but being
+    # consistent about targeting the badge itself avoids the same class of ambiguity
+    # the "Dashboard" fix above addresses.
+    expect(row.locator(".badge.status-running")).to_be_visible(timeout=10_000)
 
     # 5. Wait for completion
     row.get_by_role("link").first.click()
-    expect(page.get_by_text("completed")).to_be_visible(timeout=30_000)
+    # Not get_by_text("completed") — the Overview tab's "Completed:" label is a
+    # case-insensitive substring match for "completed" too, so this would hit the
+    # same strict-mode violation as step 1's original "Dashboard" locator.
+    expect(page.locator(".badge.status-completed")).to_be_visible(timeout=30_000)
 
     # 6. Inspect artifact
     page.get_by_role("button", name="Artifact").click()
