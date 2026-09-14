@@ -112,6 +112,11 @@ services:
     volumes:
       - ./packages:/repo/packages
       - ./services:/repo/services
+    # `postgres: service_healthy` only means the server accepts connections, not that
+    # `alembic upgrade head` has run yet (a separate step after `docker compose up`) —
+    # restart on crash so a container that starts before migrations land recovers on
+    # its own once they do, instead of staying dead for the rest of the stack's life.
+    restart: unless-stopped
 
   worker:
     build:
@@ -125,6 +130,14 @@ services:
     volumes:
       - ./packages:/repo/packages
       - ./services:/repo/services
+    # The worker's startup orphaned-task scan queries `tasks` immediately — if it
+    # starts before migrations have run (same race as `api`, above), it crashes with
+    # `UndefinedTableError` and, without this, simply stays dead: no queued mission
+    # would ever be processed again for the rest of the stack's life. Found by CI's
+    # E2E job — the demo-mission script happened to mask this because it has its own
+    # inline execute-if-nothing-claims-it fallback; the UI-driven E2E journey has no
+    # such fallback and exposed the dead worker directly.
+    restart: unless-stopped
 
   admin-web:
     build:
