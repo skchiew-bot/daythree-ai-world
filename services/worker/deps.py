@@ -12,17 +12,19 @@ from artifact_service.storage.object_store import ObjectStore, ObjectStoreConfig
 from common.config import Settings
 from event_service.publisher import EventPublisher
 from model_gateway.gateway import ModelGateway
+from model_gateway.provider_registry import available_provider_names
 from model_gateway.providers.mock import MockModelProvider
 from mission_engine.engine.task_executor import EngineDeps
 
 
 def build_model_gateway(settings: Settings) -> ModelGateway:
+    names = available_provider_names(settings)
     providers = {"mock": MockModelProvider()}
-    if settings.anthropic_api_key:
+    if "anthropic" in names:
         from model_gateway.providers.anthropic_provider import AnthropicProvider
 
         providers["anthropic"] = AnthropicProvider(api_key=settings.anthropic_api_key)
-    if settings.openai_api_key:
+    if "openai" in names:
         from model_gateway.providers.openai_provider import OpenAIProvider
 
         providers["openai"] = OpenAIProvider(api_key=settings.openai_api_key)
