@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from api.routes import (
+    agent_rooms,
     agents,
     artifacts,
     audit,
@@ -20,6 +21,7 @@ api_router.include_router(health.router)
 api_router.include_router(auth.router)
 api_router.include_router(tenant.router)
 api_router.include_router(agents.router)
+api_router.include_router(agent_rooms.router)
 api_router.include_router(model_policies.router)
 api_router.include_router(missions.router)
 api_router.include_router(tasks.router)

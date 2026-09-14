@@ -4,6 +4,7 @@ import { api } from "@/api/client";
 import type {
   Agent,
   AgentCreateRequest,
+  AgentRoomsResponse,
   Artifact,
   AuditEvent,
   CurrentUser,
@@ -48,7 +49,10 @@ export function useCreateAgent() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (payload: AgentCreateRequest) => api.post<Agent>("/api/v1/agents", payload),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["agents"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-rooms"] });
+    },
   });
 }
 
@@ -57,7 +61,10 @@ export function useActivateAgent() {
   return useMutation({
     mutationFn: ({ agentId, versionId }: { agentId: string; versionId: string }) =>
       api.post<Agent>(`/api/v1/agents/${agentId}/activate?version_id=${versionId}`),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["agents"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-rooms"] });
+    },
   });
 }
 
@@ -65,7 +72,18 @@ export function useSuspendAgent() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (agentId: string) => api.post<Agent>(`/api/v1/agents/${agentId}/suspend`),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["agents"] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-rooms"] });
+    },
+  });
+}
+
+export function useAgentRooms() {
+  return useQuery({
+    queryKey: ["agent-rooms"],
+    queryFn: () => api.get<AgentRoomsResponse>("/api/v1/agent-rooms"),
+    refetchInterval: 3_000,
   });
 }
 

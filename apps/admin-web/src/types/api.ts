@@ -145,6 +145,25 @@ export interface ExternalAgentStatus {
   updated_at: string;
 }
 
+export interface AgentRoom {
+  agent_id: string;
+  agent_code: string;
+  display_name: string;
+  lifecycle_state: string;
+  floor: number;
+  room_index: number;
+  assigned_at: string;
+  activity: "idle" | "assigned" | "working" | "completed" | "failed";
+  active_task_id: string | null;
+  activity_changed_at: string | null;
+}
+
+export interface AgentRoomsResponse {
+  rooms_per_floor: number;
+  default_floor_count: number;
+  rooms: AgentRoom[];
+}
+
 export interface DashboardSummary {
   total_agents: number;
   active_missions: number;
