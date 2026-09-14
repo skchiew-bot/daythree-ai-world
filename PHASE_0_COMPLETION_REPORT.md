@@ -101,7 +101,7 @@ and unit-tested but has never been exercised against the live Anthropic API.
 | Admin Web (5 pages) | `apps/admin-web/` | Done, verified in CI (Playwright drives the full spec §27 journey through it) |
 | Observability (structlog, OTel, Prometheus, 1 Grafana dashboard) | `services/observability/`, `infrastructure/compose/` | Done; structured logs confirmed flowing in CI job logs, dashboard/tracing not independently inspected |
 | Seed script + demo mission runner | `infrastructure/scripts/` | Done, runs successfully every CI run |
-| 8 ADRs | `docs/adr/` | Done |
+| 8 ADRs (Phase 0) + ADR-009 (post-Phase-0 apartment feature, merged) | `docs/adr/` | Done — `ADR-010` exists as a design doc but is not yet committed (a follow-on feature, out of scope for this build) |
 
 ## Tests
 
@@ -423,13 +423,18 @@ env vars, always exits 0) wired via a `UserPromptSubmit` hook (`working`) and a 
 (`done`) in `.claude/settings.local.json` (gitignored; `.example` version tracked) so a Claude Code
 session reports its own status automatically instead of needing a manual `curl` each time.
 
-**Not verified working automatically** — Claude Code appears to load hook configuration at session
-start rather than hot-reloading it mid-session, and the file was created mid-session, so the hook
-was never registered for the session that authored it. The script itself is directly verified (both
-its success and silent-no-op-on-missing-credentials paths were run by hand and produced the correct
-result); whether the hook actually fires on a fresh session, and whether its bash-style command
-syntax executes as written on Windows (undocumented which shell runs a hook's `command` string
-there), is pending real-world confirmation in a new session.
+**Update — now confirmed firing automatically.** The "pending real-world confirmation" below was
+correct to be cautious: on a genuinely fresh session the hook did not fire. Three distinct Windows-
+shell bugs were found and fixed in [PR #13](https://github.com/skchiew-bot/daythree-ai-world/pull/13)
+— see that section below for detail. The original caveat text is kept for the record:
+
+Originally: **not verified working automatically** — Claude Code appears to load hook configuration
+at session start rather than hot-reloading it mid-session, and the file was created mid-session, so
+the hook was never registered for the session that authored it. The script itself is directly
+verified (both its success and silent-no-op-on-missing-credentials paths were run by hand and
+produced the correct result); whether the hook actually fires on a fresh session, and whether its
+bash-style command syntax executes as written on Windows (undocumented which shell runs a hook's
+`command` string there), is pending real-world confirmation in a new session.
 
 ### Claude Code as a registered, governed Agent ([PR #10](https://github.com/skchiew-bot/daythree-ai-world/pull/10))
 
@@ -460,3 +465,86 @@ but not internal ones, a full `complete-external` run producing a real artifact 
 8-event timeline, invalid-output rejection (422), the internal-agent 409 guard on both new routes,
 and `fail-external`. Full unit + integration + security suite (74 tests) passed locally before this
 PR was opened, in addition to CI's own 4 jobs.
+
+### Desk avatar agent-label bug fix ([PR #12](https://github.com/skchiew-bot/daythree-ai-world/pull/12))
+
+Found live during a step-by-step demo of the "start a mission, complete it from Claude Code, watch
+the 3D world react" flow: the desk avatar's caption was a hardcoded `"Atlas"` string, not derived
+from the focus mission's actual `assigned_agent_id` — so a mission assigned to the newly-registered
+`AGT-CLAUDE-CODE` agent still displayed "Atlas" underneath it. Fixed by looking the assigned agent
+up via `useAgents()` and falling back to "Assigned agent" only when no matching agent record exists.
+
+### Claude Code hook: Windows shell bugs fixed and confirmed firing for real ([PR #13](https://github.com/skchiew-bot/daythree-ai-world/pull/13))
+
+The PR #9 caveat above ("pending real-world confirmation") turned out to be exactly right to flag —
+on a genuinely fresh session, the hook never fired. Three distinct, real Windows-shell bugs, found
+by isolating the hook's `command` string into a standalone `.bat` and running it directly to read the
+exact error at each stage:
+
+1. A trailing `&` used to background the curl calls got killed before completing — the hook runner
+   appears to tear down the process tree before an orphaned background job finishes.
+2. An unqualified `bash` (no path) inside the wrapper script resolved to Windows' own WSL bash
+   launcher (`C:\Windows\System32\bash.exe`), not Git Bash — WSL has a completely different
+   filesystem view where `C:/...` paths don't exist, producing a confusing "No such file or
+   directory" for a file that genuinely exists. Fixed by always using the fully-qualified Git Bash
+   path.
+3. Without `--login`, Git Bash's own coreutils (`dirname`, `date`, `sed`) weren't on `PATH`, since
+   normal profile setup never ran. Fixed by passing `--login` to `bash.exe`.
+
+All machine-specific config (base URL, admin password) was moved out of the hook's `command` string
+and into small gitignored wrapper scripts (`hook_working.sh`/`hook_stop.sh`), so the JSON `command`
+itself stays a single simple invocation with no nested quoting. Verified twice, independently: once
+via a direct `cmd.exe` repro proving the command syntax itself works, and once by a genuinely fresh
+Claude Code session's `Stop` hook firing for real — confirmed by observing `status="done"` at a
+timestamp that was never manually triggered.
+
+### External-agent status endpoint hardened ([PR #14](https://github.com/skchiew-bot/daythree-ai-world/pull/14))
+
+`PUT /api/v1/external-agents/{name}/status` originally accepted any authenticated role and had no
+rate limit — a capacity-DoS path against a table (`external_agent_statuses`) with no delete route,
+flagged by `guardian-gatekeeper`'s review of ADR-009 and required to be fixed before ADR-010's
+Phase A builds on the same ground. Fixed: writes are now restricted to
+`platform_admin`/`tenant_admin`/`operator` (matching `agents.py`'s `MUTATORS` pattern), and a Redis
+fixed-window limit of 60 requests/60s per tenant was added, with a self-healing `NX EXPIRE` so a
+request that dies between `INCR` and `EXPIRE` can't strand the counter above the threshold forever.
+4 new security tests (auth required, upsert semantics unchanged, cross-tenant isolation unchanged,
+viewer role rejected, rate limit enforced).
+
+### ADR-009: agent room assignment — 20-room apartment ([PR #15](https://github.com/skchiew-bot/daythree-ai-world/pull/15))
+
+Every governed agent now gets a persistent, tenant-scoped room in a 5-floor x 4-room apartment,
+replacing the single shared desk in `/world`. Gated by `guardian-gatekeeper` before implementation
+(see `docs/adr/ADR-009-agent-room-assignment.md`) — the gate's own alternative (presentation-layer
+assignment, never gating registration, elastic floors past the 20-room soft cap) is what shipped, in
+preference to the literal "hard 20-room pool" reading of the operator's request, since a hard pool
+would have made agent onboarding capacity-gated with no deallocation path.
+
+New `agent_room_assignments` table (migration `0003`), with two partial unique indexes
+(`WHERE released_at IS NULL`) as the actual concurrency guarantee — one preventing two agents
+double-booking a room, the other preventing one agent holding two active rooms — rather than
+application-level check-then-act, consistent with the idempotency approach in
+`docs/adr/ADR-007-idempotency.md`. `GET /api/v1/agent-rooms` lazily backfills any agent with no room
+yet (so agents seeded before this feature existed are roomed on first read, without touching
+`seed.py`) and derives each room's live activity from the agent's most recent Task. Suspending an
+agent releases its room; reactivating re-ensures one (possibly a different room, if the old one was
+taken meanwhile). `World.tsx` was reworked (`apps/admin-web/src/world/{layout,avatar,apartment,
+agentState}.ts`) so a room's position is always a pure function of `(floor, room_index)`, never array
+order — registering an unrelated agent never moves anyone else's room.
+
+Two real concurrency bugs were found and fixed via a test that races 8 real allocations against a
+testcontainers Postgres: (1) after `session.begin_nested()` catches an `IntegrityError` from a
+colliding INSERT, the SAVEPOINT rollback alone left the ORM `Session` needing an explicit
+`rollback()` before its next query would run (asyncpg raised `PendingRollbackError` otherwise); (2)
+the initial retry budget of 5 attempts was too low for genuine 8-way contention (two of eight callers
+hit exhaustion in testing) — raised to 16.
+
+24 new tests: 10 unit (slot math — first/fourth/fifth/20th/21st occupant, round-trip, released-slot
+reuse), 8 integration (registration assigns a room, idempotency across reads, 21st agent overflows to
+floor 6, suspend releases + the room is reused, seeded-agent lazy backfill, activity reflects the
+task lifecycle, registration survives an allocator exception at both the route and service layer), 3
+concurrency (8 concurrent distinct agents get 8 distinct rooms, 2 concurrent ensures for one agent
+yield 1 row, room reused after release — all against real Postgres, not mocked), 3 cross-tenant
+isolation. Verified live against the running dev stack beyond CI: the migration applies cleanly on
+top of revision `0002`, both partial indexes confirmed present via `pg_indexes`, and
+`GET /api/v1/agent-rooms` correctly lazy-backfilled the pre-existing Atlas and Claude Code agents
+into rooms (1,1) and (1,2) — confirmed both in the raw API response and visually in the browser.

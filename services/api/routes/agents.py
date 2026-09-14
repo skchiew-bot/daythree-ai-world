@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.db.models import Agent, AgentVersion, User
+from common.db.models import Agent, AgentVersion, ModelPolicy, User
 from common.hashing import sha256_hex
 from contracts.enums import AgentLifecycleState, EventType, UserRole
 from contracts.events import Actor, ActorType, build_event
@@ -48,6 +48,21 @@ def _version_checksum(payload: AgentVersionCreateRequest) -> str:
     return sha256_hex(payload.model_dump_json())
 
 
+async def _require_tenant_model_policy(session: AsyncSession, model_policy_id: EntityId, tenant_id: EntityId) -> None:
+    """guardian-gatekeeper (PATCH /model-policies gate review, finding FP-2 / condition
+    A8): `model_policy_id` was previously accepted straight from the client with only an
+    FK check (no tenant predicate), so tenant A could create an AgentVersion pointing at
+    tenant B's ModelPolicy row — inert while model_policies had no write route, but a
+    live cross-tenant leak the moment one existed. 400, not 404: this is a bad reference
+    inside the request body, not a path resource (matches activate_agent's existing
+    "Version does not belong to this agent" 400 for the same kind of mismatch)."""
+    policy = await get_tenant_scoped_or_404(session, ModelPolicy, model_policy_id, tenant_id)
+    if policy is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="model_policy_id does not belong to this tenant."
+        )
+
+
 @router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
     payload: AgentCreateRequest,
@@ -55,6 +70,8 @@ async def create_agent(
     session: AsyncSession = Depends(get_db_session),
     publisher=Depends(get_event_publisher),
 ) -> Agent:
+    await _require_tenant_model_policy(session, payload.version.model_policy_id, user.tenant_id)
+
     agent = Agent(
         id=new_id(), tenant_id=user.tenant_id, agent_code=payload.agent_code,
         display_name=payload.display_name, description=payload.description,
@@ -128,6 +145,7 @@ async def create_agent_version(
     agent = await get_tenant_scoped_or_404(session, Agent, agent_id, user.tenant_id)
     if agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found.")
+    await _require_tenant_model_policy(session, payload.model_policy_id, user.tenant_id)
 
     max_version = (
         await session.execute(select(AgentVersion.version).where(AgentVersion.agent_id == agent_id).order_by(AgentVersion.version.desc()).limit(1))
