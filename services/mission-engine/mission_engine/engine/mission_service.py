@@ -76,6 +76,20 @@ async def start_mission(session: AsyncSession, redis_client: Redis, *, mission_i
     mission = await session.get(Mission, mission_id)
     if mission is None:
         raise ValueError(f"Mission {mission_id} does not exist.")
+    if won_the_race:
+        # `session.get()` above returns the identity-mapped object if this session
+        # already loaded this Mission earlier in the request (e.g. the API route's own
+        # tenant-scoping lookup before calling this function) — a plain Core-style
+        # `update()` like the one above never touches that cached Python object's
+        # attributes directly. SQLAlchemy's ORM-enabled bulk-update sync then expires
+        # (not populates) attributes it can't statically evaluate — `started_at=
+        # func.now()` is exactly that case — leaving `mission.started_at` needing a
+        # lazy reload. FastAPI's response-model serialization runs outside the async
+        # greenlet context, so that lazy reload raises `MissingGreenlet` instead of a
+        # value (found by CI's E2E run against a real Postgres). An explicit, awaited
+        # refresh here — right where the row was actually changed — fixes it for every
+        # caller of `start_mission`, not just the API route.
+        await session.refresh(mission)
 
     if not won_the_race:
         existing_task = (
@@ -130,6 +144,15 @@ async def start_mission(session: AsyncSession, redis_client: Redis, *, mission_i
 async def mark_mission_status(session: AsyncSession, mission: Mission, target: MissionStatus) -> None:
     validate_mission_transition(MissionStatus(mission.status), target)
     mission.status = target.value
-    if target in (MissionStatus.completed, MissionStatus.failed, MissionStatus.cancelled):
+    sets_completed_at = target in (MissionStatus.completed, MissionStatus.failed, MissionStatus.cancelled)
+    if sets_completed_at:
         mission.completed_at = func.now()
     await session.flush()
+    if sets_completed_at:
+        # Same MissingGreenlet-on-serialization risk as `start_mission`'s CAS update,
+        # here via a plain ORM attribute assignment instead of a Core `update()` —
+        # assigning `func.now()` directly still leaves the attribute needing a
+        # reload that a later sync-context serialization can't perform. Refresh right
+        # after the flush that changed it, for every caller (currently just
+        # `routes/missions.py::cancel_mission`).
+        await session.refresh(mission)

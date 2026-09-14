@@ -54,7 +54,16 @@ mission_engine/`).
   raises `MissingGreenlet` instead. Found by CI's first real run of `POST /api/v1/
   agents` (an INSERT immediately followed by an UPDATE in the same request) — fixed in
   the three `services/api/routes/agents.py` routes with this exact pattern
-  (`create_agent`, `activate_agent`, `suspend_agent`).
+  (`create_agent`, `activate_agent`, `suspend_agent`). CI's *next* run then caught the
+  same class of bug one layer deeper: `mission_engine.engine.mission_service.
+  start_mission`'s idempotent CAS uses a Core-style `update(Mission)...` statement
+  (needed for the atomic compare-and-swap itself), and SQLAlchemy's ORM-aware bulk-
+  update sync *expires* — rather than populates — an already-identity-mapped Mission's
+  `started_at` when it can't statically evaluate `func.now()`. Same fix (`session.
+  refresh()`), applied once at the source in `mission_service.py` (covering
+  `start_mission` and `mark_mission_status`) rather than at each route, since both are
+  called from more than one place (the API and `infrastructure/scripts/
+  run_demo_mission.py`).
 - Local dev requires one `pip install -r requirements.txt`, not per-service installs.
 - A future Phase 1+ decision to split a service into its own deployable unit (e.g. the
   model gateway, if it needs independent scaling) requires adding a `pyproject.toml` to
