@@ -295,9 +295,10 @@ class ExternalAgentStatus(Base):
     """Not in spec §8 — a Phase 0-adjacent addition (see the 3D World page) for
     agents that live *outside* Daythree's own governed mission engine (a Claude Code
     session, an external script) to report a live status so they can be visualized
-    alongside Atlas. Deliberately outside the governed loop: no budget/permission
-    enforcement, no audit_events entries — just a last-known-status row any
-    authenticated caller can push to."""
+    alongside Atlas. Deliberately outside the governed loop: no budget enforcement,
+    no audit_events entries — just a last-known-status row. The write endpoint
+    (`PUT /{name}/status`) is role-gated and rate-limited (ADR-010 gate review, C1);
+    it is not open to every authenticated caller."""
 
     __tablename__ = "external_agent_statuses"
     __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_external_agent_statuses_tenant_name"),)
