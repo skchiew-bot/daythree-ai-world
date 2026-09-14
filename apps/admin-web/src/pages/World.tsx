@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-import { useExternalAgentStatuses, useMissionTimeline, useMissions } from "@/api/hooks";
+import { useAgents, useExternalAgentStatuses, useMissionTimeline, useMissions } from "@/api/hooks";
 import type { ExternalAgentStatus, Mission } from "@/types/api";
 
 /** Visual state any avatar reacts to. Derived from real mission/task data or a real
@@ -149,8 +149,11 @@ function updateAvatar(handle: AvatarHandle, anim: AvatarAnimState, state: AgentS
 
 export function World() {
   const { data: missions } = useMissions();
+  const { data: agents } = useAgents();
   const { data: externalAgents } = useExternalAgentStatuses();
   const focusMission = pickFocusMission(missions);
+  const focusAgentName =
+    agents?.find((a) => a.id === focusMission?.assigned_agent_id)?.display_name ?? "Assigned agent";
   const { data: timeline } = useMissionTimeline(focusMission?.id);
 
   const timelineEventTypes = useMemo(() => timeline?.map((e) => e.event_type) ?? [], [timeline]);
@@ -333,16 +336,17 @@ export function World() {
       <h2>3D World</h2>
       <p style={{ color: "var(--text-muted)", marginTop: "-0.5rem" }}>
         Not part of the Phase 0 spec — an additive visualization of the real agent runtime. Every
-        avatar's state is driven live by actual data polled from the API, not scripted: Atlas (near
-        the desk) reflects real mission/task events; the row in front reflects any external agent —
-        a Claude Code session, a script, anything — pinging{" "}
+        avatar's state is driven live by actual data polled from the API, not scripted: the desk
+        avatar reflects real mission/task events for whichever agent the focus mission is actually
+        assigned to (any registered Agent, not just Atlas); the row in front reflects any external
+        agent — a Claude Code session, a script, anything — pinging{" "}
         <code>PUT /api/v1/external-agents/&#123;name&#125;/status</code>.
       </p>
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
         <div ref={containerRef} style={{ width: "100%", height: "60vh" }} />
       </div>
       <div className="card" style={{ marginTop: "1rem" }}>
-        <strong>Atlas</strong>{" "}
+        <strong>{focusMission ? focusAgentName : "Desk avatar"}</strong>{" "}
         {focusMission ? (
           <>
             — {focusMission.mission_code}: {focusMission.title}{" "}
