@@ -23,7 +23,7 @@ from contracts.ids import new_id
 from contracts.policy import BudgetPolicy
 
 from mission_engine.engine.mission_service import create_mission, start_mission
-from mission_engine.engine.queue import dequeue_task
+from mission_engine.engine.queue import dequeue_task, enqueue_task
 from mission_engine.engine.task_executor import execute_task
 from worker.deps import build_engine_deps, build_redis_client
 
@@ -60,8 +60,10 @@ async def run_demo() -> None:
             logger.info("demo_mission_created", mission_id=str(mission.id))
 
         if mission.status in (MissionStatus.draft.value, MissionStatus.ready.value):
-            result = await start_mission(session, redis_client, mission_id=mission.id)
-            await session.commit()
+            result = await start_mission(session, mission_id=mission.id)
+            await session.commit()  # commit BEFORE enqueueing — see start_mission's docstring
+            if result.newly_started:
+                await enqueue_task(redis_client, result.task.id)
             logger.info("demo_mission_started", newly_started=result.newly_started)
 
     # Try to claim and run the task ourselves first (works with no separate worker).

@@ -13,7 +13,7 @@ import pytest
 from contracts.enums import EventType, TaskStatus
 from contracts.policy import BudgetPolicy
 from mission_engine.engine.mission_service import create_mission, start_mission
-from mission_engine.engine.queue import dequeue_task
+from mission_engine.engine.queue import dequeue_task, enqueue_task
 from mission_engine.engine.task_executor import execute_task
 
 pytestmark = pytest.mark.integration
@@ -31,8 +31,9 @@ async def test_full_mission_lifecycle_tc_p0_001_003_004_011(db_session, fake_red
     await db_session.commit()
     assert mission.status == "draft"  # TC-P0-003: valid mission persists
 
-    start_result = await start_mission(db_session, fake_redis, mission_id=mission.id)
-    await db_session.commit()
+    start_result = await start_mission(db_session, mission_id=mission.id)
+    await db_session.commit()  # commit before enqueueing — see start_mission's docstring
+    await enqueue_task(fake_redis, start_result.task.id)
     assert start_result.newly_started is True
     task = start_result.task
     assert task.status == TaskStatus.queued.value
@@ -78,9 +79,9 @@ async def test_duplicate_start_request_creates_only_one_run_tc_p0_010(db_session
     )
     await db_session.commit()
 
-    first = await start_mission(db_session, fake_redis, mission_id=mission.id)
+    first = await start_mission(db_session, mission_id=mission.id)
     await db_session.commit()
-    second = await start_mission(db_session, fake_redis, mission_id=mission.id)
+    second = await start_mission(db_session, mission_id=mission.id)
     await db_session.commit()
 
     assert first.newly_started is True
@@ -104,8 +105,9 @@ async def test_audit_timeline_reconstructs_full_lifecycle_tc_p0_013(db_session, 
         objective="x", requested_by=None, assigned_agent_id=seeded["agent"].id, budget_policy=BudgetPolicy(),
     )
     await db_session.commit()
-    await start_mission(db_session, fake_redis, mission_id=mission.id)
+    audit_start_result = await start_mission(db_session, mission_id=mission.id)
     await db_session.commit()
+    await enqueue_task(fake_redis, audit_start_result.task.id)
 
     task_id = await dequeue_task(fake_redis, timeout_seconds=1)
     await execute_task(db_session, engine_deps, task_id)

@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from redis.asyncio import Redis
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +16,6 @@ from contracts.enums import MissionPriority, MissionStatus, RiskLevel, TaskStatu
 from contracts.ids import EntityId, new_id
 from contracts.policy import BudgetPolicy
 
-from mission_engine.engine.queue import enqueue_task
 from mission_engine.states.transitions import validate_mission_transition
 
 
@@ -59,11 +57,23 @@ async def create_mission(
     return mission
 
 
-async def start_mission(session: AsyncSession, redis_client: Redis, *, mission_id: EntityId) -> StartMissionResult:
+async def start_mission(session: AsyncSession, *, mission_id: EntityId) -> StartMissionResult:
     """Idempotent (spec §14, TC-P0-010): a second `start` call for an already-running
     (or already-terminal) mission returns the existing task instead of creating a new
     one or re-enqueueing it — the atomic `UPDATE ... WHERE status IN (...)` below is
     what actually prevents the race, not an application-level check-then-act.
+
+    Deliberately does NOT enqueue the new task to Redis itself (contrast with
+    `artifact_service.commit_artifact`, which owns its own side effect end-to-end) —
+    this function only flushes within the caller's still-open transaction. If it
+    enqueued here, a fast worker could `BRPOP` the task and query for it before the
+    caller's `session.commit()` ever runs, and see nothing (the INSERT is only
+    visible inside this same uncommitted transaction) — `TaskExecutionError: Task ...
+    does not exist`. Found by CI's E2E job once the two earlier worker-crash bugs were
+    fixed and the worker was finally fast enough to consistently win that race. The
+    caller MUST commit before calling `mission_engine.engine.queue.enqueue_task` for
+    `result.task.id` when `result.newly_started` is true — see `routes/missions.py`
+    and `infrastructure/scripts/run_demo_mission.py` for the two call sites.
     """
     result = await session.execute(
         update(Mission)
@@ -137,7 +147,6 @@ async def start_mission(session: AsyncSession, redis_client: Redis, *, mission_i
         # only a fresh task created by this call should be pushed onto the queue).
         return StartMissionResult(mission=mission, task=existing_task, newly_started=False)
 
-    await enqueue_task(redis_client, task.id)
     return StartMissionResult(mission=mission, task=task, newly_started=True)
 
 

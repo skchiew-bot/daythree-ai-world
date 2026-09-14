@@ -18,6 +18,7 @@ from api.schemas.missions import MissionCreateRequest, MissionResponse
 
 from mission_engine.engine.mission_service import create_mission as _create_mission
 from mission_engine.engine.mission_service import mark_mission_status, start_mission
+from mission_engine.engine.queue import enqueue_task
 from mission_engine.states.transitions import InvalidTransition
 
 router = APIRouter(prefix="/api/v1/missions", tags=["missions"])
@@ -86,7 +87,7 @@ async def start_mission_route(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
 
     try:
-        result = await start_mission(session, redis_client, mission_id=mission_id)
+        result = await start_mission(session, mission_id=mission_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
@@ -100,6 +101,15 @@ async def start_mission_route(
                         task_id=result.task.id, agent_id=result.task.assigned_agent_id)
         await _publish(publisher, session, EventType.task_assigned, user.tenant_id, actor, mission_id,
                         task_id=result.task.id, agent_id=result.task.assigned_agent_id)
+
+        # Commit BEFORE enqueueing, not after: `get_db_session`'s automatic commit only
+        # runs once this route returns, which would be after `enqueue_task` below — a
+        # worker could then BRPOP this task_id and query for it while the INSERT is
+        # still only visible inside this uncommitted transaction, raising
+        # `TaskExecutionError: Task ... does not exist` (found by CI's E2E job; see
+        # `mission_service.start_mission`'s docstring for the full explanation).
+        await session.commit()
+        await enqueue_task(redis_client, result.task.id)
     return result.mission
 
 

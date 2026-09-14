@@ -47,6 +47,20 @@ Option 1, applied at three points:
 
 ## Consequences
 
+- **`start_mission` never enqueues to Redis itself — the caller must commit its
+  transaction first, then enqueue.** The first version had `start_mission` both insert
+  the task row *and* push it to Redis before returning. Once the worker's two earlier
+  startup bugs were fixed (see ADR-001/ADR-003) and it could reliably win the `BRPOP`
+  race within milliseconds of a task being queued, it started consistently beating the
+  producer's own `session.commit()` — the worker would `session.get(Task, task_id)` on
+  its own connection and find nothing, because the INSERT was still only visible
+  inside the producer's uncommitted transaction. `TaskExecutionError: Task ... does not
+  exist`, deterministically, on a healthy fast worker. This is the classic dual-write
+  ordering hazard, and the fix is the standard one: commit the state change before
+  publishing that it happened, not after. Both call sites
+  (`services/api/routes/missions.py`, `infrastructure/scripts/run_demo_mission.py`)
+  now do `await session.commit()` then `await enqueue_task(...)` explicitly, and
+  `start_mission`'s own docstring states this contract for any future caller.
 - Every idempotent operation needs a deterministic key computed the same way on every
   attempt (`f"{mission_id}:task:1"` for the one Phase 0 task, `logical_output_slot="primary"`
   for the one Phase 0 output) — a design that assumes "one task per mission, one output

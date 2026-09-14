@@ -13,7 +13,7 @@ from contracts.enums import TaskStatus
 from contracts.policy import BudgetPolicy
 from mission_engine.checkpoints.sql_checkpoint_store import SqlCheckpointStore
 from mission_engine.engine.mission_service import create_mission, start_mission
-from mission_engine.engine.queue import dequeue_task
+from mission_engine.engine.queue import dequeue_task, enqueue_task
 from mission_engine.engine.task_executor import execute_task
 
 pytestmark = pytest.mark.integration
@@ -28,8 +28,9 @@ async def test_worker_crash_after_first_checkpoint_recovers_without_duplicate_ar
         objective="x", requested_by=None, assigned_agent_id=seeded["agent"].id, budget_policy=BudgetPolicy(),
     )
     await db_session.commit()
-    await start_mission(db_session, fake_redis, mission_id=mission.id)
+    start_result = await start_mission(db_session, mission_id=mission.id)
     await db_session.commit()
+    await enqueue_task(fake_redis, start_result.task.id)
     task_id = await dequeue_task(fake_redis, timeout_seconds=1)
     deps = engine_deps
 
