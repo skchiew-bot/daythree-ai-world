@@ -43,6 +43,7 @@ operator has merged.
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
 | L1 | Contribution ledger: accept/reject, mint, upkeep | Gate E | operator opens Gate E |
 | L2 | Materials and workshop (spend, 3D render) | L1 | L1 merged |
+| X1 | Twin merge / succession (ADR-012) | L1 | L1 merged, operator answers O6..O9 |
 | C1 | Council: reports and proposals | L1 | L1 merged |
 | M1 | Operator model: reviews, profile docs, knowledge_read | L1 | L1 merged |
 | A1 | Autonomy graduation proposals | C1 + M1 | both merged |
@@ -251,6 +252,46 @@ gifting or trading (ADR-011).
 a deterministic slot; `typecheck` and `build`.
 
 **Handoff prompt:** as T1, phase L2, branch `feat/ledger-l2-materials`.
+
+---
+
+## X1. Twin merge / succession (ADR-012)
+
+**Goal.** Two or more proven twins become one successor twin; the predecessors stop existing
+operationally while their history and earned credits survive intact. No credit is minted, destroyed
+or transferred.
+
+**Deliverables.** `AgentLifecycleState.merged` (terminal: `activate_agent` and `suspend_agent` return
+409; mission creation and `_load_external_task` refuse a merged `assigned_agent_id`; the registry
+renders no action button). Migration `0007_agent_merges`: `agent_merges(id, tenant_id,
+successor_agent_id, decided_by, rationale String(500), idempotency_key unique, approved_at,
+created_at)` and `agent_merge_predecessors(merge_id, tenant_id, predecessor_agent_id)` with
+`UNIQUE(tenant_id, predecessor_agent_id)` and a composite FK to `agents(tenant_id, id)` (add the
+matching unique index on `agents`). `POST /api/v1/agents/merge` behind a router-local role constant
+(`operator` / `tenant_admin` / `platform_admin`, 403 for `agent_runtime`), body carries explicit
+`predecessor_agent_ids` plus the successor's creation payload; any proposal reference is an opaque
+string. Preconditions: predecessors `active` or `suspended`, no task in `queued` / `running` /
+`waiting`, successor `agent_code` unused (400, not 500). One transaction: lock every anchor in
+ascending `agent_id` order, insert merge rows in `begin_nested()`, create the successor through
+`create_agent` (rooms via `ensure_assignment`), flip predecessors to `merged`, `release_assignment`
+each, emit `agent.merged` (new `EventType`) per predecessor and for the successor with ids and
+counts only. `lineage_head(agent_id)` and a recursive `DISTINCT` depth-capped lineage CTE in the
+ledger service; every read, mint and debit resolves the head before locking. `agent_rooms.py`
+filters `lifecycle_state IN (draft, active)`.
+
+**Tests.** Merged agent absent from `GET /agent-rooms` and holds no active assignment after the
+call; 409 on activate and suspend of a merged agent; 409 when a predecessor has an open task; 422
+for a body naming only a proposal reference; 403 for `agent_runtime`; duplicate execute with the
+same idempotency key returns the first result, without it the second is 409; chained merge A+B→C
+then C+D→E gives `balance(E)` equal to the sum over A, B, C, D, E to the cent; concurrent purchase
+against predecessor and successor lets exactly one succeed; `rationale` never appears in
+`audit_events.payload`; `downgrade()` from `0007` lists agents left in `merged`.
+
+**Exit criteria.** ADR-012 conditions M1 to M10 each have a named test; typecheck and build green;
+the completion report's twin section states that successor balances include lineage.
+
+**Handoff prompt:** as T1, phase X1, branch `feat/twins-x1-merge`, read `docs/adr/ADR-012-twin-merge.md`
+first and treat its "Gate Review Outcome" findings as the acceptance list.
 
 ---
 
