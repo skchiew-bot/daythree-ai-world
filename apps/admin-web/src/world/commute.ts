@@ -1,7 +1,12 @@
 /** Where a twin is and how it gets there (ADR-014 decision 4). A pure state machine: no
- * `Math.random`, no `Date.now()` inside — every input (ids, the town plan, `nowMs`) is
- * passed in, so two clients fed the same inputs compute the same position, and a test can
- * call it twice and get the same answer. */
+ * `Math.random`, no `Date.now()` inside; every input (ids, the town plan, `nowMs`) is passed
+ * in, so a test can call it twice and get the same answer.
+ *
+ * What is and is not the same across browsers: idle wandering (idleSchedule.ts) and building
+ * placement (lots.ts) are functions of ids and wall-clock buckets, so two browsers agree. A
+ * commute is not: its `startMs` is the local time at which THIS browser first saw the data
+ * change, so the timing of a trip depends on each browser's poll phase (a few seconds
+ * apart). Making it identical would need a server timestamp, which is not allow-listed. */
 import { WALK_SPEED } from "./idleSchedule";
 import type { WorldAgent } from "./renderPayload";
 import { hashString } from "./rng";
@@ -75,8 +80,13 @@ export function resolvePlaceNode(place: Place, town: TownPlan, lotOf: ReadonlyMa
 export interface CommuteState {
   /** The last place the twin actually arrived at. */
   place: Place;
+  /** The road node it stands at (or set off from). Stored, never re-resolved from the current
+   * `lotOf`: a project that leaves the list, or a lot that shifts, must not move a twin. */
+  placeNode: string;
   /** Where it is headed; equals `place` once arrived. */
   target: Place;
+  /** The node the current trip ends at, resolved once when the trip started. */
+  targetNode: string;
   /** The road-graph polyline of the current trip, or null when not traveling. */
   path: Vec2[] | null;
   startMs: number;
@@ -87,8 +97,12 @@ export interface CommuteState {
 /** Places a twin at `place` with no travel — used the first time an agent is seen, same
  * spirit as agentMotion's initMotion snap (ADR-009), so a fresh page load never shows
  * everyone walking in from the residence. */
-export function initCommute(place: Place): CommuteState {
-  return { place, target: place, path: null, startMs: 0, distance: 0, vehicle: "walk" };
+export function initCommute(place: Place, town: TownPlan, lotOf: ReadonlyMap<string, number>): CommuteState {
+  return settledAt(place, resolvePlaceNode(place, town, lotOf), 0);
+}
+
+function settledAt(place: Place, node: string, nowMs: number): CommuteState {
+  return { place, placeNode: node, target: place, targetNode: node, path: null, startMs: nowMs, distance: 0, vehicle: "walk" };
 }
 
 function travelMs(state: CommuteState): number {
@@ -112,32 +126,42 @@ export function stepCommute(
 ): CommuteState {
   if (reducedMotion) {
     const settled = prev.path === null && placeEquals(prev.place, desired) && placeEquals(prev.target, desired);
-    return settled ? prev : { place: desired, target: desired, path: null, startMs: nowMs, distance: 0, vehicle: "walk" };
+    return settled ? prev : settledAt(desired, resolvePlaceNode(desired, town, lotOf), nowMs);
   }
 
   let state = prev;
   if (state.path && nowMs - state.startMs >= travelMs(state)) {
-    state = { ...state, place: state.target, path: null };
+    state = { ...state, place: state.target, placeNode: state.targetNode, path: null };
   }
   if (state.path || placeEquals(state.place, desired)) return state;
 
-  return startTrip(state.place, desired, agentId, town, lotOf, nowMs);
+  return startTrip(state, desired, agentId, town, lotOf, nowMs);
 }
 
+/** Only the DESTINATION is resolved from `lotOf`; the start is the node the twin already
+ * stands at. */
 function startTrip(
-  from: Place,
+  from: CommuteState,
   to: Place,
   agentId: string,
   town: TownPlan,
   lotOf: ReadonlyMap<string, number>,
   nowMs: number,
 ): CommuteState {
-  const fromNode = resolvePlaceNode(from, town, lotOf);
   const toNode = resolvePlaceNode(to, town, lotOf);
-  const path = fromNode === toNode ? null : shortestPath(town.roads, fromNode, toNode);
+  const path = from.placeNode === toNode ? null : shortestPath(town.roads, from.placeNode, toNode);
   const distance = path ? pathLength(path) : 0;
-  if (!path || distance <= 0) return { place: to, target: to, path: null, startMs: nowMs, distance: 0, vehicle: "walk" };
-  return { place: from, target: to, path, startMs: nowMs, distance, vehicle: vehicleFor(distance, agentId) };
+  if (!path || distance <= 0) return settledAt(to, toNode, nowMs);
+  return {
+    place: from.place,
+    placeNode: from.placeNode,
+    target: to,
+    targetNode: toNode,
+    path,
+    startMs: nowMs,
+    distance,
+    vehicle: vehicleFor(distance, agentId),
+  };
 }
 
 export interface CommutePose {
@@ -156,12 +180,11 @@ const scratchPoint: PathPoint = { x: 0, z: 0, dx: 0, dz: 1 };
 export function poseAt(
   state: CommuteState,
   town: TownPlan,
-  lotOf: ReadonlyMap<string, number>,
   nowMs: number,
   agentId: string,
   out: CommutePose = { x: 0, z: 0, heading: 0, walking: false, vehicle: "walk" },
 ): CommutePose {
-  if (!state.path) return standingPose(state.place, town, lotOf, agentId, out);
+  if (!state.path) return standingPose(state, town, agentId, out);
 
   const elapsedS = Math.max(0, (nowMs - state.startMs) / 1000);
   const s = Math.min(state.distance, elapsedS * speedOf(state.vehicle));
@@ -181,19 +204,13 @@ const STAND_SPACING_M = 0.45;
 /** Where a twin waits once it has arrived. At a building it faces the door (buildings face
  * +z, so the twin looks toward -z) and takes one of a few slots along the curb, chosen from
  * its id, so several twins at one project don't stand on each other. */
-function standingPose(
-  place: Place,
-  town: TownPlan,
-  lotOf: ReadonlyMap<string, number>,
-  agentId: string,
-  out: CommutePose,
-): CommutePose {
-  const node = town.roads.nodes.get(resolvePlaceNode(place, town, lotOf));
+function standingPose(state: CommuteState, town: TownPlan, agentId: string, out: CommutePose): CommutePose {
+  const node = town.roads.nodes.get(state.placeNode);
   const x = node?.x ?? 0;
   const z = node?.z ?? 0;
   out.walking = false;
   out.vehicle = "walk";
-  if (place.kind === "residence") {
+  if (state.place.kind === "residence") {
     out.x = x;
     out.z = z;
     out.heading = 0;

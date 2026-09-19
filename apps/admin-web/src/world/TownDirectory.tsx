@@ -24,20 +24,28 @@ export function TownDirectory({ projects, rooms, focusKey, onFocus }: TownDirect
     <aside className="card" aria-label="Town directory" style={{ flex: "1 1 15rem", minWidth: 0 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem" }}>
         <strong>Town</strong>
-        <button type="button" onClick={() => onFocus(null)} disabled={focusKey === null}>
+        {/* aria-disabled, not disabled: activating it must not drop keyboard focus to <body>. */}
+        <button
+          type="button"
+          aria-disabled={focusKey === null}
+          style={focusKey === null ? { opacity: 0.5, cursor: "default" } : undefined}
+          onClick={() => {
+            if (focusKey !== null) onFocus(null);
+          }}
+        >
           Back to overview
         </button>
       </div>
 
       <ul style={{ listStyle: "none", padding: 0, margin: "0.75rem 0 0", display: "grid", gap: "0.5rem" }}>
         <li>
-          <button type="button" aria-pressed={focusKey === RESIDENCE_KEY} onClick={() => onFocus(RESIDENCE_KEY)}>
+          <button type="button" aria-current={focusKey === RESIDENCE_KEY ? "true" : undefined} onClick={() => onFocus(RESIDENCE_KEY)}>
             Residence
           </button>
           <div style={{ color: "var(--text-muted)", fontSize: "0.85em" }}>Every twin's room; idle twins live here</div>
         </li>
         <li>
-          <button type="button" aria-pressed={focusKey === HALL_KEY} onClick={() => onFocus(HALL_KEY)}>
+          <button type="button" aria-current={focusKey === HALL_KEY ? "true" : undefined} onClick={() => onFocus(HALL_KEY)}>
             Community hall
           </button>
           <div style={{ color: "var(--text-muted)", fontSize: "0.85em" }}>Shared services, work with no project</div>
@@ -72,7 +80,7 @@ function ProjectEntry({ project, rooms, focused, hasBuilding, onFocus }: Project
   const assigned = rooms.filter((room) => room.project_id === project.id);
   return (
     <li>
-      <button type="button" aria-pressed={focused} disabled={!hasBuilding} onClick={() => onFocus(project.id)}>
+      <button type="button" aria-current={focused ? "true" : undefined} disabled={!hasBuilding} onClick={() => onFocus(project.id)}>
         {project.code}
       </button>{" "}
       <span className={`badge status-${project.status}`}>{project.status}</span>

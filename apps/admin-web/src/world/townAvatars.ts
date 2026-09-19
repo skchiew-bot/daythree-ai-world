@@ -81,7 +81,7 @@ export class TownAvatars {
         this.dropAway(agent.agent_id);
         this.scratch.push(agent);
       } else {
-        this.updateAway(agent, state, commute, lotOf, clock);
+        this.updateAway(agent, state, commute, clock);
       }
     }
 
@@ -99,7 +99,7 @@ export class TownAvatars {
 
   private advance(agent: WorldAgent, lotOf: ReadonlyMap<string, number>, clock: FrameClock): CommuteState {
     const desired = placeFor(agent);
-    const prev = this.commutes.get(agent.agent_id) ?? initCommute(desired);
+    const prev = this.commutes.get(agent.agent_id) ?? initCommute(desired, this.town, lotOf);
     const next = stepCommute(prev, desired, agent.agent_id, this.town, lotOf, clock.nowMs, clock.reducedMotion);
     this.commutes.set(agent.agent_id, next);
     return next;
@@ -109,11 +109,10 @@ export class TownAvatars {
     agent: WorldAgent,
     state: AgentState,
     commute: CommuteState,
-    lotOf: ReadonlyMap<string, number>,
     clock: FrameClock,
   ): void {
     const entry = this.awayEntry(agent);
-    const pose = poseAt(commute, this.town, lotOf, clock.nowMs, agent.agent_id, entry.commutePose);
+    const pose = poseAt(commute, this.town, clock.nowMs, agent.agent_id, entry.commutePose);
     const ride: RideKind | null = commute.path && commute.vehicle !== "walk" ? commute.vehicle : null;
     this.syncVehicle(entry, agent.agent_id, ride);
 

@@ -87,6 +87,35 @@ describe("town disposal (ADR-014 W2)", () => {
     expect(scene.children).toHaveLength(0);
   });
 
+  it("frees every sign's texture and material, not only geometry", () => {
+    stubCanvas();
+    const scene = new THREE.Scene();
+    const town = createTownMaterials(baseMaterials());
+    const plan = buildTownPlan();
+    const projects = ["p-1", "p-2"].map((id) => toWorldProject({ id, code: id.toUpperCase(), name: "Client", status: "active" }));
+
+    const statics = buildTownStatic(scene, town, plan);
+    const buildings = buildProjectBuildings(scene, town, plan, projects, assignLots(projects.map((p) => p.id)));
+
+    const freed = new Set<THREE.EventDispatcher>();
+    let signs = 0;
+    for (const group of [statics.group, buildings.group]) {
+      group.traverse((node) => {
+        const material = (node as THREE.Mesh).material as THREE.MeshBasicMaterial | undefined;
+        if (!material?.map) return;
+        signs++;
+        material.addEventListener("dispose", () => freed.add(material));
+        material.map.addEventListener("dispose", () => freed.add(material.map!));
+      });
+    }
+    expect(signs).toBe(3); // the hall's sign plus one per project
+
+    buildings.dispose();
+    statics.dispose();
+
+    expect(freed.size).toBe(signs * 2); // each sign: material + texture
+  });
+
   it("leaves no project building for a project with no lot", () => {
     stubCanvas();
     const scene = new THREE.Scene();

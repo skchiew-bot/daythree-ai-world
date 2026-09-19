@@ -1,10 +1,12 @@
 import * as THREE from "three";
 
+import { fitSignText } from "./signageFit";
+
 const CANVAS_W = 256;
 const CANVAS_H = 64;
 const FONT_FAMILY = "system-ui, sans-serif";
 const MAX_FONT_PX = 40;
-const MIN_FONT_PX = 14;
+const MIN_FONT_PX = 18;
 const PADDING_PX = 12;
 
 /** Draws `text` (a project's code, or "HALL") on a canvas texture. This is the only text
@@ -22,16 +24,15 @@ function drawSignTexture(text: string): THREE.CanvasTexture {
     ctx.lineWidth = 3;
     ctx.strokeRect(3, 3, CANVAS_W - 6, CANVAS_H - 6);
 
-    let size = MAX_FONT_PX;
-    ctx.font = `700 ${size}px ${FONT_FAMILY}`;
-    while (size > MIN_FONT_PX && ctx.measureText(text).width > CANVAS_W - PADDING_PX * 2) {
-      size -= 2;
-      ctx.font = `700 ${size}px ${FONT_FAMILY}`;
-    }
+    const fit = fitSignText(text, CANVAS_W - PADDING_PX * 2, MAX_FONT_PX, MIN_FONT_PX, (t, px) => {
+      ctx.font = `700 ${px}px ${FONT_FAMILY}`;
+      return ctx.measureText(t).width;
+    });
+    ctx.font = `700 ${fit.fontPx}px ${FONT_FAMILY}`;
     ctx.fillStyle = "#f8fafc";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(text, CANVAS_W / 2, CANVAS_H / 2 + 2);
+    ctx.fillText(fit.text, CANVAS_W / 2, CANVAS_H / 2 + 2);
   }
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;

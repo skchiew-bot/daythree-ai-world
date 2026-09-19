@@ -48,17 +48,17 @@ describe("vehicleFor (ADR-014 decision 5, D15)", () => {
 describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
   it("is deterministic: the same state and time give the same position twice", () => {
     const project: Place = { kind: "project", projectId: "proj-a" };
-    const start = initCommute({ kind: "residence" });
+    const start = initCommute({ kind: "residence" }, town, lotOf);
     const stepped = stepCommute(start, project, "agent-1", town, lotOf, 1_000, false);
 
-    const a = poseAt(stepped, town, lotOf, 5_000, "agent-1");
-    const b = poseAt(stepped, town, lotOf, 5_000, "agent-1");
+    const a = poseAt(stepped, town, 5_000, "agent-1");
+    const b = poseAt(stepped, town, 5_000, "agent-1");
     expect(a).toEqual(b);
   });
 
   it("starts walking toward a project when project_id is assigned", () => {
     const project: Place = { kind: "project", projectId: "proj-a" };
-    const start = initCommute({ kind: "residence" });
+    const start = initCommute({ kind: "residence" }, town, lotOf);
     const stepped = stepCommute(start, project, "agent-1", town, lotOf, 0, false);
 
     expect(stepped.path).not.toBeNull();
@@ -67,7 +67,7 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
 
   it("arrives at the target after enough time has passed, without snapping instantly", () => {
     const hall: Place = { kind: "hall" };
-    const start = initCommute({ kind: "residence" });
+    const start = initCommute({ kind: "residence" }, town, lotOf);
     const departed = stepCommute(start, hall, "agent-1", town, lotOf, 0, false);
     expect(isArrivedAt(departed, hall)).toBe(false);
 
@@ -83,11 +83,11 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
     const project: Place = { kind: "project", projectId: "proj-a" };
     const residence: Place = { kind: "residence" };
 
-    let state = initCommute(project);
+    let state = initCommute(project, town, lotOf);
     state = stepCommute(state, residence, "agent-1", town, lotOf, 0, false);
     expect(state.path).not.toBeNull();
 
-    const poseSoonAfter = poseAt(state, town, lotOf, 200, "agent-1");
+    const poseSoonAfter = poseAt(state, town, 200, "agent-1");
     // Still en route: not yet at the residence's road node.
     const residenceNode = town.roads.nodes.get("residence")!;
     const stillTraveling = Math.hypot(poseSoonAfter.x - residenceNode.x, poseSoonAfter.z - residenceNode.z) > 0.5;
@@ -100,7 +100,7 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
 
   it("disables commuting under prefers-reduced-motion: the twin is placed at its data-driven spot with no path", () => {
     const project: Place = { kind: "project", projectId: "proj-b" };
-    const start = initCommute({ kind: "residence" });
+    const start = initCommute({ kind: "residence" }, town, lotOf);
     const stepped = stepCommute(start, project, "agent-2", town, lotOf, 1_000, true);
 
     expect(stepped.path).toBeNull();
@@ -109,7 +109,7 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
 
   it("parks at the hall if a project somehow has no assigned lot", () => {
     const project: Place = { kind: "project", projectId: "proj-unassigned" };
-    const start = initCommute({ kind: "residence" });
+    const start = initCommute({ kind: "residence" }, town, lotOf);
     const stepped = stepCommute(start, project, "agent-3", town, lotOf, 0, false);
     expect(stepped.path).not.toBeNull();
   });
@@ -118,7 +118,7 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
     const project: Place = { kind: "project", projectId: "proj-a" };
     const residence: Place = { kind: "residence" };
 
-    let state = stepCommute(initCommute(residence), project, "agent-1", town, lotOf, 0, false);
+    let state = stepCommute(initCommute(residence, town, lotOf), project, "agent-1", town, lotOf, 0, false);
     const outboundPath = state.path;
     const outboundMs = (state.distance / speedOf(state.vehicle)) * 1000;
 
@@ -146,7 +146,7 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
     const noLotB: Place = { kind: "project", projectId: "gone-b" };
     const residence: Place = { kind: "residence" };
 
-    let state = initCommute(hall);
+    let state = initCommute(hall, town, lotOf);
     state = stepCommute(state, noLotA, "agent-1", town, lotOf, 0, false);
     expect(isArrivedAt(state, noLotA)).toBe(true);
 
@@ -163,9 +163,62 @@ describe("stepCommute + poseAt (ADR-014 decision 4)", () => {
     expect(isArrivedAt(state, residence)).toBe(true);
   });
 
+  describe("a twin keeps the node it stands at, even when its project leaves lotOf", () => {
+    const P: Place = { kind: "project", projectId: "shift-23" };
+    const residence: Place = { kind: "residence" };
+    const withP = assignLots(["shift-23"]);
+    const nodeOf = (lots: ReadonlyMap<string, number>, id: string) =>
+      town.roads.nodes.get(town.lots[lots.get(id)!].roadNode)!;
+
+    it("(a) walks home from the building, not from the hall, after its project vanishes", () => {
+      const standing = initCommute(P, town, withP);
+      const gone = new Map<string, number>();
+
+      const state = stepCommute(standing, residence, "agent-1", town, gone, 0, false);
+
+      expect(state.path).not.toBeNull();
+      expect(state.path![0]).toEqual(nodeOf(withP, "shift-23"));
+      const pose = poseAt(state, town, 0, "agent-1");
+      expect(Math.hypot(pose.x - nodeOf(withP, "shift-23").x, pose.z - nodeOf(withP, "shift-23").z)).toBeLessThan(1);
+    });
+
+    it("(b) finishes at the stored destination when the project vanishes mid-trip, then walks home", () => {
+      const gone = new Map<string, number>();
+      let state = stepCommute(initCommute(residence, town, withP), P, "agent-1", town, withP, 0, false);
+      const outboundMs = (state.distance / speedOf(state.vehicle)) * 1000;
+
+      state = stepCommute(state, residence, "agent-1", town, gone, outboundMs / 2, false);
+      expect(isArrivedAt(state, P)).toBe(false);
+
+      state = stepCommute(state, residence, "agent-1", town, gone, outboundMs + 1, false);
+      // It arrived at the building it was headed to (no snap to the hall) and set off home from there.
+      expect(state.place).toEqual(P);
+      expect(state.path).not.toBeNull();
+      expect(state.path![0]).toEqual(nodeOf(withP, "shift-23"));
+    });
+
+    it("(c) does not move a standing twin when a freed lot shifts its project, until it leaves", () => {
+      const both = assignLots(["shift-23", "shift-92"]);
+      const shifted = assignLots(["shift-92"]);
+      const Q: Place = { kind: "project", projectId: "shift-92" };
+      expect(shifted.get("shift-92")).not.toBe(both.get("shift-92"));
+
+      const standing = initCommute(Q, town, both);
+      const oldNode = nodeOf(both, "shift-92");
+
+      const still = stepCommute(standing, Q, "agent-1", town, shifted, 1_000, false);
+      const pose = poseAt(still, town, 1_000, "agent-1");
+      expect(Math.abs(pose.z - oldNode.z)).toBeLessThan(1e-9);
+      expect(Math.abs(pose.x - oldNode.x)).toBeLessThan(3);
+
+      const leaving = stepCommute(still, residence, "agent-1", town, shifted, 2_000, false);
+      expect(leaving.path![0]).toEqual(oldNode);
+    });
+  });
+
   it("returns the same state object while nothing changes under reduced motion", () => {
     const project: Place = { kind: "project", projectId: "proj-a" };
-    const first = stepCommute(initCommute({ kind: "residence" }), project, "agent-1", town, lotOf, 1_000, true);
+    const first = stepCommute(initCommute({ kind: "residence" }, town, lotOf), project, "agent-1", town, lotOf, 1_000, true);
     const second = stepCommute(first, project, "agent-1", town, lotOf, 2_000, true);
     expect(second).toBe(first);
   });

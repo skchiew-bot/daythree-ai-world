@@ -73,7 +73,8 @@ export function World() {
         wanders out through the corridor to the lobby and back. Each project is a building in the
         town (ADR-014), and a twin working on one commutes there over the roads, on foot, by
         bicycle or by motorbike; work with no project is done at the community hall. Click a
-        building to focus it. Every browser computes the same schedule. Driven live by{" "}
+        building to focus it. Idle wandering and building placement are the same in every
+        browser; when a commute starts depends on when that browser last polled. Driven live by{" "}
         <code>GET /api/v1/agent-rooms</code>, not scripted. The row in front reflects any external
         agent — a Claude Code session, a script, anything — pinging{" "}
         <code>PUT /api/v1/external-agents/&#123;name&#125;/status</code>.
