@@ -39,7 +39,7 @@ operator has merged.
 | T1 | Twins: identity and registration (ADR-010 A) | nothing | now |
 | T2 | Twins: lifecycle closure, reaper, SessionEnd (ADR-010 B, corrected; no output stored) | T1 | T1 merged (2026-09-19, #33) |
 | T2b | Twins: opt-in subagent output capture (D24..D31) | T2 | before Gate E needs reviewable artifacts |
-| T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C) | T2 | T2 merged |
+| T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C, corrected after gate review) | T2 | T2 merged (2026-09-20, #35); payload capture first |
 | T4 | Twins in the 3D world (ADR-010 D) | T3 | T3 merged |
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
 | R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
@@ -319,31 +319,149 @@ T2-F1..F11 and D28..D30 as the acceptance list; T2 stores no subagent output.
 
 ## T3. Twins: hook wiring for the roster
 
-**Goal.** A real Claude Code session with the roster's personas registers, closes and reaps itself
-without any manual call.
+Gate-reviewed against main at `aa0179f` on 2026-09-20: guardian-gatekeeper **BLOCK + ALTERNATIVE**
+(T3-F1..F20) and guardian-data-warden **PASS WITH CONDITIONS** (D32..D44), both folded in below and
+recorded in `docs/council/LEDGER.md`. Operator decisions (2026-09-20): the ended-parent 409 guard on
+the merged T1 route is approved; the payload contract is settled docs first, then one key-names-only
+capture; the T3 key expires after 90 days. Where this section and ADR-010 disagree, this section wins.
+
+**Goal.** A real Claude Code session and its roster subagents register, heartbeat, close and (as a
+backstop) get reaped without any manual call, without the hook ever blocking or slowing Claude Code,
+and without any prompt, path, transcript or message text leaving the machine.
+
+**Pre-build gate: the payload contract (T3-F1).** Field names reported by the official hooks
+documentation (checked 2026-09-20, to be confirmed on 2.1.227 by the capture below):
+
+| Event | Fields the script may read | Notes |
+|---|---|---|
+| SessionStart | `session_id`, `hook_event_name`, `source` (startup, resume, clear, compact, fork) | stdout is injected into context |
+| SessionEnd | `session_id`, `reason` (clear, resume, logout, prompt_input_exit, other) | 1.5 s shared budget unless a hook sets a longer `timeout` |
+| Stop, UserPromptSubmit | `session_id`, `hook_event_name` only | UserPromptSubmit stdout is injected into context |
+| SubagentStart | `session_id`, `agent_id`, `agent_type` | the same `agent_id` appears in SubagentStop |
+| SubagentStop | `session_id`, `agent_id`, `agent_type` | carries `last_assistant_message`: never read |
+
+Not read, logged, hashed or forwarded, ever: `prompt`/`user_prompt`, `cwd`, `transcript_path`,
+`agent_transcript_path`, `tool_input`, `tool_result`, `last_assistant_message`, `permission_mode` and
+every other field (D32). The docs carry no per-subagent tool-call count, so `tool_call_count` is
+never sent (D39). The docs are silent on subagent stdout injection and hook inheritance, so the
+capture must answer those. **The capture** (operator agrees at that point): one fresh session with a
+temporary hook that writes only the JSON key names and value types (never values) of every event
+above, plus `PreToolUse` for the subagent-spawning tool, to a gitignored file; the chair records the
+Claude Code version and the key sets in the ledger and deletes the file. It must confirm: the field
+names above; that `agent_id` is identical at start and stop and matches `^[A-Za-z0-9._-]{1,64}$`;
+that `session_id` on a subagent event is the parent's; whether hooks fire inside a subagent's own
+session; that `bash --login` prints nothing; and whether hooks hot-reload. If `agent_id` fails any of
+these, the operator chooses between register-and-close in one SubagentStop call (the hook-loss metric
+becomes structurally zero and O2's threshold must be restated) and LIFO matching (persona attribution
+wrong under parallel spawns).
 
 **Deliverables.**
 
-- `scripts/report_twin_lifecycle.sh` (tracked, secret-free): reads the runtime API key from a
-  gitignored wrapper (`.claude/twin_env.sh`, `.example` tracked), maps `SessionStart`,
-  `SubagentStart`, `SubagentStop`, `SessionEnd` payloads to the T1/T2 routes, sends only agent
-  type, session id, parent session id, outcome and tool-call count (ADR-010 C6, D-warden), exits 0
-  always, logs failures to `.hook-debug/`.
-- `.claude/settings.local.json.example` extended with the four hooks, using the Windows-safe shape
-  from PR #13 (fully-qualified `bash.exe --login`, no backgrounding).
-- Validate the real hook payload field names against the installed Claude Code version before
-  committing the mapping; record the version in the script header.
-- The existing `report_claude_status.sh` stays as the presence fallback.
+1. **`.gitignore`, first commit of the PR:** add `.hook-debug/` and `.claude/twin_env.sh` (T3-F5,
+   D35, D37). No other file is created before this lands.
+2. **Server guard, operator-approved (T3-F2).** `_register_subagent` returns 409 with a stable detail
+   (`parent_session_ended`) when a NEW subagent row would be created under a parent whose `ended_at`
+   is set. An idempotent replay of an existing `external_instance_ref` returns the stored row. Test
+   first. No other server change: the routes, schemas and enums stay as merged.
+3. **`scripts/report_twin_lifecycle.sh`** (tracked, secret-free). Header records the Claude Code
+   version and the validated field names.
+   - **Structure (T3-F6..F9, D32..D36):** `trap 'exit 0' EXIT`, no `set -e`, no `set -x`, no `eval`;
+     stdout and stderr redirected to `/dev/null` on every path; stdin read once with `read -r -t 2`,
+     CR stripped, refused above 1 MiB, kept in an unexported variable, never written to disk; values
+     extracted with class-restricted anchored `sed` (no jq, no python: neither is safe on this
+     machine) and re-validated (session id: canonical UUID; ref: `^[A-Za-z0-9._-]{1,64}$`; event name:
+     fixed `case`); the body is assembled from validated tokens only; a missing or invalid value means
+     no request and one enum log line, never a derived id.
+   - **Transport (D36, T3-F14):** curl with its config on stdin (`-K -`, built by `printf`, so the
+     key is in no argv or environment), `--connect-timeout 1 --max-time 2`, `--max-redirs 0`,
+     `--noproxy '*'` for loopback, `--proto '=http,https'`, status via `-w '%{http_code}'` only; a
+     non-loopback `http` base URL makes no call (`insecure_transport`). Hook `timeout: 5` in settings
+     (this also lifts SessionEnd's 1.5 s budget).
+   - **Config (T3-F15, D37):** sources `$HOME/.daythree/twin_env.sh` (fixed path, never from the
+     payload; outside the repo and the Apache web root). No working defaults: base URL and key must
+     both be set, else exit 0 with `no_key` logged. Tracked `.claude/twin_env.sh.example` describes the
+     file with placeholders that match no key shape.
+   - **Log (D35):** `.hook-debug/twin_lifecycle.log`, fixed grammar `UTC event enum-class HTTP-code pid
+     [8-char ref prefix]`, about 256 KiB cap by truncation; never a body, header, key, key id, base
+     URL, agent type or payload text. Also a per-event failure counter file that Gate E reads next to
+     the server-side rate (T3-F4).
+4. **Event mapping.**
+   - **SessionStart** (startup, resume, clear, fork): mint a run uuid (a fresh canonical UUID; the
+     Claude session id is never the platform ref, T3-F2), `POST /sessions` `kind=session` with it as
+     `external_session_ref`, store run uuid, runtime session id and last-heartbeat epoch in
+     `.hook-debug/twin-state/<session-id>`. `compact` reuses the existing run; with no state file it
+     mints one.
+   - **SubagentStart:** `POST /sessions` `kind=subagent`, `external_instance_ref` = the validated
+     `agent_id`, `parent_external_session_ref` = the run uuid from state, `agent_type` sent only when it
+     equals one of the five roster names (`planner`, `architect`, `code-reviewer`, `tdd-guide`,
+     `security-reviewer`; the list is a subset of `persona_registry`); anything else is omitted and the
+     server buckets to `AGT-CC-GENERAL` (D38). No state file: log a miss and send nothing (never
+     register a session from a subagent event, T3-F12). On `409 parent_session_ended`: mint a new run,
+     re-register the session, retry this subagent once.
+   - **SubagentStop:** `POST /subagents/{agent_id}/close` `outcome=completed`,
+     `reason_code=hook_reported`, no `tool_call_count`; "declared, not measured" wherever shown. A 404 is
+     a logged miss, never register-then-close (T3-F12).
+   - **Stop, UserPromptSubmit:** heartbeat `PATCH /sessions/{runtime id}` with an empty body, at most
+     one per 300 s per session (T3-F3), on the `sessions-heartbeat` bucket only, never a re-POST
+     (T3-F4).
+   - **SessionEnd:** `PATCH /sessions/{runtime id}` `outcome` from a fixed table (clear, resume,
+     logout, prompt_input_exit map to `completed`; other maps to `abandoned`; the raw reason is never
+     forwarded), then delete the state file.
+   - **Response table (T3-F13):** any 4xx is terminal (log, no retry); connection failure or 5xx retry
+     once inside the same timeout budget.
+5. **`infrastructure/scripts/issue_agent_runtime_key.py`:** add `--expires-in-days` (T3-F18); the
+   operator issues the key in a terminal outside Claude Code straight into the key file (D43); the key
+   id and expiry go in the ledger, never the secret. The builder issues no key for the live tenant.
+6. **`.claude/settings.local.json.example`:** the six hooks (SessionStart, SubagentStart,
+   SubagentStop, SessionEnd, Stop, UserPromptSubmit) in PR #13's Windows-safe shape (fully-qualified
+   `bash.exe --login`, no backgrounding, no env prefix or key in `command`), `timeout: 5`, and a
+   `permissions.deny` Read rule for the key path so a session cannot read the key into context (D37).
+   `report_claude_status.sh` stays untouched; `hook_working.sh.example` is relabelled legacy
+   presence-only, deleted at T4 (T3-F16).
+7. **Known limits stated up front (T3-F19, T3-F20):** builder sessions in isolated worktrees have no
+   `settings.local.json` and produce no twins, so Gate E's sample is the operator's own sessions;
+   concurrent windows share the per-tenant rate buckets.
 
-**Tests.** A shell-level test that feeds recorded hook payloads through the script against the
-local stack; a fresh-session manual verification recorded in the ledger (the same standard PR #13
-used: a timestamp the operator never manually produced).
+**Tests** (RED first; fixtures are synthetic, generated from field names, D41):
+1. `-m unit`, subprocess bash, `TWIN_DRY_RUN=1` writes the request it would send to a file, no
+   network, no key. Exit 0 and byte-empty stdout for: each event, empty stdin, malformed JSON, 64 KiB
+   and 2 MiB of stdin, CRLF, and every internal command forced to fail.
+2. Canary payloads: every non-allow-listed field holds a unique token; none appears in the request,
+   argv, log, state file, stdout or stderr; a decoy `"session_id"` and `"agent_type"` inside a message
+   string change nothing; `../`, quotes, a 65-character ref and a non-UUID session id send nothing or
+   only the validated value.
+3. The emitted body field set equals the T1/T2 allow-list; a custom `agent_type` canary is absent; a
+   `last_assistant_message` containing "error" and "failed" still yields `completed`.
+4. State lifecycle: double SessionStart is one run; compact reuses it; resume mints a new one;
+   SubagentStart without state sends nothing; SessionEnd removes the file. Heartbeat throttle: 20 Stop
+   events in 10 s emit at most one PATCH.
+5. Response table against a stub: 200/201, 404, 409 (each detail), 422, 429, 500, no listener; the
+   ended-parent path re-registers exactly once and never loops.
+6. Key hygiene: a curl shim records argv and env; the secret and `dtk_` prefix are absent from both,
+   present only on the shim's stdin; the whole `.hook-debug/` tree and test output contain neither.
+7. Repo assertions: `git check-ignore -v` matches `.hook-debug/x.json` and the key path;
+   `git grep` finds no key-shaped token in tracked files; the fixtures scan finds no `C:\Users`,
+   `/Users/`, `/home/`, `.jsonl`, real UUID, e-mail or common secret format.
+8. Server (integration, real Postgres): SessionEnd then a new subagent on that run is 409 with no Task
+   created; a replay of an already-registered ref is 200; the rest of T1's and T2's suites pass
+   unmodified.
+9. `-m e2e`, in the existing full-stack job, key issued inside the job and never echoed: SessionStart,
+   two SubagentStart, two SubagentStop, SessionEnd give one Mission, closed Tasks, two closures with
+   `closed_by=hook`, no artifact, hook-loss 0; a third never-stopped subagent is reaped and a late
+   close returns 200 with `late_close_at`; the heartbeat keeps a session out of the reaper; every
+   `audit_events.payload` is ids, timestamps and enums; the canaries appear in no table; the key still
+   gets 403 on `/missions`, `/tasks/{id}`, `/artifacts/{id}/download` and `/agents`.
 
-**Exit.** One real session, two spawned subagents, one Mission and two closed Tasks with correct
-persona rows, no plaintext secret in any new file.
+**Exit.** One fresh real session with two parallel roster subagents produces one Mission, two closed
+Tasks with the correct persona rows, a heartbeat that survives past the throttle, no new file holding
+a secret, and the hook printing nothing. The operator records the ledger evidence to PR #13's
+standard (a timestamp and row ids the operator never typed by hand; counts, persona codes, HTTP codes
+and 8-character ref prefixes only, D44).
 
-**Handoff prompt:** as T1, phase T3, branch `feat/twins-t3-hooks`; the final verification needs the
-operator to start a fresh session, so end the PR description with that request.
+**Handoff prompt:** as T1, phase T3, branch `feat/twins-t3-hooks`; read this section first and treat
+T3-F1..F20 and D32..D44 as the acceptance list; the payload capture is done before the branch is cut;
+the builder issues no key; end the PR description with the request that the operator start a fresh
+session.
 
 ---
 
