@@ -433,6 +433,16 @@ class AgentRuntimeSession(Base):
             unique=True, postgresql_where=text("kind = 'subagent'"),
         ),
         Index("ix_agent_runtime_sessions_mission_id", "mission_id"),
+        # T2 deliverable 1, operator-approved 2026-09-19: a partial index for the
+        # reaper's own scan (`kind = ... AND ended_at IS NULL`) -- the WHERE clause
+        # alone is the partial-index condition; `kind` is the leading column both the
+        # subagent and the session halves of the reaper's query filter on. Migration
+        # 0004b creates this on the existing table via a per-index `checkfirst=True`
+        # sweep (the same pattern 0003b used), never an ALTER.
+        Index(
+            "ix_agent_runtime_sessions_open", "kind",
+            postgresql_where=text("ended_at IS NULL"),
+        ),
     )
 
     id: Mapped[EntityId] = _pk()
@@ -491,3 +501,50 @@ class AgentRuntimeApiKey(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
     expires_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+
+
+class AgentRuntimeClosure(Base):
+    """T2 deliverable 1: the durable record of HOW and WHY a twin Task reached a
+    terminal state -- `tasks.status` alone can't distinguish "the hook reported
+    completed" from "the reaper gave up on it two hours later", and Gate E's
+    hook-loss rate (deliverable 10) is computed entirely from this table.
+
+    `runtime_session_id` is UNIQUE: at most one closure per `agent_runtime_sessions`
+    row, which is also the idempotency backstop for concurrent/duplicate close calls
+    (T2-F9) -- the actual lock is `SELECT ... FOR UPDATE` on the runtime-session row
+    first, taken by every caller (`api.services.agent_runtime_closure`) before this
+    insert is attempted.
+
+    `artifact_id` is always NULL in T2 (the operator's 2026-09-19 decision: no
+    subagent output is stored this phase) -- it exists now so T2b (output capture)
+    needs no ALTER on this table. `reason_code` is a plain, unconstrained string
+    column (data-warden D28), unlike `closed_by`/`outcome` below, which are each
+    CHECK-constrained closed sets not expected to grow.
+    """
+
+    __tablename__ = "agent_runtime_closures"
+    __table_args__ = (
+        UniqueConstraint("runtime_session_id", name="uq_agent_runtime_closures_runtime_session_id"),
+        CheckConstraint(
+            "closed_by IN ('hook', 'session_end', 'reaper')", name="ck_agent_runtime_closures_closed_by"
+        ),
+        CheckConstraint("outcome IN ('completed', 'failed')", name="ck_agent_runtime_closures_outcome"),
+        Index("ix_agent_runtime_closures_tenant_id", "tenant_id"),
+        Index("ix_agent_runtime_closures_task_id", "task_id"),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    runtime_session_id: Mapped[EntityId] = mapped_column(
+        ForeignKey("agent_runtime_sessions.id"), nullable=False
+    )
+    task_id: Mapped[EntityId] = mapped_column(ForeignKey("tasks.id"), nullable=False)
+    closed_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_call_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    artifact_id: Mapped[Optional[EntityId]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id"), nullable=True
+    )
+    closed_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    late_close_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)

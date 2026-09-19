@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,11 +13,17 @@ from contracts.ids import EntityId
 
 from api.dependencies.auth import get_current_user, get_tenant_scoped_or_404, require_role
 from api.dependencies.db import get_db_session
+from api.schemas.agent_runtime import HookLossRateResponse
 from api.schemas.audit import AuditEventResponse
+from api.services.agent_runtime_closure import compute_hook_loss_rate
 
 router = APIRouter(prefix="/api/v1", tags=["audit"])
 
 AUDIT_READERS = require_role(UserRole.platform_admin, UserRole.tenant_admin, UserRole.auditor)
+
+# T2 deliverable 10 default lookback: Gate E's own window is a config detail of the
+# gate, not this endpoint -- an explicit `since`/`until` overrides it per call.
+_DEFAULT_HOOK_LOSS_WINDOW = timedelta(days=7)
 
 
 @router.get("/missions/{mission_id}/timeline", response_model=list[AuditEventResponse])
@@ -45,3 +54,22 @@ async def list_audit_events(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+@router.get("/audit/agent-runtime-hook-loss-rate", response_model=HookLossRateResponse)
+async def agent_runtime_hook_loss_rate(
+    user: User = Depends(AUDIT_READERS),
+    session: AsyncSession = Depends(get_db_session),
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> HookLossRateResponse:
+    """T2 deliverable 10 for Gate E: computed on read from `agent_runtime_closures`,
+    never a stored counter. Behind the existing audit reader roles, same as every
+    other endpoint in this file -- not on the agent-runtime router, so the scoped
+    `dtk_...` credential can never reach it (it isn't even the right kind of
+    principal: `AUDIT_READERS` requires a JWT-authenticated `User`)."""
+    since = since or (datetime.now(timezone.utc) - _DEFAULT_HOOK_LOSS_WINDOW)
+    result = await compute_hook_loss_rate(session, user.tenant_id, since=since, until=until)
+    return HookLossRateResponse(
+        since=result.since, until=result.until, lost=result.lost, total=result.total, rate=result.rate
+    )

@@ -1,4 +1,5 @@
-"""`POST`/`PATCH /api/v1/agent-runtime/sessions` (ADR-010 Phase A, T1 deliverable 4).
+"""`POST`/`PATCH /api/v1/agent-runtime/sessions` (ADR-010 Phase A, T1 deliverable 4)
+plus the T2 close routes (`POST .../subagents/{ref}/close`, `POST .../sessions/{id}/close`).
 
 Registers a Claude Code session or subagent spawn as governed objects under the scoped
 `agent_runtime` credential (`api.dependencies.agent_runtime_auth`). Every other router in
@@ -8,8 +9,10 @@ place it can write anything.
 Deliberately does NOT touch `services/api/services/room_assignment.py::ensure_assignment`
 (T1-F6): that helper's own `IntegrityError` branch calls `session.rollback()`, which would
 discard this whole registration; the world read already backfills rooms lazily. It also
-never calls `tasks.py`'s `complete-external`/`fail-external` (that is lifecycle CLOSURE,
-out of this phase's scope entirely -- T1 only registers).
+never calls `tasks.py`'s `complete-external`/`fail-external` (T2-F5): both end the Mission
+and accept a free-text `reason` -- lifecycle CLOSURE goes through
+`api.services.agent_runtime_closure` instead, which never touches the Mission on the
+close path and never stores free text.
 """
 from __future__ import annotations
 
@@ -21,9 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.db.models import Agent, AgentRuntimeSession, Task, User
+from common.db.models import Agent, AgentRuntimeClosure, AgentRuntimeSession, Task, User
 from contracts.enums import (
     AgentLifecycleState,
+    AgentRuntimeClosedBy,
     AgentRuntimeKind,
     EventType,
     MissionStatus,
@@ -39,10 +43,13 @@ from api.dependencies.events import get_event_publisher
 from api.dependencies.redis_client import get_redis_client
 from api.persona_registry import resolve_persona
 from api.schemas.agent_runtime import (
+    AgentRuntimeCloseRequest,
+    AgentRuntimeClosureResponse,
     AgentRuntimeSessionCreateRequest,
     AgentRuntimeSessionResponse,
     AgentRuntimeSessionUpdateRequest,
 )
+from api.services.agent_runtime_closure import close_task, end_session
 from api.services.persona_slots import ensure_persona
 
 from mission_engine.engine.mission_service import create_mission, mark_mission_status, start_mission
@@ -256,12 +263,14 @@ async def update_session(
     payload: AgentRuntimeSessionUpdateRequest,
     principal: AgentRuntimePrincipal = Depends(get_agent_runtime_principal),
     session: AsyncSession = Depends(get_db_session),
+    publisher=Depends(get_event_publisher),
     redis_client: Redis = Depends(get_redis_client),
 ) -> AgentRuntimeSession:
-    """Heartbeat (`outcome` absent) or ended (`outcome` present). Never touches the
-    Mission or Task this session is linked to -- lifecycle closure is a later phase;
-    this is a 404, not a 403, on a cross-tenant id (TC-P0-012 discipline: a tenant-scoped
-    lookup that can't even reveal existence to the wrong tenant)."""
+    """Heartbeat (`outcome` absent), or SessionEnd (`outcome` present on a
+    `kind='session'` row -- T2-F7). A `kind='subagent'` row with an `outcome` is 409
+    (T2-F6: "use /close" instead); this is a 404, not a 403, on a cross-tenant id
+    (TC-P0-012 discipline: a tenant-scoped lookup that can't even reveal existence to
+    the wrong tenant)."""
     await _enforce_rate_limit(redis_client, principal.user.tenant_id, principal.key_id, "sessions-heartbeat")
 
     result = await session.execute(
@@ -273,11 +282,97 @@ async def update_session(
     if runtime_session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime session not found.")
 
-    now = datetime.now(timezone.utc)
     if payload.outcome is None:
-        runtime_session.last_heartbeat_at = now
-    else:
-        runtime_session.ended_at = now
-        runtime_session.outcome = payload.outcome.value
-    await session.flush()
+        runtime_session.last_heartbeat_at = datetime.now(timezone.utc)
+        await session.flush()
+        return runtime_session
+
+    if runtime_session.kind == AgentRuntimeKind.subagent.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This is a subagent session; use POST .../subagents/{ref}/close or "
+            "POST .../sessions/{id}/close instead.",
+        )
+
+    # T2-F6: a session's end state is set once -- `end_session` itself is the
+    # idempotency guard (a second SessionEnd, via PATCH or the reaper, changes
+    # nothing), so a duplicate PATCH here is a 200 no-op, never a 409.
+    actor = Actor(type=ActorType.user, id=principal.user.id)
+    await end_session(
+        session, publisher, tenant_id=principal.user.tenant_id, actor=actor,
+        runtime_session_id=runtime_session.id, outcome=payload.outcome,
+    )
+    await session.refresh(runtime_session)
     return runtime_session
+
+
+async def _resolve_subagent_for_close(
+    session: AsyncSession, tenant_id: EntityId, *, session_id: EntityId | None, external_instance_ref: str | None
+) -> AgentRuntimeSession:
+    stmt = select(AgentRuntimeSession).where(AgentRuntimeSession.tenant_id == tenant_id)
+    if session_id is not None:
+        stmt = stmt.where(AgentRuntimeSession.id == session_id)
+    else:
+        stmt = stmt.where(AgentRuntimeSession.external_instance_ref == external_instance_ref)
+    runtime_session = (await session.execute(stmt)).scalar_one_or_none()
+    if runtime_session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime session not found.")
+    if runtime_session.kind != AgentRuntimeKind.subagent.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This is a session, not a subagent; use PATCH .../sessions/{id} to end it.",
+        )
+    return runtime_session
+
+
+async def _close_subagent(
+    session: AsyncSession, publisher, principal: AgentRuntimePrincipal, runtime_session: AgentRuntimeSession,
+    payload: AgentRuntimeCloseRequest,
+) -> AgentRuntimeClosure:
+    actor = Actor(type=ActorType.user, id=principal.user.id)
+    closure, _is_new = await close_task(
+        session, publisher, tenant_id=principal.user.tenant_id, actor=actor,
+        runtime_session_id=runtime_session.id, outcome=payload.outcome, reason_code=payload.reason_code,
+        closed_by=AgentRuntimeClosedBy.hook, tool_call_count=payload.tool_call_count,
+    )
+    if closure is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime session not found.")
+    return closure
+
+
+@router.post("/subagents/{external_instance_ref}/close", response_model=AgentRuntimeClosureResponse)
+async def close_subagent_by_ref(
+    external_instance_ref: str,
+    payload: AgentRuntimeCloseRequest,
+    principal: AgentRuntimePrincipal = Depends(get_agent_runtime_principal),
+    session: AsyncSession = Depends(get_db_session),
+    publisher=Depends(get_event_publisher),
+    redis_client: Redis = Depends(get_redis_client),
+) -> AgentRuntimeClosure:
+    """T2 deliverable 2: the stateless T3 hook only knows `external_instance_ref`,
+    never the internal runtime-session id -- resolved by tenant plus T1's own partial
+    unique index on this column."""
+    await _enforce_rate_limit(redis_client, principal.user.tenant_id, principal.key_id, "close")
+    runtime_session = await _resolve_subagent_for_close(
+        session, principal.user.tenant_id, session_id=None, external_instance_ref=external_instance_ref
+    )
+    return await _close_subagent(session, publisher, principal, runtime_session, payload)
+
+
+@router.post("/sessions/{session_id}/close", response_model=AgentRuntimeClosureResponse)
+async def close_subagent_by_id(
+    session_id: EntityId,
+    payload: AgentRuntimeCloseRequest,
+    principal: AgentRuntimePrincipal = Depends(get_agent_runtime_principal),
+    session: AsyncSession = Depends(get_db_session),
+    publisher=Depends(get_event_publisher),
+    redis_client: Redis = Depends(get_redis_client),
+) -> AgentRuntimeClosure:
+    """T2 deliverable 2: the same close handler, addressed by the internal runtime-
+    session id instead of the external ref -- cross-tenant or cross-session ids are
+    404, same discipline as `update_session` above."""
+    await _enforce_rate_limit(redis_client, principal.user.tenant_id, principal.key_id, "close")
+    runtime_session = await _resolve_subagent_for_close(
+        session, principal.user.tenant_id, session_id=session_id, external_instance_ref=None
+    )
+    return await _close_subagent(session, publisher, principal, runtime_session, payload)

@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     seed_admin_email: str = "admin@daythree.local"
     seed_admin_password: str = "ChangeMe123!"
 
+    # T2 deliverable 8 (Digital Twin Program, reaper): a named setting rather than a
+    # magic number inlined into the sweep, per the operator's 2026-09-19 decision --
+    # a subagent (or a whole silent session) is reaped once neither it nor its parent
+    # has shown any heartbeat/start activity for this long.
+    agent_runtime_reap_window_minutes: int = 120
+
     @property
     def is_production(self) -> bool:
         return self.environment.lower() == "production"

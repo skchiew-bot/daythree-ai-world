@@ -116,6 +116,37 @@ class AgentRuntimeOutcome(str, Enum):
     abandoned = "abandoned"
 
 
+class AgentRuntimeCloseOutcome(str, Enum):
+    """T2 deliverable 2: the close route only ever accepts these two -- `abandoned`
+    (T1's `AgentRuntimeOutcome`, used by PATCH .../sessions/{id} to end a SESSION) is
+    deliberately not offered here; a subagent Task can only ever close completed or
+    failed."""
+
+    completed = "completed"
+    failed = "failed"
+
+
+class AgentRuntimeClosedBy(str, Enum):
+    """T2 deliverable 1: who/what actually closed the twin Task -- a CHECK-constrained
+    column (`agent_runtime_closures.closed_by`), unlike `reason_code` below, since this
+    set is not expected to grow."""
+
+    hook = "hook"
+    session_end = "session_end"
+    reaper = "reaper"
+
+
+class AgentRuntimeReasonCode(str, Enum):
+    """T2 deliverable 5 / data-warden D28: a closed enum validated at the Pydantic/
+    service layer only -- `agent_runtime_closures.reason_code` is a plain, unconstrained
+    string column so T2b can add `artifact_rejected`/`artifact_store_unavailable`
+    without an ALTER on this table."""
+
+    hook_reported = "hook_reported"
+    session_ended = "session_ended"
+    reaped_stale = "reaped_stale"
+
+
 class ToolName(str, Enum):
     artifact_write = "artifact.write"
     artifact_read = "artifact.read"
