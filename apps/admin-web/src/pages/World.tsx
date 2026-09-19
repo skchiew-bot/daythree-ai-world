@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentRooms, useExternalAgentStatuses, useMissionTimeline, useMissions } from "@/api/hooks";
 import { deriveExternalAgentState, deriveRoomAgentState, pickFocusMission, type AgentState } from "@/world/agentState";
-import { toWorldAgents } from "@/world/renderPayload";
+import { toWorldAgents, toWorldProjects } from "@/world/renderPayload";
 import { describeScene } from "@/world/sceneLabel";
-import { WorldCanvas } from "@/world/WorldCanvas";
+import { TownDirectory } from "@/world/TownDirectory";
+import { WorldCanvas, type WorldCanvasApi } from "@/world/WorldCanvas";
 import { WorldErrorBoundary } from "@/world/WorldErrorBoundary";
 
 const FALLBACK_FLOOR_COUNT = 5;
@@ -23,6 +24,16 @@ export function World() {
   // Everything the 3D scene sees about a governed agent comes through this one
   // allow-list (ADR-013, data-warden D11). The tables below keep using the full rows.
   const worldAgents = useMemo(() => toWorldAgents(rooms), [rooms]);
+  // Projects reach the scene as {id, code} only (data-warden D13). The full rows, with
+  // name, stay here for the HTML directory beside the canvas (operator decision O17).
+  const projects = useMemo(() => roomsData?.projects ?? [], [roomsData]);
+  const worldProjects = useMemo(() => toWorldProjects(projects), [projects]);
+  const canvasApi = useRef<WorldCanvasApi>(null);
+  const [focusKey, setFocusKey] = useState<string | null>(null);
+  const focusOn = (key: string | null) => {
+    setFocusKey(key);
+    canvasApi.current?.focus(key);
+  };
   const agentStates = useMemo(
     () =>
       new Map<string, AgentState>(
@@ -58,25 +69,33 @@ export function World() {
       <h2>3D World</h2>
       <p style={{ color: "var(--text-muted)", marginTop: "-0.5rem" }}>
         Not part of the Phase 0 spec — an additive visualization of the real agent runtime. Every
-        governed agent gets its own room in a per-tenant apartment (ADR-009). It sits at its room's
-        desk when it has an active task; when it is idle it wanders out through the corridor to the
-        lobby and back, on a schedule every browser computes the same way. Driven live by{" "}
+        governed agent gets its own room in a per-tenant residence (ADR-009); when it is idle it
+        wanders out through the corridor to the lobby and back. Each project is a building in the
+        town (ADR-014), and a twin working on one commutes there over the roads, on foot, by
+        bicycle or by motorbike; work with no project is done at the community hall. Click a
+        building to focus it. Every browser computes the same schedule. Driven live by{" "}
         <code>GET /api/v1/agent-rooms</code>, not scripted. The row in front reflects any external
         agent — a Claude Code session, a script, anything — pinging{" "}
         <code>PUT /api/v1/external-agents/&#123;name&#125;/status</code>.
       </p>
-      <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-        <WorldErrorBoundary>
-          <WorldCanvas
-            agents={worldAgents}
-            agentStates={agentStates}
-            floors={floors}
-            externalNames={externalNames}
-            externalStates={externalStates}
-            label={describeScene(worldAgents, externalList.length)}
-            describedBy="world-room-occupancy"
-          />
-        </WorldErrorBoundary>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem", alignItems: "flex-start" }}>
+        <div className="card" style={{ padding: 0, overflow: "hidden", flex: "3 1 30rem", minWidth: 0 }}>
+          <WorldErrorBoundary>
+            <WorldCanvas
+              ref={canvasApi}
+              agents={worldAgents}
+              agentStates={agentStates}
+              floors={floors}
+              externalNames={externalNames}
+              externalStates={externalStates}
+              projects={worldProjects}
+              label={describeScene(worldAgents, externalList.length, worldProjects.length)}
+              describedBy="world-room-occupancy"
+              onFocusChange={setFocusKey}
+            />
+          </WorldErrorBoundary>
+        </div>
+        <TownDirectory projects={projects} rooms={rooms} focusKey={focusKey} onFocus={focusOn} />
       </div>
       <div className="card" style={{ marginTop: "1rem" }}>
         <strong>Focus mission</strong>{" "}

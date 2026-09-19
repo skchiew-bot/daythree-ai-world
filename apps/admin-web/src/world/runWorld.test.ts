@@ -9,6 +9,7 @@ const INPUTS: WorldInputs = {
   floors: 5,
   externalNames: [],
   externalStates: new Map(),
+  projects: [],
 };
 
 function fakeKit(): SceneKit & { dispose: ReturnType<typeof vi.fn> } {
