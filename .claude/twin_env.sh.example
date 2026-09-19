@@ -4,35 +4,71 @@
 #
 #     $HOME/.daythree/twin_env.sh        (Windows: %USERPROFILE%\.daythree\twin_env.sh)
 #
-# It sources that file and needs two variables. There are no defaults: with either one
-# missing the hook does nothing and logs one `no_key` line. Never add `export`: the hook
-# clears the variables after reading them so the key is never in an environment.
+# The hook READS that file and never runs it. Only two lines count, in this exact form
+# (no `export`, no quotes, no trailing text); comments, blank lines and everything else
+# are ignored. There are no defaults: with either line missing the hook does nothing and
+# logs one `no_key` line.
 #
-# Issue the key yourself, in a terminal OUTSIDE Claude Code (a plain Git Bash or
-# PowerShell window, never a Claude Code Bash tool call), straight into the key file, so
-# the secret is never printed, pasted into a chat, or written anywhere else. The script
-# prints the key once, on its last line of stdout; `tail -n 1` keeps only that line:
+#     DAYTHREE_TWIN_BASE_URL=http://localhost:<published-api-port>
+#     DAYTHREE_TWIN_KEY=<the key printed by the issue script>
+#
+# The API port: docker-compose.yml publishes the API on 8000 by default, but a local
+# docker-compose.override.yml can publish a different host port. Use the port YOUR stack
+# publishes (`docker compose ps`). Plain http is accepted only for localhost, 127.0.0.1 or
+# [::1]; any other host must be https.
+#
+# ---------------------------------------------------------------------------------------
+# STEP 1: issue the key. Bash only: use Git Bash, in a terminal OUTSIDE Claude Code (never a
+# Claude Code Bash tool call), from the repo root. The issue script prints the key once, as
+# the last line of its output; the recipe writes it straight into the key file so it is
+# never shown, pasted into a chat, or written anywhere else.
+#
+# 1a. The issue script imports the platform packages, so it needs the same PYTHONPATH the
+#     Makefile uses:
+#
+#     export PYTHONPATH="$(python -c "import os,sys; print(os.pathsep.join(sys.argv[1:]))" packages packages/policy-sdk packages/tool-sdk services services/mission-engine services/agent-runtime services/model-gateway services/event-service services/artifact-service)"
+#
+# 1b. The issue script reaches Postgres through DATABASE_URL: taken from the environment,
+#     else from `.env` in the current directory, else the built-in default
+#     (localhost:5432). It refuses any host other than localhost or 127.0.0.1. If your
+#     compose override publishes Postgres on another host port, derive DATABASE_URL from
+#     `.env` and swap only the port, without printing it (replace <published-postgres-port>
+#     with the port your stack publishes):
+#
+#     export DATABASE_URL="$(grep '^DATABASE_URL=' .env | cut -d= -f2- | sed 's/@localhost:5432/@localhost:<published-postgres-port>/')"
+#
+# 1c. Issue the key with a 90-day expiry and write the key file, only if a key came back:
 #
 #     mkdir -p "$HOME/.daythree" && umask 077
-#     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code <your-tenant> \
-#         --expires-in-days 90 --label "twin hooks" | tail -n 1 | {
-#       read -r K && printf 'DAYTHREE_TWIN_BASE_URL=%s\nDAYTHREE_TWIN_KEY=%s\n' \
-#         "http://localhost:8000" "$K" > "$HOME/.daythree/twin_env.sh"; unset K; }
+#     K="$(python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code <your-tenant> --expires-in-days 90 --label "twin hooks" | tail -n 1)"
+#     if [[ $K =~ ^dtk_[0-9a-f]{32}_ ]]; then
+#       printf 'DAYTHREE_TWIN_BASE_URL=%s\nDAYTHREE_TWIN_KEY=%s\n' "http://localhost:<published-api-port>" "$K" > "$HOME/.daythree/twin_env.sh"
+#     else
+#       echo "no key was issued; nothing was written" >&2
+#     fi
+#     unset K
 #
-# Then restrict the file to your own account (Windows):
+# ---------------------------------------------------------------------------------------
+# STEP 2: restrict the file to your own account. Run this in a Windows terminal (cmd.exe),
+# NOT in bash; the variables are cmd-style:
 #
 #     icacls "%USERPROFILE%\.daythree\twin_env.sh" /inheritance:r /grant:r "%USERNAME%:F"
 #
+# ---------------------------------------------------------------------------------------
 # The key id is the 32 hexadecimal characters between the first two underscores of the
-# key (the part that follows the three-letter prefix). Record the key id
-# and the expiry date in docs/council/LEDGER.md; never record the secret part.
+# key (the part that follows the three-letter prefix). Record the key id and the expiry date
+# in docs/council/LEDGER.md; never record the secret part.
 #
-# If the key may have been exposed (pasted into a chat, shown on screen, committed): issue
-# a new one the same way, then revoke the old one by id:
+# Never `cat` or print this file in a Claude Code session: the Read/Edit/Write deny rules in
+# .claude/settings.local.json.example block those tools only, not a Bash command.
+#
+# If the key may have been exposed (pasted into a chat, shown on screen, committed): issue a
+# new one the same way (steps 1a to 1c), then revoke the old one by id, with the same
+# PYTHONPATH and DATABASE_URL:
 #
 #     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code <your-tenant> --revoke <old-key-id>
 #
-# The value formats below are placeholders on purpose and match no key shape.
+# The lines below are placeholders on purpose and match no key shape.
 
-DAYTHREE_TWIN_BASE_URL=http://localhost:8000
+DAYTHREE_TWIN_BASE_URL=http://localhost:<published-api-port>
 DAYTHREE_TWIN_KEY=PASTE_THE_KEY_PRINTED_BY_THE_ISSUE_SCRIPT_HERE

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 import time
 
 import pytest
@@ -130,7 +131,7 @@ def test_an_unknown_event_is_ignored_and_a_missing_one_is_a_counted_failure(hook
 
 @pytest.mark.parametrize(
     "failing",
-    [["sed"], ["od"], ["mkdir"], ["mv"], ["rm"], ["timeout"], ["head"], ["timeout", "head"]],
+    [["awk"], ["od"], ["mkdir"], ["mv"], ["rm"], ["timeout"], ["head"], ["timeout", "head"]],
 )
 def test_any_single_internal_command_failing_still_exits_zero_silently(hook, failing):
     hook.make_shims(failing)
@@ -148,7 +149,7 @@ def test_any_single_internal_command_failing_still_exits_zero_silently(hook, fai
 
 
 def test_every_external_command_failing_at_once_still_exits_zero_silently(hook):
-    hook.make_shims(["sed", "od", "mkdir", "mv", "rm", "timeout", "head", "cat", "date", "tr", "curl", "wc", "tail", "grep"])
+    hook.make_shims(["awk", "sed", "od", "mkdir", "mv", "rm", "timeout", "head", "cat", "date", "tr", "curl", "wc", "tail", "grep"])
 
     result = hook.run(payload_bytes("SessionStart", new_session_id(), source="startup"))
 
@@ -547,8 +548,30 @@ def test_ten_concurrent_hook_runs_never_corrupt_the_state_file(hook):
     runtime_id = hook.state(session_id)[1]
     hook.put_state(session_id, run, runtime_id, 0)
 
+    # A reader polls the state file while the ten hooks rewrite it. It can catch a
+    # truncate-then-write (an empty or partial file) but cannot prove atomicity against a crash
+    # in the middle of a write; the rename-based write is what gives that guarantee.
+    pattern = re.compile(r"^[0-9a-f-]{36} (?:[0-9a-f-]{36}|-) [0-9]{1,12}\n$")
+    torn: list[str] = []
+    stop_reading = threading.Event()
+
+    def reader():
+        path = hook.state_dir / session_id
+        while not stop_reading.is_set():
+            try:
+                text = path.read_text()
+            except OSError:  # a rename in flight on Windows
+                continue
+            if not pattern.match(text):
+                torn.append(text)
+
+    watcher = threading.Thread(target=reader, daemon=True)
+    watcher.start()
     processes = [hook.popen(payload_bytes("Stop", session_id)) for _ in range(10)]
     results = [(p.wait(timeout=60), p.stdout.read(), p.stderr.read()) for p in processes]
+    stop_reading.set()
+    watcher.join(timeout=5)
+    assert torn == []
 
     assert all(code == 0 and out == b"" and err == b"" for code, out, err in results)
     state = hook.state(session_id)  # parses: exactly three well-formed fields
@@ -658,3 +681,159 @@ def test_the_argv_event_name_goes_through_the_same_fixed_list_as_the_payload_val
     assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
     assert hook.requests() == []
     assert hook.last_log()[2] == "ignored"
+
+
+# ---------------------------------------------------------------------------
+# Top-level keys only: nested decoys ahead of the real keys, and decoys inside strings
+# ---------------------------------------------------------------------------
+
+
+def _nested_decoys() -> dict:
+    decoy_session, decoy_agent, decoy_id = new_session_id(), new_agent_id(), new_session_id()
+    member = {
+        "session_id": decoy_session, "agent_id": decoy_agent, "agent_type": "security-reviewer", "source": "clear",
+        "reason": "other", "id": decoy_id, "hook_event_name": "SessionEnd",
+    }
+    return {
+        "background_tasks": [member, {"deeper": [member]}],
+        "session_crons": [[member]],
+        "tool_input": {**member, "nested": {**member}},
+        "background_object": {"inner": member},
+    }
+
+
+def _decoyed(event: str, session_id: str, **fields) -> bytes:
+    return json.dumps({**_nested_decoys(), "session_id": session_id, "hook_event_name": event, **fields}).encode()
+
+
+def test_nested_decoys_ahead_of_the_top_level_keys_never_win_on_subagent_events(hook):
+    session_id, agent_id = new_session_id(), new_agent_id()
+    run = _start(hook, session_id)
+
+    hook.run(_decoyed("SubagentStart", session_id, agent_id=agent_id, agent_type="planner"))
+    hook.run(_decoyed("SubagentStop", session_id, agent_id=agent_id, agent_type="planner"))
+
+    _register, start, stop = hook.requests()
+    assert start["body"] == {
+        "kind": "subagent", "external_instance_ref": agent_id, "parent_external_session_ref": run,
+        "agent_type": "planner",
+    }
+    assert stop["path"] == f"/api/v1/agent-runtime/subagents/{agent_id}/close"
+
+
+def test_nested_decoys_never_win_on_session_start_and_session_end(hook):
+    session_id = new_session_id()
+
+    hook.run(_decoyed("SessionStart", session_id, source="startup"))
+    run = hook.state(session_id)[0]
+    hook.run(_decoyed("SessionEnd", session_id, reason="clear"))
+
+    register, end = hook.requests()[0], hook.requests()[1]
+    assert register["body"] == {"kind": "session", "external_session_ref": run}
+    assert end["body"] == {"outcome": "completed"}  # the real reason, not the nested "other"
+    assert hook.state(session_id) is None
+    assert [line[1] for line in hook.log_lines()] == ["SessionStart", "SessionEnd"]  # not the nested SessionEnd
+
+
+def test_a_payload_whose_only_session_id_is_nested_is_refused(hook):
+    raw = json.dumps({"hook_event_name": "Stop", "background_tasks": [{"session_id": new_session_id()}]}).encode()
+
+    hook.run(raw)
+
+    assert hook.requests() == [] and hook.last_log()[2] == "bad_session"
+
+
+def test_a_top_level_array_payload_is_refused(hook):
+    raw = json.dumps([{"session_id": new_session_id(), "hook_event_name": "Stop"}]).encode()
+
+    hook.run(raw)
+
+    assert hook.requests() == [] and hook.last_log()[2] == "bad_event"  # nothing is top-level, not even the event
+
+
+def test_the_first_of_two_top_level_duplicates_wins(hook):
+    first, second = new_session_id(), new_session_id()
+    raw = ('{"session_id":"%s","hook_event_name":"SessionStart","source":"startup","session_id":"%s"}' % (first, second)).encode()
+
+    hook.run(raw)
+
+    assert hook.state(first) is not None and hook.state(second) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '} ] { "session_id":"{sid}","agent_id":"{aid}" \\',
+        '{{{{[[[[ "agent_type":"security-reviewer" ]]]]}}}}',
+        'ends with a backslash \\',
+        'quote " and \\" and \\\\" mixes',
+    ],
+)
+def test_decoys_and_structural_characters_inside_strings_change_nothing(hook, message):
+    session_id, agent_id = new_session_id(), new_agent_id()
+    run = _start(hook, session_id)
+    message = message.replace("{sid}", new_session_id()).replace("{aid}", new_agent_id())
+
+    for event in ("SubagentStart", "SubagentStop"):
+        raw = json.dumps(
+            {"last_assistant_message": message, "session_id": session_id, "hook_event_name": event,
+             "agent_id": agent_id, "agent_type": "planner", "trailer": message}
+        ).encode()
+        result = hook.run(raw)
+        assert result.returncode == 0 and result.stdout == b""
+
+    _register, start, stop = hook.requests()
+    assert start["body"]["external_instance_ref"] == agent_id
+    assert start["body"]["parent_external_session_ref"] == run and start["body"]["agent_type"] == "planner"
+    assert stop["path"].endswith(f"/subagents/{agent_id}/close")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"a":"x\\\\","session_id":"%s","hook_event_name":"SessionStart","source":"startup"}',
+        b'{"n":123,"b":true,"c":null,"d":[1,2,{"e":"}"}],"session_id":"%s","hook_event_name":"SessionStart","source":"startup"}',
+        b'{ "session_id" : "%s" , "hook_event_name" : "SessionStart" , "source" : "startup" }',
+    ],
+)
+def test_odd_but_valid_json_layouts_still_yield_the_top_level_keys(hook, raw):
+    session_id = new_session_id()
+
+    hook.run(raw % session_id.encode())
+
+    assert hook.state(session_id) is not None and len(hook.requests()) == 1
+
+
+def test_a_value_with_a_backslash_or_a_wrong_class_is_not_a_value(hook):
+    session_id = new_session_id()
+    _start(hook, session_id)
+    for bad in ('a\\nb', "a b", "a/b", "é", "x" * 65):
+        raw = json.dumps(
+            {"session_id": session_id, "hook_event_name": "SubagentStart", "agent_id": bad, "agent_type": "planner"}
+        ).encode()
+        hook.run(raw)
+
+    assert len(hook.requests()) == 1  # only the SessionStart registration
+
+
+def test_a_payload_of_many_short_strings_is_parsed_within_the_time_budget(hook):
+    session_id = new_session_id()
+    many = {f"k{i}": "v" for i in range(30000)}  # about 400 KB, tens of thousands of records
+    raw = json.dumps({**many, "session_id": session_id, "hook_event_name": "SessionStart", "source": "startup"}).encode()
+
+    started = time.monotonic()
+    hook.run(raw)
+
+    assert time.monotonic() - started < 15
+    assert hook.state(session_id) is not None
+
+
+def test_session_end_removes_a_corrupt_state_file_too(hook):
+    session_id = new_session_id()
+    hook.state_dir.mkdir(parents=True)
+    (hook.state_dir / session_id).write_text("garbage\n")
+
+    hook.fire("SessionEnd", session_id, reason="clear")
+
+    assert not (hook.state_dir / session_id).exists()
+    assert hook.requests() == [] and hook.last_log()[2] == "no_state"

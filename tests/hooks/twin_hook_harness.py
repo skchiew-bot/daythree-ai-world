@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "report_twin_lifecycle.sh"
@@ -106,6 +106,11 @@ class Hook:
             f"{prefix}DAYTHREE_TWIN_BASE_URL={base_url}\n{prefix}DAYTHREE_TWIN_KEY={key}\n", encoding="utf-8", newline="\n"
         )
         return key
+
+    def write_key_text(self, text: str) -> None:
+        target = self.home / ".daythree"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "twin_env.sh").write_text(text, encoding="utf-8", newline="\n")
 
     def make_shims(self, names: list[str], body: str = "exit 1\n", *, name: str = "shims") -> Path:
         shim_dir = self.root / name
@@ -202,6 +207,9 @@ class Stub:
     routes: dict = field(default_factory=dict)
     seen: list = field(default_factory=list)
     server: Optional[ThreadingHTTPServer] = None
+    # Optional hook called with the request dict before the queued routes: it may return
+    # (status, payload) to answer itself (and may block, to order concurrent requests), or None.
+    responder: Optional[Callable[[dict], Optional[tuple[int, str]]]] = None
 
     def on(self, method: str, path: str, *responses: tuple[int, str]) -> None:
         self.routes[(method, path)] = list(responses)
@@ -222,13 +230,16 @@ class Stub:
             def _handle(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length).decode() if length else ""
-                stub.seen.append(
-                    {"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body}
-                )
+                request = {"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body}
+                stub.seen.append(request)
+                answered = stub.responder(request) if stub.responder else None
                 queue = stub.routes.get((self.command, self.path))
-                status, payload = (404, '{"detail":"no route"}') if not queue else (
-                    queue.pop(0) if len(queue) > 1 else queue[0]
-                )
+                if answered is not None:
+                    status, payload = answered
+                else:
+                    status, payload = (404, '{"detail":"no route"}') if not queue else (
+                        queue.pop(0) if len(queue) > 1 else queue[0]
+                    )
                 data = payload.encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -249,3 +260,35 @@ class Stub:
 
     def bodies(self, method: str, path: str) -> list[dict]:
         return [json.loads(r["body"]) for r in self.seen if r["method"] == method and r["path"] == path and r["body"]]
+
+
+class HoldListener:
+    """Accepts TCP connections and never answers, counting them: a platform that hangs."""
+
+    def __init__(self) -> None:
+        import socket
+
+        self.socket = socket.socket()
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(16)
+        self.connections = 0
+        self._held: list = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.socket.getsockname()[1]}"
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                connection, _ = self.socket.accept()
+            except OSError:
+                return
+            self.connections += 1
+            self._held.append(connection)
+
+    def close(self) -> None:
+        self.socket.close()
+        for connection in self._held:
+            connection.close()

@@ -15,9 +15,9 @@
   ],
   "_twin_setup": [
     "Digital-twin hooks (phase T3): the twin entries in the hooks section (SessionStart, SubagentStart, SubagentStop and SessionEnd, plus a second entry on Stop and on UserPromptSubmit) run scripts/report_twin_lifecycle.sh, which registers this session and its roster subagents with the platform, closes them, and heartbeats the session. They are separate from the presence hooks (hook_working.sh and hook_stop.sh, legacy, presence only).",
-    "1. Issue the API key yourself in a terminal OUTSIDE Claude Code, straight into $HOME/.daythree/twin_env.sh, following the instructions in .claude/twin_env.sh.example. Never paste the key into a chat or a tracked file.",
+    "1. Issue the API key yourself, in Git Bash in a terminal OUTSIDE Claude Code, straight into $HOME/.daythree/twin_env.sh, following the instructions in .claude/twin_env.sh.example. Never paste the key into a chat or a tracked file.",
     "2. Adjust the two absolute paths in each twin command (the shell executable and the script) for your machine. The command carries no key and no environment prefix; the script takes the event name as its only argument, as a fallback for a payload that omits it.",
-    "3. The permissions.deny rule stops a Claude Code session from reading the key file into its context.",
+    "3. The permissions.deny rules block the Read, Edit and Write tools on the key file. Bash is not covered by them: a shell command such as cat can still print the file, so never cat it (or anything under ~/.daythree) in a Claude Code session. The hook also runs whichever version of scripts/report_twin_lifecycle.sh the checked-out branch holds, so check out a reviewed branch before starting a session.",
     "4. Start a NEW Claude Code session: SessionStart fires only at session start, so a session that was already running has no twin state and its subagents are not registered."
   ],
   "hooks": {
@@ -110,7 +110,9 @@
   },
   "permissions": {
     "deny": [
-      "Read(~/.daythree/**)"
+      "Read(~/.daythree/**)",
+      "Edit(~/.daythree/**)",
+      "Write(~/.daythree/**)"
     ]
   }
 }

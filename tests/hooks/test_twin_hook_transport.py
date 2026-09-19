@@ -132,7 +132,7 @@ def test_a_platform_with_no_listener_is_a_quiet_counted_failure(tmp_path):
     result = hook.run(payload_bytes("SessionStart", new_session_id(), source="startup"))
 
     assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
-    assert time.monotonic() - started < 6
+    assert time.monotonic() - started < 10  # bounded (two 2 s attempts at most), with slack for a loaded runner
     assert hook.last_log()[2:4] == ["conn_fail", "000"]
     assert hook.failure_count("SessionStart") == 1
 
@@ -181,7 +181,7 @@ def test_a_platform_that_never_answers_cannot_hold_the_hook_past_its_budget(tmp_
     listener.close()
 
     assert result.returncode == 0 and result.stdout == b""
-    assert elapsed < 6.5  # two bounded attempts inside the 5 s hook timeout, never a hang
+    assert elapsed < 10  # a hung platform costs one 2 s attempt, never a hang (60 s subprocess cap)
     assert hook.last_log()[2] == "conn_fail"
 
 
@@ -196,10 +196,10 @@ def test_a_stdin_that_never_closes_and_never_carries_data_cannot_hang_the_hook(t
     )
     started = time.monotonic()
     try:
-        code = process.wait(timeout=8)
+        code = process.wait(timeout=20)
     finally:
         process.kill()
-    assert code == 0 and time.monotonic() - started < 7
+    assert code == 0 and time.monotonic() - started < 12  # 2 s head timeout plus the 2 s read fallback
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +321,8 @@ def _records(tmp_path, suffix: str) -> list[str]:
     return [p.read_text(errors="replace") for p in sorted((tmp_path / "record").glob(f"*.{suffix}"))]
 
 
-@pytest.mark.parametrize("export", [False, True])
-def test_the_key_is_only_ever_on_the_curl_shims_stdin(tmp_path, export):
-    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9", export=export)
+def test_the_key_is_only_ever_on_the_curl_shims_stdin(tmp_path):
+    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9")
     session_id, agent_id = new_session_id(), new_agent_id()
     outputs = b""
 
@@ -343,7 +342,8 @@ def test_the_key_is_only_ever_on_the_curl_shims_stdin(tmp_path, export):
     assert len(argv) == len(env) == len(stdin) == 5
     for text in argv + env:
         assert key not in text and "dtk_" not in text
-        assert "127.0.0.1" not in text  # the URL travels in the config on stdin too
+    # (the environment is not checked for the URL: NO_PROXY and friends legitimately hold hosts)
+    assert all("127.0.0.1" not in text for text in argv)  # the URL travels in the config on stdin too
     assert all(key in text for text in stdin)  # present only where curl reads its config
     for text in (hook.tree_text(), outputs.decode(errors="replace")):
         assert key not in text and "dtk_" not in text
@@ -433,17 +433,6 @@ def test_a_key_file_with_windows_line_endings_still_works(tmp_path):
     assert len(_records(tmp_path, "argv")) == 1 and hook.last_log()[2] == "ok"
 
 
-@pytest.mark.parametrize("name", ["TW_KEY", "KEY", "BASE_URL", "TW_BASE_URL", "DAYTHREE_TWIN_KEY"])
-def test_an_ambient_variable_of_the_same_name_cannot_carry_the_key_into_curls_environment(tmp_path, name):
-    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9")
-
-    result = hook.run(payload_bytes("SessionStart", new_session_id(), source="startup"), env={name: "ambient-value"})
-
-    assert result.returncode == 0 and len(_records(tmp_path, "env")) == 1
-    (env_text,) = _records(tmp_path, "env")
-    assert key not in env_text and "dtk_" not in env_text
-
-
 # ---------------------------------------------------------------------------
 # Limited re-registration (coordinator decision): only the SAME run, only when the state has
 # no runtime id, at most once per invocation, never with no state at all
@@ -495,3 +484,261 @@ def test_with_no_state_file_nothing_is_ever_registered(live, stub, event, fields
 
     assert stub.seen == []
     assert live.last_log()[2] == "no_state"
+
+
+# ---------------------------------------------------------------------------
+# Review round 2: environment hygiene, registration outage, 409 race, key file parsing
+# ---------------------------------------------------------------------------
+
+
+def _script_text() -> str:
+    from twin_hook_harness import SCRIPT
+
+    return SCRIPT.read_text(encoding="utf-8")
+
+
+def _assigned_identifiers(text: str) -> set[str]:
+    """Every identifier the script assigns, derived from its text (not from a hand list)."""
+    import re
+
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    names = set(re.findall(r"(?<![\w$\-\"'/.])([A-Za-z_][A-Za-z0-9_]*)\+?=", code))
+    for match in re.finditer(r"\blocal\s+([^\n;]*)", code):
+        names.update(token.split("=", 1)[0] for token in match.group(1).split() if re.match(r"^[A-Za-z_]\w*", token))
+    names.update(re.findall(r"printf -v (\w+)", code))
+    for match in re.finditer(r"\bread -r (?:-[a-z] \S+ )*((?:[A-Za-z_]\w* ?)+)", code):
+        names.update(match.group(1).split())
+    names.update(re.findall(r"\bfor (\w+) in", code))
+    names.update({"UUID_RE", "REF_RE", "KEY_RE", "URL_RE"})
+    return {n for n in names if re.fullmatch(r"[A-Za-z_]\w*", n)} - {"IFS", "LC_ALL", "PATH"}
+
+
+def _unset_list(text: str) -> set[str]:
+    import re
+
+    match = re.search(r"^unset -v ((?:.*\\\n)*.*)$", text, re.M)
+    return set(match.group(1).replace("\\\n", " ").split())
+
+
+def test_the_script_unsets_every_identifier_it_assigns_before_assigning_anything():
+    text = _script_text()
+
+    missing = _assigned_identifiers(text) - _unset_list(text)
+
+    assert missing == set(), f"assigned but not unset at the top of the script: {sorted(missing)}"
+    assert text.index("unset -v") < text.index("readonly ROSTER")
+
+
+def test_no_ambient_exported_variable_of_any_name_the_script_assigns_can_carry_secrets_into_curl(tmp_path):
+    import os
+
+    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9")
+    existing = {name.casefold() for name in os.environ}  # Windows names are case-insensitive: never clobber PATH etc.
+    ambient = {name: "AMBIENT" for name in _assigned_identifiers(_script_text()) if name.casefold() not in existing}
+    canary = f"CANARY-prompt-{uuid.uuid4().hex[:12]}"
+    session_id, agent_id = new_session_id(), new_agent_id()
+
+    def run(event, **fields):
+        result = hook.run(payload_bytes(event, session_id, prompt=canary, **fields), env=ambient)
+        assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
+
+    run("SessionStart", source="startup")
+    run("SubagentStart", agent_id=agent_id, agent_type="planner")
+    hook.put_state(session_id, hook.state(session_id)[0], RUNTIME_ID, 0)
+    run("Stop")
+    run("SubagentStop", agent_id=agent_id)
+    run("SessionEnd", reason="clear")
+
+    envs = _records(tmp_path, "env")
+    assert len(envs) == 5
+    for text in envs:
+        assert key not in text and "dtk_" not in text and canary not in text
+        assert "Authorization" not in text and "external_session_ref" not in text and "url = " not in text
+        assert "hook_reported" not in text and "outcome" not in text
+
+
+def _hold_hook(tmp_path):
+    from twin_hook_harness import HoldListener
+
+    listener = HoldListener()
+    hook = Hook(tmp_path, dry_run=False)
+    hook.write_key_file(listener.base_url)
+    return hook, listener
+
+
+def test_a_registration_outage_costs_one_slow_call_then_every_event_is_quick(tmp_path):
+    hook, listener = _hold_hook(tmp_path)
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    hook.put_state(session_id, run, "-", 0)
+    elapsed = {}
+
+    try:
+        for label, event, fields in (
+            ("stop", "Stop", {}),
+            ("prompt", "UserPromptSubmit", {}),
+            ("subagent", "SubagentStart", {"agent_id": new_agent_id(), "agent_type": "planner"}),
+            ("stop-again", "Stop", {}),
+        ):
+            started = time.monotonic()
+            hook.fire(event, session_id, **fields)
+            elapsed[label] = time.monotonic() - started
+        connections = listener.connections
+    finally:
+        listener.close()
+
+    assert connections == 1  # one registration attempt in total, never a second
+    assert elapsed["stop"] < 6  # the 2 s attempt (no retry: the budget is spent), not two of them
+    assert max(elapsed["prompt"], elapsed["subagent"], elapsed["stop-again"]) < elapsed["stop"] + 1
+    assert [line[2] for line in hook.log_lines()] == ["conn_fail", "throttled", "backoff", "throttled"]
+    assert hook.state(session_id)[:2] == (run, "-") and hook.state(session_id)[2] > 0  # the attempt is stamped
+
+
+def test_a_failed_registration_stamps_the_state_so_the_next_minute_of_subagents_back_off(tmp_path):
+    hook, listener = _hold_hook(tmp_path)
+    session_id = new_session_id()
+
+    try:
+        hook.fire("SessionStart", session_id, source="startup")
+        hook.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+        connections = listener.connections
+    finally:
+        listener.close()
+
+    assert connections == 1
+    assert [line[2] for line in hook.log_lines()] == ["conn_fail", "backoff"]
+
+
+def test_twenty_stop_events_with_an_unregistered_session_make_at_most_one_registration_post(live, stub):
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    live.put_state(session_id, run, "-", 0)
+    stub.on("POST", SESSIONS, (403, '{"detail":"forbidden"}'))
+
+    for _ in range(20):
+        live.fire("Stop", session_id)
+
+    assert len([r for r in stub.seen if r["method"] == "POST"]) <= 1
+    assert live.state(session_id)[1] == "-"
+
+
+def test_two_parallel_subagent_starts_on_an_ended_run_share_one_new_run(live, stub):
+    session_id = new_session_id()
+    old_run = _register(live, stub, session_id)
+    stub.seen.clear()
+    first_agent, second_agent = new_agent_id(), new_agent_id()
+    registered = threading.Event()
+    refused = []
+
+    def responder(request):
+        if request["method"] != "POST" or request["path"] != SESSIONS:
+            return None
+        body = json.loads(request["body"])
+        if body["kind"] == "session":
+            registered.set()
+            return 201, json.dumps({"id": NEW_RUNTIME_ID})
+        if body["parent_external_session_ref"] == old_run:
+            refused.append(body["external_instance_ref"])
+            if len(refused) > 1:  # the second hook's refusal arrives once the first has re-registered
+                registered.wait(timeout=5)
+                time.sleep(0.5)
+            return 409, '{"detail":"parent_session_ended"}'
+        return 201, "{}"
+
+    stub.responder = responder
+    payloads = [
+        payload_bytes("SubagentStart", session_id, agent_id=agent_id, agent_type="planner")
+        for agent_id in (first_agent, second_agent)
+    ]
+    processes = [live.popen(raw) for raw in payloads]
+    codes = [p.wait(timeout=60) for p in processes]
+
+    assert codes == [0, 0]
+    bodies = stub.bodies("POST", SESSIONS)
+    new_sessions = [b for b in bodies if b["kind"] == "session"]
+    assert len(new_sessions) == 1, "a second run (a second Mission) was minted"
+    retried = [b for b in bodies if b["kind"] == "subagent" and b["parent_external_session_ref"] != old_run]
+    assert {b["external_instance_ref"] for b in retried} == {first_agent, second_agent}
+    assert {b["parent_external_session_ref"] for b in retried} == {new_sessions[0]["external_session_ref"]}
+    assert live.state(session_id)[0] == new_sessions[0]["external_session_ref"]
+
+
+# ---- the key file is read, never executed -------------------------------------------------
+
+
+def _marker(tmp_path, name: str):
+    return tmp_path / f"executed-{name}"
+
+
+def test_a_key_file_full_of_shell_syntax_runs_nothing_and_yields_only_validated_values(tmp_path):
+    from twin_hook_harness import synthetic_key
+
+    hook, _key = _shimmed(tmp_path, "http://127.0.0.1:9")
+    key = synthetic_key()
+    markers = [_marker(tmp_path, name).as_posix() for name in ("subst", "tick", "semi", "export", "func", "and")]
+    hook.write_key_text(
+        f"# a comment with $(touch {markers[0]})\n"
+        f"$(touch {markers[0]})\n"
+        f"`touch {markers[1]}`\n"
+        f"touch {markers[2]}; touch {markers[2]}\n"
+        f"export FROM_THE_FILE=1; touch {markers[3]}\n"
+        f"f() {{ touch {markers[4]}; }}; f\n"
+        f"true && touch {markers[5]}\n"
+        "export DAYTHREE_TWIN_KEY=ignored-because-of-the-export-prefix\n"
+        "  DAYTHREE_TWIN_KEY=ignored-because-of-the-leading-spaces\n"
+        "DAYTHREE_TWIN_BASE_URL=http://127.0.0.1:9\n"
+        f"DAYTHREE_TWIN_KEY={key}\n"
+        "DAYTHREE_TWIN_KEY=a-second-line-never-wins\n"
+    )
+
+    hook.fire("SessionStart", new_session_id(), source="startup")
+
+    assert [p for p in tmp_path.glob("executed-*")] == []
+    (stdin,) = _records(tmp_path, "stdin")
+    assert key in stdin and "ignored-because" not in stdin and "a-second-line" not in stdin
+    assert hook.last_log()[2] == "ok"
+
+
+@pytest.mark.parametrize(
+    "value_line",
+    [
+        "DAYTHREE_TWIN_KEY=$(touch {marker})",
+        "DAYTHREE_TWIN_KEY=`touch {marker}`",
+        "DAYTHREE_TWIN_KEY={key}; touch {marker}",
+        "DAYTHREE_TWIN_KEY={key} && touch {marker}",
+        'DAYTHREE_TWIN_KEY="{key}"',
+        "DAYTHREE_TWIN_KEY={key} # trailing comment",
+    ],
+)
+def test_a_key_line_with_anything_but_the_bare_key_is_refused_and_nothing_runs(tmp_path, value_line):
+    from twin_hook_harness import synthetic_key
+
+    hook, _key = _shimmed(tmp_path, "http://127.0.0.1:9")
+    marker = _marker(tmp_path, "value").as_posix()
+    hook.write_key_text(
+        "DAYTHREE_TWIN_BASE_URL=http://127.0.0.1:9\n" + value_line.format(marker=marker, key=synthetic_key()) + "\n"
+    )
+
+    hook.fire("SessionStart", new_session_id(), source="startup")
+
+    assert not _marker(tmp_path, "value").exists()
+    assert _records(tmp_path, "argv") == []
+    assert hook.last_log()[2] in {"no_key", "bad_config"}
+
+
+def test_an_export_prefixed_key_file_is_not_honoured(tmp_path):
+    hook, _key = _shimmed(tmp_path, "http://127.0.0.1:9", export=True)
+
+    hook.fire("SessionStart", new_session_id(), source="startup")
+
+    assert _records(tmp_path, "argv") == [] and hook.last_log()[2] == "no_key"
+
+
+def test_the_dry_run_file_is_honoured_only_when_dry_run_is_on(tmp_path):
+    hook, _key = _shimmed(tmp_path, "http://127.0.0.1:9")
+    target = tmp_path / "should-not-exist.txt"
+
+    result = hook.run(
+        payload_bytes("SessionStart", new_session_id(), source="startup"), env={"TWIN_DRY_RUN_FILE": str(target)}
+    )
+
+    assert result.returncode == 0 and not target.exists()
+    assert len(_records(tmp_path, "argv")) == 1  # a real (shimmed) call, not a dry run

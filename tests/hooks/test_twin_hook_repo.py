@@ -128,12 +128,22 @@ def test_the_key_file_location_is_fixed_and_outside_the_repo_and_the_payload_nev
 
 
 def test_the_script_reads_only_the_documented_payload_fields():
-    extracted = set(re.findall(r'extract_from "[^"]*" (\w+)', _CODE_TEXT))
+    documented = {"hook_event_name", "session_id", "source", "reason", "agent_id", "agent_type", "id"}
+    asked_for = set(re.findall(r'pair_get "\$PAIRS" (\w+)', _CODE_TEXT))
+    allow_list = re.search(r"function allowed\(k\) \{ return k ~ /\^\(([^)]*)\)\$/", _CODE_TEXT).group(1).split("|")
 
-    assert extracted == {"hook_event_name", "session_id", "source", "reason", "agent_id", "agent_type", "id"}
+    assert asked_for | {"id"} == documented  # `id` is read from the platform's own response
+    assert 'pair_get "$(top_pairs "${RESP' in _CODE_TEXT
+    assert set(allow_list) == documented  # the awk pass cannot even emit any other member
     for never in ("prompt", "cwd", "transcript_path", "last_assistant_message", "tool_input", "tool_result"):
-        assert not re.search(rf'extract_from "[^"]*" {never}\b', _CODE_TEXT)
+        assert never not in allow_list and f'pair_get "$PAIRS" {never}' not in _CODE_TEXT
     assert "tool_call_count" not in _CODE_TEXT
+
+
+def test_the_key_file_is_never_sourced_or_executed():
+    assert not re.search(r"(^|[\s;&|(])(source|\.)\s+[\"$]", _CODE_TEXT, re.M)
+    assert '. "$KEY_FILE"' not in _CODE_TEXT and "source" not in re.findall(r"\bsource\s+\S+", _CODE_TEXT)
+    assert 'done <"$KEY_FILE"' in _CODE_TEXT  # read line by line
 
 
 # ---------------------------------------------------------------------------
@@ -171,8 +181,19 @@ def test_the_existing_presence_hooks_are_kept():
         assert any(script in command for command in commands)
 
 
-def test_a_read_deny_rule_covers_the_key_path():
-    assert "Read(~/.daythree/**)" in _settings["permissions"]["deny"]
+def test_read_edit_and_write_deny_rules_cover_the_key_path_but_not_the_script():
+    deny = _settings["permissions"]["deny"]
+
+    for tool in ("Read", "Edit", "Write"):
+        assert f"{tool}(~/.daythree/**)" in deny
+    assert not any("report_twin_lifecycle" in rule for rule in deny)  # would block legitimate edits
+
+
+def test_the_setup_note_says_plainly_that_bash_is_not_covered():
+    note = " ".join(_settings["_twin_setup"])
+
+    assert "Bash" in note and "not covered" in note
+    assert "checked-out" in note and "report_twin_lifecycle.sh" in note
 
 
 def test_the_key_example_has_placeholders_only_and_the_operator_instructions():
@@ -180,9 +201,17 @@ def test_the_key_example_has_placeholders_only_and_the_operator_instructions():
 
     assert "DAYTHREE_TWIN_BASE_URL=" in text and "DAYTHREE_TWIN_KEY=" in text
     assert re.search(r"DAYTHREE_TWIN_KEY=PASTE\w*", text)
-    assert "dtk_" not in text
-    for required in ("icacls", "--expires-in-days 90", "OUTSIDE Claude Code", "--revoke", ".daythree/twin_env.sh"):
+    assert not re.search(r"dtk_[0-9a-f]{8}", text)  # only the `^dtk_` validation pattern may appear
+    for required in (
+        "icacls", "--expires-in-days 90", "OUTSIDE Claude Code", "--revoke", ".daythree/twin_env.sh",
+        "PYTHONPATH", "packages/policy-sdk", "services/artifact-service", "DATABASE_URL", ".env",
+        "localhost", "127.0.0.1", "Git Bash", "repo root", "cat",
+    ):
         assert required in text
+    assert "or PowerShell" not in text  # the issuing recipe is bash-only
+    assert "localhost:8000" not in text  # the API port is a placeholder, not a hard-coded default
+    assert "<published-api-port>" in text and "<published-postgres-port>" in text
+    assert "^dtk_" in text  # the recipe validates what it is about to write
 
 
 @pytest.mark.parametrize("name", ["hook_working.sh.example", "hook_stop.sh.example"])

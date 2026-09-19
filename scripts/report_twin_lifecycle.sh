@@ -20,28 +20,55 @@
 # No payload carries a tool-call count, so none is ever sent. Outcome and reason on a
 # subagent close are declared by this hook, not measured.
 #
-# Parsing uses class-restricted anchored sed only, and every extracted value is
-# re-validated before use; the request body is assembled from validated tokens only.
+# Parsing: one awk pass tokenises the payload and keeps only TOP-LEVEL string members whose key
+# is on a short allow-list and whose value is a short class-restricted token (a nested object or
+# array, or a key inside a string, can never match). Every value is then re-validated in bash,
+# and the request body is assembled from validated tokens only. No jq, no python.
 #
 # Configuration (never from the payload):
-#   $HOME/.daythree/twin_env.sh   sets DAYTHREE_TWIN_BASE_URL and DAYTHREE_TWIN_KEY (see
-#                                 .claude/twin_env.sh.example). There are no defaults: with
-#                                 either missing the hook exits 0 and logs one `no_key` line.
-#   TWIN_HOME       test override: use $TWIN_HOME instead of $HOME for the key file, and
+#   $HOME/.daythree/twin_env.sh   two lines, DAYTHREE_TWIN_BASE_URL=<url> and DAYTHREE_TWIN_KEY=<key>
+#                                 (see .claude/twin_env.sh.example). The file is READ, never
+#                                 executed: only those two lines are accepted, each value is
+#                                 validated, and comments, blanks, `export` lines and anything
+#                                 else are ignored. There are no defaults: with either missing
+#                                 the hook exits 0 and logs one `no_key` line.
+#   TWIN_HOME       TEST-ONLY override: use $TWIN_HOME instead of $HOME for the key file, and
 #                   $TWIN_HOME/.hook-debug instead of <repo>/.hook-debug for state and log.
-#   TWIN_DRY_RUN=1  make no network call and read no key; append each request this script
-#                   would send ("METHOD path body" per line) to the file named by
-#                   TWIN_DRY_RUN_FILE.
+#                   Never set it in the hook command or the settings file.
+#   TWIN_DRY_RUN=1  TEST-ONLY: make no network call and read no key; append each request this
+#                   script would send ("METHOD path body" per line) to the file named by
+#                   TWIN_DRY_RUN_FILE (honoured only when TWIN_DRY_RUN=1).
 #
 # State and log (gitignored, ids and enums only, never a secret):
 #   .hook-debug/twin-state/<claude-session-id>   "run-uuid runtime-uuid|- last-heartbeat-epoch"
 #   .hook-debug/twin_lifecycle.log               "UTC event class http-code pid [8-char ref]"
 #   .hook-debug/twin-failures/<event>            one epoch line per failure, counted at Gate E
+#
+# Known limits: the log and the failure files are trimmed by rewriting them past 256 KiB; a line
+# appended by a parallel hook during that rewrite can be lost (the state file, which matters, is
+# written atomically and is not trimmed). A SubagentStart racing a SessionEnd for the same run in
+# the same millisecond can register a Task under an ended run; the reaper heals that.
 
 exec >/dev/null 2>&1
 trap 'exit 0' EXIT
 set +x
-unset BASH_XTRACEFD TW_KEY TW_BASE_URL
+# A variable this script assigns keeps its export attribute if the caller's environment already
+# holds one of the same name, and would then reach curl's environment with the script's value
+# (the curl config with the key, the payload). Unset EVERY identifier the script assigns, before
+# anything is assigned; tests/hooks derive this list from the script text.
+unset -v BASH_XTRACEFD DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY \
+  ROSTER MAX_PAYLOAD HEARTBEAT_SECONDS LOG_CAP UUID_RE REF_RE KEY_RE URL_RE \
+  AWK_TOP HOME_DIR STATE_ROOT SCRIPT_PATH SCRIPT_DIR STATE_DIR FAIL_DIR LOG_FILE \
+  KEY_FILE EVENT EVENT_RAW SESSION_ID LOG_REF CLEANUP_STATE CONFIG_OK TW_BASE_URL \
+  TW_KEY LOOPBACK CURL_OPTS HTTP_CODE RESP NOW UUID CLASS \
+  S_OK S_RUN S_RT S_HB REG_RT FMT payload FLAT \
+  PAIRS e days secs z era doe yoe \
+  y doy mp d m file content ref \
+  f n hex i variants a b c \
+  tmp host line url key method path body \
+  attempt out rc code esc cfg source run \
+  type frag refused new_run elapsed reason outcome t \
+  v
 LC_ALL=C
 umask 077
 
@@ -53,7 +80,6 @@ readonly UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 readonly REF_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 readonly KEY_RE='^dtk_[0-9a-f]{32}_[A-Za-z0-9_-]{20,128}$'
 readonly URL_RE='^(https?)://([A-Za-z0-9.-]+|\[::1\])(:[0-9]{1,5})?$'
-readonly TOKEN='[A-Za-z0-9._:-]\{1,64\}'
 
 if [ -n "${TWIN_HOME:-}" ]; then
   HOME_DIR=$TWIN_HOME
@@ -147,14 +173,54 @@ finish() {
 
 # ---------------------------------------------------------------- parsing
 
-# extract_from STRING KEY -> stdout. First `"KEY": "<token>"` in the single-line STRING;
-# the value class is restricted so no quote, backslash or control character can pass.
-# A key sitting inside a JSON string value is escaped in the payload (`\"KEY\"`), so it
-# cannot match; the value is re-validated by the caller either way.
-extract_from() {
-  printf '%s' "$1" | LC_ALL=C sed -n \
-    -e 's/"'"$2"'"[[:space:]]*:[[:space:]]*"\('"$TOKEN"'\)"/\n\1\n/' \
-    -e 's/^[^\n]*\n\([^\n]*\)\n.*$/\1/p'
+# Top-level string members only. RS is the double quote, so records alternate between text
+# outside a string and the content of a string; a string whose closing quote is escaped
+# (an odd run of backslashes) is joined with the next record. Bracket depth is counted in the
+# outside-string text only, so braces inside strings never matter. A member is emitted as
+# `key=value` when it sits at depth 1, the key is on the allow-list, the value is a string of 1 to
+# 64 characters from [A-Za-z0-9._:-] (any backslash disqualifies it), and the key was not seen before.
+readonly AWK_TOP='
+BEGIN { RS = "\""; depth = 0; instr = 0; acc = ""; esc = 0; haspend = 0; pend = ""; isval = 0 }
+function allowed(k) { return k ~ /^(session_id|hook_event_name|source|reason|agent_id|agent_type|id)$/ }
+{
+  r = $0
+  if (!instr) {
+    t = r
+    sub(/^.*[,[{]/, "", t)
+    isval = (t ~ /:/)
+    o = gsub(/[[{]/, "&", r)
+    c = gsub(/[]}]/, "&", r)
+    depth += o - c
+    instr = 1
+    next
+  }
+  if (match(r, /\\+$/) && (RLENGTH % 2 == 1)) { acc = acc r "\""; esc = 1; next }
+  content = acc r
+  bad = esc || (content ~ /\\/)
+  acc = ""; esc = 0; instr = 0
+  if (depth != 1) next
+  if (isval) {
+    if (haspend && !bad && length(content) >= 1 && length(content) <= 64 && content ~ /^[A-Za-z0-9._:-]+$/ && !(pend in seen)) {
+      seen[pend] = 1
+      print pend "=" content
+    }
+    haspend = 0
+  } else {
+    haspend = (!bad && allowed(content))
+    pend = content
+  }
+}'
+
+# top_pairs STRING -> `key=value` lines for the allowed top-level members of the single-line JSON.
+top_pairs() { printf '%s' "$1" | LC_ALL=C awk "$AWK_TOP"; }
+
+# pair_get PAIRS KEY -> the value, or nothing.
+pair_get() {
+  local t v
+  t=$'\n'$1
+  v=${t#*$'\n'"$2"=}
+  if [ "$v" = "$t" ]; then return 0; fi
+  printf '%s' "${v%%$'\n'*}"
 }
 
 mint_uuid() { # canonical version-4 UUID -> UUID
@@ -199,14 +265,21 @@ write_state() { # run runtime-or-dash heartbeat-epoch
 
 # ---------------------------------------------------------------- transport
 
+# The key file is parsed, never sourced: anything that can write it (or a shell `cat` of it) is
+# outside what this script can defend, so at least nothing in it is ever executed. Only the first
+# `DAYTHREE_TWIN_BASE_URL=` and `DAYTHREE_TWIN_KEY=` lines count; every other line is ignored.
 load_config() {
-  local host
-  unset DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY
-  if [ -f "$KEY_FILE" ]; then . "$KEY_FILE"; fi
-  TW_BASE_URL=${DAYTHREE_TWIN_BASE_URL:-}
-  TW_KEY=${DAYTHREE_TWIN_KEY:-}
-  unset DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY # the key must never sit in an environment curl inherits
-  TW_BASE_URL=${TW_BASE_URL//$'\r'/} TW_KEY=${TW_KEY//$'\r'/} # a key file saved by a Windows editor
+  local host line
+  TW_BASE_URL= TW_KEY=
+  if [ -f "$KEY_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line//$'\r'/} # a key file saved by a Windows editor
+      case $line in
+        DAYTHREE_TWIN_BASE_URL=*) if [ -z "$TW_BASE_URL" ]; then TW_BASE_URL=${line#*=}; fi ;;
+        DAYTHREE_TWIN_KEY=*) if [ -z "$TW_KEY" ]; then TW_KEY=${line#*=}; fi ;;
+      esac
+    done <"$KEY_FILE"
+  fi
   if [ -z "$TW_BASE_URL" ] || [ -z "$TW_KEY" ]; then finish no_key; fi
   TW_BASE_URL=${TW_BASE_URL%/}
   if [[ ! $TW_KEY =~ $KEY_RE ]] || [[ ! $TW_BASE_URL =~ $URL_RE ]]; then finish bad_config; fi
@@ -240,7 +313,7 @@ api_call() {
   esc=${body//\"/\\\"}
   printf -v cfg 'url = "%s%s"\nrequest = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\ndata = "%s"\n' \
     "$TW_BASE_URL" "$path" "$method" "$TW_KEY" "$esc"
-  while [ "$attempt" -lt 2 ] && [ "$SECONDS" -lt 3 ]; do
+  while [ "$attempt" -lt 2 ] && [ "$SECONDS" -lt 2 ]; do
     attempt=$((attempt + 1))
     out=$(printf '%s' "$cfg" | curl -q -s -K - "${CURL_OPTS[@]}" -w '%{http_code}')
     rc=$?
@@ -274,7 +347,7 @@ register_session() { # run-uuid -> REG_RT ; 0 on a 2xx carrying a valid runtime 
   printf -v body '{"kind":"session","external_session_ref":"%s"}' "$1"
   api_call POST /api/v1/agent-runtime/sessions "$body"
   case $HTTP_CODE in 2??) ;; *) return 1 ;; esac
-  REG_RT=$(extract_from "${RESP//$'\n'/ }" id)
+  REG_RT=$(pair_get "$(top_pairs "${RESP//$'\n'/ }")" id)
   if [[ ! $REG_RT =~ $UUID_RE ]]; then REG_RT= HTTP_CODE=000; return 1; fi
   return 0
 }
@@ -283,8 +356,12 @@ register_session() { # run-uuid -> REG_RT ; 0 on a 2xx carrying a valid runtime 
 # the state has no runtime id): re-POST the SAME minted run uuid already in that state, at
 # most once per invocation. The server is idempotent on that ref, so this can never create a
 # second Mission. Never called when there is no state file (that is a logged miss, T3-F12),
-# and never by a heartbeat that already has a runtime id.
+# and never by a heartbeat that already has a runtime id. The attempt is stamped in the state
+# BEFORE the call and stays stamped on failure, so an outage costs one slow call per throttle
+# window (300 s on a heartbeat, 60 s on a subagent start), not one per event.
 ensure_session() {
+  now_epoch
+  write_state "$S_RUN" - "$NOW"
   if register_session "$S_RUN"; then
     S_RT=$REG_RT
     now_epoch
@@ -298,7 +375,7 @@ ensure_session() {
 
 on_session_start() {
   local source run
-  source=$(extract_from "$FLAT" source)
+  source=$(pair_get "$PAIRS" source)
   case $source in startup | resume | clear | compact | fork) ;; *) finish bad_source ;; esac
   read_state
   if [ "$source" = compact ] && [ "$S_OK" = 1 ]; then LOG_REF=$S_RUN; finish reused; fi
@@ -317,7 +394,8 @@ on_session_start() {
     finish ok "$HTTP_CODE"
   fi
   class_for_code "$HTTP_CODE"
-  case $CLASS in conn_fail | server_error) write_state "$run" - 0 ;; esac
+  now_epoch
+  case $CLASS in conn_fail | server_error) write_state "$run" - "$NOW" ;; esac
   finish "$CLASS" "$HTTP_CODE"
 }
 
@@ -329,10 +407,10 @@ post_subagent() { # instance-ref run-uuid agent-type-json-fragment
 
 on_subagent_start() {
   local ref type frag=
-  ref=$(extract_from "$FLAT" agent_id)
+  ref=$(pair_get "$PAIRS" agent_id)
   if [[ ! $ref =~ $REF_RE ]]; then finish bad_ref; fi
   LOG_REF=$ref
-  type=$(extract_from "$FLAT" agent_type)
+  type=$(pair_get "$PAIRS" agent_type)
   # Only the five roster names are ever sent; anything else is omitted and the server
   # buckets it to the general persona (D38).
   if [[ $type =~ ^[a-z-]{1,32}$ ]] && [[ $ROSTER == *" $type "* ]]; then frag=",\"agent_type\":\"$type\""; fi
@@ -340,19 +418,33 @@ on_subagent_start() {
   # state was lost): log a miss and send nothing. A session is never registered from a
   # subagent event.
   if ! read_state; then finish no_state; fi
-  if [ "$S_RT" = - ]; then ensure_session; fi
+  if [ "$S_RT" = - ]; then
+    # The session never registered. Retry that at most once a minute: while the platform is
+    # down, each subagent start must not add another slow call.
+    now_epoch
+    elapsed=$((NOW - 10#$S_HB))
+    if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt 60 ]; then finish backoff; fi
+    ensure_session
+  fi
   post_subagent "$ref" "$S_RUN" "$frag"
   case $HTTP_CODE in
     2??) finish ok "$HTTP_CODE" ;;
     409)
       if [[ $RESP != *'"parent_session_ended"'* ]]; then fail_from_response; fi
-      # The run ended (e.g. SessionEnd, or the reaper): mint a new run, register it, and
-      # retry this subagent exactly once. A second refusal is terminal, never a loop.
-      mint_uuid
-      local new_run=$UUID
-      if ! register_session "$new_run"; then fail_from_response; fi
-      now_epoch
-      write_state "$new_run" "$REG_RT" "$NOW"
+      # The run ended (e.g. SessionEnd, or the reaper): move to a new run and retry this
+      # subagent exactly once. A second refusal is terminal, never a loop. A parallel hook may
+      # have moved the session to a new run already: read the state again and reuse that run
+      # instead of minting a second one (which would create a second Mission).
+      refused=$S_RUN
+      if read_state && [ "$S_RUN" != "$refused" ] && [ "$S_RT" != - ]; then
+        new_run=$S_RUN
+      else
+        mint_uuid
+        new_run=$UUID
+        if ! register_session "$new_run"; then fail_from_response; fi
+        now_epoch
+        write_state "$new_run" "$REG_RT" "$NOW"
+      fi
       post_subagent "$ref" "$new_run" "$frag"
       case $HTTP_CODE in 2??) finish reregistered "$HTTP_CODE" ;; esac
       fail_from_response
@@ -363,7 +455,7 @@ on_subagent_start() {
 
 on_subagent_stop() {
   local ref
-  ref=$(extract_from "$FLAT" agent_id)
+  ref=$(pair_get "$PAIRS" agent_id)
   if [[ ! $ref =~ $REF_RE ]]; then finish bad_ref; fi
   LOG_REF=$ref
   # Declared, not measured: the payload carries no outcome and no tool-call count, so the
@@ -384,7 +476,7 @@ on_heartbeat() {
   elapsed=$((NOW - 10#$S_HB))
   if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt "$HEARTBEAT_SECONDS" ]; then finish throttled; fi
   if [ "$S_RT" = - ]; then
-    ensure_session # registration itself counts as the heartbeat
+    ensure_session # stamps the attempt first; a successful registration counts as the heartbeat
     finish ok "$HTTP_CODE"
   fi
   # Stamp the attempt, not the success: a platform outage must not add a slow call to every
@@ -400,15 +492,15 @@ on_heartbeat() {
 
 on_session_end() {
   local reason outcome
-  reason=$(extract_from "$FLAT" reason)
+  reason=$(pair_get "$PAIRS" reason)
   # Fixed table; the raw reason is never forwarded.
   case $reason in
     clear | resume | logout | prompt_input_exit) outcome=completed ;;
     *) outcome=abandoned ;;
   esac
+  CLEANUP_STATE=1 # the state file goes on every path from here, even a corrupt one
   if ! read_state; then finish no_state; fi
   LOG_REF=$S_RUN
-  CLEANUP_STATE=1 # the state file goes on every path from here, success or not
   if [ "$S_RT" = - ]; then finish no_state; fi
   api_call PATCH "/api/v1/agent-runtime/sessions/$S_RT" "{\"outcome\":\"$outcome\"}"
   case $HTTP_CODE in 2??) finish ok "$HTTP_CODE" ;; esac
@@ -433,8 +525,10 @@ if [ -z "$payload" ]; then finish empty; fi
 payload=${payload//$'\r'/}
 FLAT=${payload//$'\n'/ }
 payload=
+PAIRS=$(top_pairs "$FLAT")
+FLAT=
 
-EVENT_RAW=$(extract_from "$FLAT" hook_event_name)
+EVENT_RAW=$(pair_get "$PAIRS" hook_event_name)
 if [ -z "$EVENT_RAW" ]; then EVENT_RAW=${1:-}; fi
 case $EVENT_RAW in
   SessionStart | SessionEnd | SubagentStart | SubagentStop | Stop | UserPromptSubmit) EVENT=$EVENT_RAW ;;
@@ -442,7 +536,7 @@ case $EVENT_RAW in
   *) finish ignored ;;
 esac
 
-SESSION_ID=$(extract_from "$FLAT" session_id)
+SESSION_ID=$(pair_get "$PAIRS" session_id)
 if [[ ! $SESSION_ID =~ $UUID_RE ]]; then SESSION_ID=; finish bad_session; fi
 
 case $EVENT in
