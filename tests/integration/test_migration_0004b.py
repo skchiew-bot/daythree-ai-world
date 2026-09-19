@@ -175,7 +175,15 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
 
 
 def test_downgrade_drops_only_the_new_table_and_index_and_upgrade_restores_them(fresh_database):
-    command.upgrade(_alembic(), REVISION)
+    """Same newest-first, by-name discipline as `test_migration_0004.py`: upgrade to
+    `head` (today, 0004b IS head) and confirm there is exactly one, then downgrade to
+    a named revision rather than a relative offset -- so this stays correct once
+    something stacks on top of 0004b too."""
+    script = ScriptDirectory.from_config(_alembic())
+    command.upgrade(_alembic(), "head")
+    assert len(script.get_heads()) == 1
+    head_revision = script.get_heads()[0]
+
     ids = _seed_populated_rows(fresh_database)
     tables_at_head = fresh_database.table_names()
 
@@ -191,9 +199,9 @@ def test_downgrade_drops_only_the_new_table_and_index_and_upgrade_restores_them(
         == "session"
     )
 
-    command.upgrade(_alembic(), REVISION)
+    command.upgrade(_alembic(), "head")
 
-    assert fresh_database.current_revision() == REVISION
+    assert fresh_database.current_revision() == head_revision
     assert NEW_TABLES <= fresh_database.table_names()
     _assert_all_new_indexes(fresh_database)
 

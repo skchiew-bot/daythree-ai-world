@@ -150,20 +150,6 @@ def test_revision_id_fits_alembic_version_and_chains_onto_the_projects_head():
     assert len(script.get_heads()) == 1
 
 
-def test_upgrading_to_0004_alone_does_not_create_a_later_migrations_table(fresh_database):
-    """Regression test (found via 0004b's own CI run): `create_all(checkfirst=True)`
-    used to walk the WHOLE of today's `Base.metadata`, so upgrading to exactly this
-    revision would silently also create `agent_runtime_closures` (0004b's table) the
-    moment that model existed in the codebase -- and then THIS migration's own
-    `downgrade()` could no longer drop `agent_runtime_sessions` (blocked by the
-    incidentally-created table's live FK). `0004`'s `upgrade()` now passes
-    `tables=_NEW_TABLES` so it only ever creates its own three tables, regardless of
-    what a later migration's model declares."""
-    command.upgrade(_alembic(), REVISION)
-
-    assert "agent_runtime_closures" not in fresh_database.table_names()
-
-
 def test_upgrade_from_an_empty_database_creates_the_three_tables_and_every_index(fresh_database):
     command.upgrade(_alembic(), "head")
 
@@ -191,26 +177,40 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
 
 
 def test_downgrade_drops_only_the_three_tables_and_upgrade_restores_them(fresh_database):
-    # Revision-targeted, not "head" / "-1": a later migration (0004b) now stacks on
-    # top of this one, so "head" no longer means 0004 and "-1" from head no longer
-    # means "undo 0004" -- it would undo whatever the new head is instead. Naming
-    # both ends explicitly keeps this test about 0004 regardless of what stacks on
-    # top of it later (found when 0004b's own CI run broke this exact assumption).
-    command.upgrade(_alembic(), REVISION)
+    """Downgrades run newest-first in a real alembic history: from `head` (today,
+    0004b stacks on top of this migration), downgrading to a named revision undoes
+    EVERYTHING after that revision, not just 0004 in isolation -- so this test
+    downgrades one named revision at a time (`head` -> 0004 -> 0003c), never a
+    relative offset (`-1`), which broke the moment 0004b became the new head (found
+    via 0004b's own CI run: `-1` from head then undid 0004b, not 0004)."""
+    script = ScriptDirectory.from_config(_alembic())
+    command.upgrade(_alembic(), "head")
+    assert len(script.get_heads()) == 1
+    head_revision = script.get_heads()[0]
+
     ids = _seed_populated_rows(fresh_database)
     tables_at_head = fresh_database.table_names()
+
+    command.downgrade(_alembic(), REVISION)
+
+    assert fresh_database.current_revision() == REVISION
+    assert "agent_runtime_closures" not in fresh_database.table_names()  # 0004b undone
+    assert NEW_TABLES <= fresh_database.table_names()  # 0004's own three tables remain
+    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"
 
     command.downgrade(_alembic(), PARENT_REVISION)
 
     assert fresh_database.current_revision() == PARENT_REVISION
-    assert tables_at_head - fresh_database.table_names() == NEW_TABLES  # dropped exactly these
+    dropped = tables_at_head - fresh_database.table_names()
+    assert dropped == NEW_TABLES | {"agent_runtime_closures"}  # dropped exactly these, across both steps
     assert fresh_database.table_names() <= tables_at_head  # and created nothing
-    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"
+    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"  # pre-existing row untouched
 
-    command.upgrade(_alembic(), REVISION)
+    command.upgrade(_alembic(), "head")
 
-    assert fresh_database.current_revision() == REVISION
+    assert fresh_database.current_revision() == head_revision
     assert NEW_TABLES <= fresh_database.table_names()
+    assert "agent_runtime_closures" in fresh_database.table_names()
     _assert_all_new_indexes(fresh_database)
 
 
