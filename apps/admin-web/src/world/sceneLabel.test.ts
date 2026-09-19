@@ -17,6 +17,7 @@ function agent(activity: AgentRoom["activity"], i: number) {
     activity,
     active_task_id: null,
     activity_changed_at: null,
+    project_id: null,
   });
 }
 

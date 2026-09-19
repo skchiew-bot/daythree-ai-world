@@ -30,7 +30,8 @@ export function World() {
       ),
     [worldAgents, focusAgentId, timelineEventTypes],
   );
-  const focusAgentName = rooms.find((r) => r.agent_id === focusAgentId)?.display_name ?? "Assigned agent";
+  const focusAgentRoom = rooms.find((r) => r.agent_id === focusAgentId);
+  const focusAgentName = focusAgentRoom?.display_name ?? "Assigned agent";
   const floors = Math.max(
     roomsData?.default_floor_count ?? FALLBACK_FLOOR_COUNT,
     ...rooms.map((r) => r.floor),
@@ -80,9 +81,14 @@ export function World() {
       <div className="card" style={{ marginTop: "1rem" }}>
         <strong>Focus mission</strong>{" "}
         {focusMission ? (
+          // Allow-listed fields only (data-warden D18): mission code, status, agent
+          // display name, activity — never the free-text title (may carry a client name).
           <>
-            — {focusAgentName}: {focusMission.mission_code}: {focusMission.title}{" "}
-            <span className={`badge status-${focusMission.status}`}>{focusMission.status}</span>
+            — {focusAgentName}: {focusMission.mission_code}{" "}
+            <span className={`badge status-${focusMission.status}`}>{focusMission.status}</span>{" "}
+            {focusAgentRoom && (
+              <span className={`badge status-${focusAgentRoom.activity}`}>{focusAgentRoom.activity}</span>
+            )}
           </>
         ) : (
           <span style={{ color: "var(--text-muted)" }}>
@@ -131,12 +137,13 @@ export function World() {
             <code>{`{"status": "working", "job_description": "..."}`}</code>.
           </p>
         ) : (
+          // Allow-listed fields only (data-warden D18): name, status, updated — never
+          // job_description, a free-text field an external caller supplies unvalidated.
           <table>
             <thead>
               <tr>
                 <th>Name</th>
                 <th>Status</th>
-                <th>Job</th>
                 <th>Updated</th>
               </tr>
             </thead>
@@ -147,7 +154,6 @@ export function World() {
                   <td>
                     <span className={`badge status-${agent.status}`}>{agent.status}</span>
                   </td>
-                  <td>{agent.job_description ?? "—"}</td>
                   <td>{new Date(agent.updated_at).toLocaleTimeString()}</td>
                 </tr>
               ))}

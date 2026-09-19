@@ -5,8 +5,8 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.db.models import Agent, AgentVersion, Mission, User
-from contracts.enums import EventType, MissionStatus, UserRole
+from common.db.models import Agent, AgentVersion, Mission, MissionProject, Project, User
+from contracts.enums import EventType, MissionStatus, ProjectStatus, UserRole
 from contracts.events import Actor, ActorType, build_event
 from contracts.ids import EntityId
 
@@ -14,7 +14,7 @@ from api.dependencies.auth import get_current_user, get_tenant_scoped_or_404, re
 from api.dependencies.db import get_db_session
 from api.dependencies.events import get_event_publisher
 from api.dependencies.redis_client import get_redis_client
-from api.schemas.missions import MissionCreateRequest, MissionResponse
+from api.schemas.missions import MissionCreateRequest, MissionResponse, MissionUpdateRequest
 
 from mission_engine.engine.mission_service import create_mission as _create_mission
 from mission_engine.engine.mission_service import mark_mission_status, start_mission
@@ -24,6 +24,49 @@ from mission_engine.states.transitions import InvalidTransition
 router = APIRouter(prefix="/api/v1/missions", tags=["missions"])
 
 MUTATORS = require_role(UserRole.platform_admin, UserRole.tenant_admin, UserRole.operator)
+
+
+async def _resolve_project_link(session: AsyncSession, project_id: EntityId | None, tenant_id: EntityId) -> None:
+    """Validates a project_id before it is linked to a mission (ADR-014 decision 2):
+    cross-tenant is a 404 (get_tenant_scoped_or_404's usual guarantee, TC-P0-012),
+    archived is a 409 — a new link to an archived project is refused, though a
+    mission that already links to one keeps working (gate finding F6)."""
+    if project_id is None:
+        return
+    project = await get_tenant_scoped_or_404(session, Project, project_id, tenant_id)
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
+    if project.status == ProjectStatus.archived.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This project is archived and cannot be linked to a new mission.",
+        )
+
+
+async def _project_ids_for_missions(
+    session: AsyncSession, mission_ids: list[EntityId], tenant_id: EntityId
+) -> dict[EntityId, EntityId]:
+    """Explicit `MissionProject.tenant_id == tenant_id` predicate, matching
+    `agent_rooms.py::_project_id_by_mission` (security review follow-up, PR #26,
+    LOW) — not exploitable today since every caller already passes tenant-scoped
+    `mission_ids` and `mission_id` is the table's PK, but every mission-link read
+    is expected to filter tenant explicitly regardless of what the id alone
+    already guarantees."""
+    if not mission_ids:
+        return {}
+    rows = await session.execute(
+        select(MissionProject.mission_id, MissionProject.project_id).where(
+            MissionProject.mission_id.in_(mission_ids), MissionProject.tenant_id == tenant_id
+        )
+    )
+    return {mission_id: project_id for mission_id, project_id in rows.all()}
+
+
+async def _mission_response(session: AsyncSession, mission: Mission) -> MissionResponse:
+    project_ids = await _project_ids_for_missions(session, [mission.id], mission.tenant_id)
+    response = MissionResponse.model_validate(mission)
+    response.project_id = project_ids.get(mission.id)
+    return response
 
 
 async def _publish(publisher, session, event_type, tenant_id, actor, mission_id, task_id=None, agent_id=None, data=None):
@@ -40,8 +83,10 @@ async def create_mission_route(
     user: User = Depends(MUTATORS),
     session: AsyncSession = Depends(get_db_session),
     publisher=Depends(get_event_publisher),
-) -> Mission:
+) -> MissionResponse:
     import uuid as _uuid
+
+    await _resolve_project_link(session, payload.project_id, user.tenant_id)
 
     mission = await _create_mission(
         session, tenant_id=user.tenant_id, mission_code=f"MSN-{_uuid.uuid4().hex[:10].upper()}",
@@ -49,29 +94,73 @@ async def create_mission_route(
         assigned_agent_id=payload.assigned_agent_id, priority=payload.priority,
         risk_level=payload.risk_level, budget_policy=payload.budget_policy,
     )
+    if payload.project_id is not None:
+        session.add(
+            MissionProject(mission_id=mission.id, tenant_id=user.tenant_id, project_id=payload.project_id)
+        )
+        await session.flush()
+
     await _publish(
         publisher, session, EventType.mission_created, user.tenant_id, Actor(type=ActorType.user, id=user.id),
         mission.id, agent_id=mission.assigned_agent_id,
     )
-    return mission
+    return await _mission_response(session, mission)
 
 
 @router.get("", response_model=list[MissionResponse])
 async def list_missions(
     user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db_session)
-) -> list[Mission]:
+) -> list[MissionResponse]:
     result = await session.execute(select(Mission).where(Mission.tenant_id == user.tenant_id))
-    return list(result.scalars().all())
+    missions = list(result.scalars().all())
+    project_ids = await _project_ids_for_missions(session, [m.id for m in missions], user.tenant_id)
+    responses = []
+    for mission in missions:
+        response = MissionResponse.model_validate(mission)
+        response.project_id = project_ids.get(mission.id)
+        responses.append(response)
+    return responses
 
 
 @router.get("/{mission_id}", response_model=MissionResponse)
 async def get_mission(
     mission_id: EntityId, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db_session)
-) -> Mission:
+) -> MissionResponse:
     mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
     if mission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
-    return mission
+    return await _mission_response(session, mission)
+
+
+@router.patch("/{mission_id}", response_model=MissionResponse)
+async def update_mission(
+    mission_id: EntityId,
+    payload: MissionUpdateRequest,
+    user: User = Depends(MUTATORS),
+    session: AsyncSession = Depends(get_db_session),
+) -> MissionResponse:
+    """Today the only editable field is the project link (ADR-014 decision 2)."""
+    mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
+    if mission is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
+
+    await _resolve_project_link(session, payload.project_id, user.tenant_id)
+
+    existing_link = (
+        await session.execute(select(MissionProject).where(MissionProject.mission_id == mission.id))
+    ).scalar_one_or_none()
+    if payload.project_id is None:
+        if existing_link is not None:
+            await session.delete(existing_link)
+    elif existing_link is None:
+        session.add(
+            MissionProject(mission_id=mission.id, tenant_id=user.tenant_id, project_id=payload.project_id)
+        )
+    else:
+        existing_link.project_id = payload.project_id
+    await session.flush()
+
+    return await _mission_response(session, mission)
 
 
 @router.post("/{mission_id}/start", response_model=MissionResponse)
@@ -81,7 +170,7 @@ async def start_mission_route(
     session: AsyncSession = Depends(get_db_session),
     publisher=Depends(get_event_publisher),
     redis_client: Redis = Depends(get_redis_client),
-) -> Mission:
+) -> MissionResponse:
     mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
     if mission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
@@ -123,7 +212,7 @@ async def start_mission_route(
         )
         if agent_version is not None and agent_version.runtime_adapter == "custom_durable":
             await enqueue_task(redis_client, result.task.id)
-    return result.mission
+    return await _mission_response(session, result.mission)
 
 
 @router.post("/{mission_id}/cancel", response_model=MissionResponse)
@@ -132,7 +221,7 @@ async def cancel_mission(
     user: User = Depends(MUTATORS),
     session: AsyncSession = Depends(get_db_session),
     publisher=Depends(get_event_publisher),
-) -> Mission:
+) -> MissionResponse:
     mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
     if mission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
@@ -146,4 +235,4 @@ async def cancel_mission(
         publisher, session, EventType.mission_cancelled, user.tenant_id, Actor(type=ActorType.user, id=user.id),
         mission_id,
     )
-    return mission
+    return await _mission_response(session, mission)

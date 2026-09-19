@@ -19,6 +19,7 @@ const row = {
   activity: "idle",
   active_task_id: null,
   activity_changed_at: null,
+  project_id: null,
 } satisfies AgentRoom;
 
 describe("WorldAgent is only producible by toWorldAgent (data-warden D11)", () => {

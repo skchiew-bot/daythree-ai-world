@@ -17,6 +17,16 @@ class MissionCreateRequest(BaseModel):
     priority: MissionPriority = MissionPriority.normal
     risk_level: RiskLevel = RiskLevel.low
     budget_policy: Optional[BudgetPolicy] = None
+    # ADR-014 decision 2: optional link to a project, resolved with
+    # get_tenant_scoped_or_404 (cross-tenant is a 404; archived is a 409).
+    project_id: Optional[EntityId] = None
+
+
+class MissionUpdateRequest(BaseModel):
+    """The only mutable field today is the project link (ADR-014 decision 2) — every
+    other mission field changes through a dedicated action route (start/cancel)."""
+
+    project_id: Optional[EntityId] = None
 
 
 class MissionResponse(BaseModel):
@@ -34,3 +44,4 @@ class MissionResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    project_id: Optional[EntityId] = None

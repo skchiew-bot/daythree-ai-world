@@ -7,6 +7,7 @@ const NAV_ITEMS = [
   { to: "/agents", label: "Agent Registry" },
   { to: "/agents/new", label: "Create Agent" },
   { to: "/missions", label: "Mission Control" },
+  { to: "/projects", label: "Projects" },
   { to: "/world", label: "3D World" },
 ];
 
