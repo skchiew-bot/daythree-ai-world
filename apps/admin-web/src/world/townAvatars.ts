@@ -97,6 +97,32 @@ export class TownAvatars {
     this.commutes.clear();
   }
 
+  /** Every agent currently out in town (not at the residence). Read-only, live view: a
+   * caller must not mutate or retain a reference across an `update()` call. Used by W3 to
+   * build twin pick proxies without duplicating TownAvatars' own bookkeeping. */
+  get awayIds(): IterableIterator<string> {
+    return this.away.keys();
+  }
+
+  /** True while `agentId` is out in town. */
+  hasAway(agentId: string): boolean {
+    return this.away.has(agentId);
+  }
+
+  /** Fills `out` with the twin's current world position and heading and returns true, or
+   * returns false without touching `out` when the twin is not away (it left the payload,
+   * or it has arrived home and been handed back to the residence) — never reads a handle
+   * that has already been disposed (W3-F3). `out` is owned by the caller, so a frame that
+   * follows a twin allocates no pose. */
+  poseOf(agentId: string, out: { x: number; z: number; heading: number }): boolean {
+    const entry = this.away.get(agentId);
+    if (!entry) return false;
+    out.x = entry.handle.group.position.x;
+    out.z = entry.handle.group.position.z;
+    out.heading = entry.handle.group.rotation.y;
+    return true;
+  }
+
   private advance(agent: WorldAgent, lotOf: ReadonlyMap<string, number>, clock: FrameClock): CommuteState {
     const desired = placeFor(agent);
     const prev = this.commutes.get(agent.agent_id) ?? initCommute(desired, this.town, lotOf);

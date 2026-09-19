@@ -22,12 +22,14 @@ export type WorldAgent = {
 } & { readonly [worldAgentBrand]: true };
 
 /** The only fields of a project that may reach the 3D scene (ADR-014 decision 5, data-
- * warden D13): `id` and `code`. `name` may be a client's name and never enters the
+ * warden D13; W3 D19 widens this by exactly `status` for the proximity card and follow
+ * panel): `id`, `code` and `status`. `name` may be a client's name and never enters the
  * canvas; it stays in the HTML sidebar (operator decision O17). Same branding rule as
  * `WorldAgent`: a raw `ProjectSummary` (which has `name`) does not satisfy it. */
 export type WorldProject = {
   readonly id: string;
   readonly code: string;
+  readonly status: string;
 } & { readonly [worldProjectBrand]: true };
 
 /** The single allow-list builder for agents. It copies fields one by one and never
@@ -52,6 +54,7 @@ export function toWorldProject(project: ProjectSummary): WorldProject {
   return {
     id: project.id,
     code: project.code,
+    status: project.status,
   } as WorldProject;
 }
 

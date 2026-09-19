@@ -5,7 +5,7 @@ import type { AgentRoom, ProjectSummary } from "@/types/api";
 import { toWorldAgent, toWorldAgents, toWorldProject, toWorldProjects } from "./renderPayload";
 
 const ALLOWED_KEYS = ["activity", "agent_id", "display_name", "floor", "project_id", "room_index"];
-const ALLOWED_PROJECT_KEYS = ["code", "id"];
+const ALLOWED_PROJECT_KEYS = ["code", "id", "status"];
 
 function apiRow(overrides: Record<string, unknown> = {}): AgentRoom {
   return {
@@ -79,11 +79,11 @@ describe("world project payload allow-list (data-warden D13)", () => {
     expect(Object.keys(toWorldProject(projectRow())).sort()).toEqual(ALLOWED_PROJECT_KEYS);
   });
 
-  it("copies id and code unchanged and drops name and status", () => {
+  it("copies id, code and status unchanged and drops name", () => {
     const project = toWorldProject(projectRow());
 
-    expect(project).toEqual({ id: "p-1", code: "ATLAS-1" });
-    expect(JSON.stringify(project)).not.toMatch(/Acme|payroll|active/);
+    expect(project).toEqual({ id: "p-1", code: "ATLAS-1", status: "active" });
+    expect(JSON.stringify(project)).not.toMatch(/Acme|payroll/);
   });
 
   it("drops extra fields the API adds later", () => {
