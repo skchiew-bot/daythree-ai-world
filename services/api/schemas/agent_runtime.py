@@ -44,11 +44,17 @@ class AgentRuntimeSessionCreateRequest(BaseModel):
         if self.kind == AgentRuntimeKind.session:
             # mission_code is the session uuid directly (build-plan condition C5): must
             # be a real UUID so `missions.title` always matches
-            # `^Claude Code session [0-9a-f-]{36}$` (T1 acceptance test 13).
+            # `^Claude Code session [0-9a-f-]{36}$` (T1 acceptance test 13). Normalized
+            # to `str(UUID(...))`'s canonical lowercase-hyphenated form -- `uuid.UUID`
+            # itself accepts non-canonical spellings of the same value (braces,
+            # `urn:uuid:` prefix, uppercase hex, no dashes), and storing the raw input
+            # verbatim would let two different spellings of one session id defeat the
+            # `(tenant_id, external_session_ref)` idempotency index and break the title
+            # regex (security review round 1, MEDIUM).
             if not self.external_session_ref:
                 raise ValueError("external_session_ref is required for kind='session'.")
             try:
-                UUID(self.external_session_ref)
+                self.external_session_ref = str(UUID(self.external_session_ref))
             except ValueError as exc:
                 raise ValueError("external_session_ref must be a UUID for kind='session'.") from exc
         if self.kind == AgentRuntimeKind.subagent:

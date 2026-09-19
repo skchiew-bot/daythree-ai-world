@@ -1,7 +1,13 @@
-"""Issues (or rotates) a scoped `agent_runtime` API key for one tenant (ADR-010 C2,
+"""Issues, or revokes, a scoped `agent_runtime` API key for one tenant (ADR-010 C2,
 T1-F15). Ships with this PR for the test suite's use only -- the operator runs it
 themselves, later, against their own database; this build does not run it against the
 live tenant and does not create the first key for it.
+
+Rotation is issue-new-then-revoke-old, WITH an overlap window: `issue()` never revokes
+anything by itself, so running it again for a tenant that already has a live key leaves
+BOTH valid (`AgentRuntimePrincipal`'s own docstring: rate limits are keyed per key id,
+not just per user, precisely so two overlapping keys don't share one budget). Once the
+new key is confirmed working, revoke the old one explicitly by id with `--revoke`.
 
 Safety:
   - Refuses a non-local `DATABASE_URL` unless `--allow-remote` is passed explicitly --
@@ -16,7 +22,7 @@ Safety:
 
 Usage:
     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq
-    python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq --rotate
+    python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq --revoke <key-id>
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import argparse
 import asyncio
 import secrets
 import sys
+import uuid
 from datetime import datetime, timezone
 
 import structlog
@@ -47,6 +54,14 @@ def _is_local_database_url(url: str) -> bool:
 
 def _service_email(tenant_code: str) -> str:
     return f"agent-runtime+{tenant_code}@daythree.local"
+
+
+async def _get_tenant(session, tenant_code: str) -> Tenant:
+    result = await session.execute(select(Tenant).where(Tenant.code == tenant_code))
+    tenant = result.scalar_one_or_none()
+    if tenant is None:
+        raise SystemExit(f"No tenant with code '{tenant_code}' exists.")
+    return tenant
 
 
 async def _ensure_service_user(session, tenant: Tenant) -> User:
@@ -84,40 +99,47 @@ async def _issue_key(session, user: User, label: str) -> str:
     return f"dtk_{key.id.hex}_{secret}"
 
 
-async def _revoke_existing_keys(session, user: User) -> int:
-    result = await session.execute(
-        select(AgentRuntimeApiKey).where(AgentRuntimeApiKey.user_id == user.id, AgentRuntimeApiKey.revoked_at.is_(None))
-    )
-    rows = list(result.scalars().all())
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        row.revoked_at = now
-    await session.flush()
-    return len(rows)
-
-
-async def issue(tenant_code: str, *, label: str, rotate: bool) -> str:
+async def issue(tenant_code: str, *, label: str) -> str:
+    """Always additive -- never revokes an existing key. Safe to call again for a
+    tenant that already has a live key: rotation is issue-new-then-revoke-old, and the
+    old key stays valid until a separate `revoke(...)` call names it."""
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        result = await session.execute(select(Tenant).where(Tenant.code == tenant_code))
-        tenant = result.scalar_one_or_none()
-        if tenant is None:
-            raise SystemExit(f"No tenant with code '{tenant_code}' exists.")
-
+        tenant = await _get_tenant(session, tenant_code)
         user = await _ensure_service_user(session, tenant)
-        if rotate:
-            revoked = await _revoke_existing_keys(session, user)
-            logger.info("agent_runtime_api_keys_revoked", tenant_code=tenant_code, count=revoked)
         token = await _issue_key(session, user, label)
         await session.commit()
         return token
+
+
+async def revoke(tenant_code: str, key_id: str) -> None:
+    """Revokes exactly one key by id, scoped to this tenant's own service user so a
+    typo'd id can never revoke a different tenant's key."""
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        tenant = await _get_tenant(session, tenant_code)
+        user = await _ensure_service_user(session, tenant)
+        try:
+            parsed_key_id = uuid.UUID(key_id)
+        except ValueError:
+            raise SystemExit(f"'{key_id}' is not a valid key id.") from None
+        key = await session.get(AgentRuntimeApiKey, parsed_key_id)
+        if key is None or key.user_id != user.id:
+            raise SystemExit(f"No key '{key_id}' exists for tenant '{tenant_code}'.")
+        if key.revoked_at is None:
+            key.revoked_at = datetime.now(timezone.utc)
+            await session.commit()
+        logger.info("agent_runtime_api_key_revoked", key_id=key_id, tenant_code=tenant_code)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant-code", required=True)
     parser.add_argument("--label", default="issued via issue_agent_runtime_key.py")
-    parser.add_argument("--rotate", action="store_true", help="Revoke this tenant's existing keys first.")
+    parser.add_argument(
+        "--revoke", metavar="KEY_ID", default=None,
+        help="Revoke this key id for the tenant instead of issuing a new one.",
+    )
     parser.add_argument(
         "--allow-remote", action="store_true",
         help="Required to run against a DATABASE_URL that is not localhost/127.0.0.1.",
@@ -133,7 +155,12 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    token = asyncio.run(issue(args.tenant_code, label=args.label, rotate=args.rotate))
+    if args.revoke is not None:
+        asyncio.run(revoke(args.tenant_code, args.revoke))
+        print(f"Revoked key {args.revoke} for tenant {args.tenant_code}.")
+        return
+
+    token = asyncio.run(issue(args.tenant_code, label=args.label))
     print(token)
 
 

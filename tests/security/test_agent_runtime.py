@@ -95,6 +95,38 @@ def _agent_runtime_jwt(user: User) -> str:
     )
 
 
+async def _seed_claude_code_agent(db_session, tenant: Tenant) -> Agent:
+    """Every registration test needs `AGT-CLAUDE-CODE` (and the `claude-code-external`
+    `ModelPolicy` it depends on) seeded for the tenant first, or `_register_session`
+    409s -- factored out so the log/rotation tests (which build their own bare tenant
+    rather than going through `_make_tenant_with_runtime_key`) don't have to repeat it.
+    """
+    model_policy = ModelPolicy(
+        id=new_id(), tenant_id=tenant.id, name="claude-code-external", primary_provider="claude-code",
+        primary_model="claude-code-session", max_input_tokens=0, max_output_tokens=0,
+        max_cost_per_task=0, timeout_seconds=0,
+    )
+    db_session.add(model_policy)
+    await db_session.flush()
+
+    claude_code = Agent(
+        id=new_id(), tenant_id=tenant.id, agent_code="AGT-CLAUDE-CODE", display_name="Claude Code",
+        lifecycle_state=AgentLifecycleState.active.value,
+    )
+    db_session.add(claude_code)
+    await db_session.flush()
+    version = AgentVersion(
+        id=new_id(), agent_id=claude_code.id, version=1, system_prompt="x", runtime_adapter="external_manual",
+        model_policy_id=model_policy.id, autonomy_level=AutonomyLevel.a3.value,
+        tool_policy=ToolPolicy.allow_only([]).model_dump(), checksum="x",
+    )
+    db_session.add(version)
+    await db_session.flush()
+    claude_code.active_version_id = version.id
+    await db_session.commit()
+    return claude_code
+
+
 async def _make_tenant_with_runtime_key(db_session, code: str) -> dict:
     tenant = Tenant(id=new_id(), code=code, name=code)
     db_session.add(tenant)
@@ -239,6 +271,147 @@ async def test_a_garbage_bearer_token_is_401(client, db_session):
     assert response.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_the_secret_never_appears_in_captured_logs(client, db_session, caplog):
+    """T1 acceptance test 14's missing case (security review round 1, MEDIUM): issuing
+    a key, a successful authenticated call, a revoked-key call and a malformed-key call
+    must never put the secret into any log line -- structlog here is configured with
+    `PrintLoggerFactory` (writes straight to stdout, bypassing stdlib `logging`
+    entirely -- see `observability/logging/setup.py`), so `structlog.testing
+    .capture_logs()` is what actually intercepts it regardless of that sink; stdlib
+    `caplog` is also asserted for anything a library might log through normal
+    `logging`. The script's one deliberate stdout print is exercised and asserted
+    separately in `test_issue_script_prints_the_token_exactly_once_and_only_to_stdout`.
+    """
+    import structlog
+
+    from infrastructure.scripts.issue_agent_runtime_key import _ensure_service_user, _issue_key
+
+    tenant = Tenant(id=new_id(), code="ar-log-secret", name="ar-log-secret")
+    db_session.add(tenant)
+    await db_session.commit()
+    await _seed_claude_code_agent(db_session, tenant)
+
+    with structlog.testing.capture_logs() as structlog_events, caplog.at_level("DEBUG"):
+        service_user = await _ensure_service_user(db_session, tenant)
+        token = await _issue_key(db_session, service_user, label="log-secret-test")
+        await db_session.commit()
+
+        secret = token.split("_", 2)[2]
+
+        good = await client.post(
+            "/api/v1/agent-runtime/sessions", headers=_auth_headers(token),
+            json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+        )
+        assert good.status_code == 201, good.text
+
+        # Revoke, then a call with the now-revoked key, then a malformed one.
+        key = (
+            await db_session.execute(
+                select(AgentRuntimeApiKey).where(AgentRuntimeApiKey.user_id == service_user.id)
+            )
+        ).scalar_one()
+        key.revoked_at = datetime.now(timezone.utc)
+        await db_session.commit()
+        revoked = await client.post(
+            "/api/v1/agent-runtime/sessions", headers=_auth_headers(token),
+            json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+        )
+        assert revoked.status_code == 401
+        malformed = await client.post(
+            "/api/v1/agent-runtime/sessions", headers=_auth_headers(f"dtk_{key.id.hex}_{secret}x-garbled"),
+            json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+        )
+        assert malformed.status_code == 401
+
+    for event in structlog_events:
+        assert secret not in repr(event), f"secret leaked into a structlog event: {event!r}"
+    for record in caplog.records:
+        assert secret not in record.getMessage(), f"secret leaked into a stdlib log record: {record.getMessage()!r}"
+
+
+def test_issue_script_prints_the_token_exactly_once_and_only_to_stdout(monkeypatch, capsys):
+    """Isolated from the database: `main()`'s only remaining side effect once `issue()`
+    returns is `print(token)` -- this proves that call site (and only that call site)
+    ever reaches stdout, without needing a live DB for the CLI wiring itself (the
+    secret-never-logged half of test 14 is covered against the real functions and a
+    real DB in the previous test). Deliberately a plain sync test, not async: `main()`
+    itself owns an `asyncio.run(...)` call, which raises "cannot be called from a
+    running event loop" if this test were async under `asyncio_mode = "auto"`."""
+    import infrastructure.scripts.issue_agent_runtime_key as issue_script
+    from common.config import Settings
+
+    sentinel_token = "dtk_" + ("a" * 32) + "_the-actual-secret-value"
+
+    async def _fake_issue(tenant_code, *, label):
+        return sentinel_token
+
+    monkeypatch.setattr(issue_script, "issue", _fake_issue)
+    monkeypatch.setattr(issue_script, "get_settings", lambda: Settings())  # database_url defaults to localhost
+    monkeypatch.setattr(
+        "sys.argv", ["issue_agent_runtime_key.py", "--tenant-code", "daythree-hq"]
+    )
+
+    issue_script.main()
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == sentinel_token
+    assert captured.out.count("the-actual-secret-value") == 1
+
+
+@pytest.mark.asyncio
+async def test_rotation_is_issue_new_then_revoke_old_with_an_overlap_window(client, db_session, monkeypatch):
+    """Security review round 1, LOW: `issue()` must never revoke anything by itself
+    (docstring vs. code mismatch found in round 1) -- a tenant can hold two live keys
+    at once, and only a separate, explicit `revoke(key_id)` call retires one."""
+    import infrastructure.scripts.issue_agent_runtime_key as issue_script
+    from infrastructure.scripts.issue_agent_runtime_key import issue, revoke
+
+    tenant = Tenant(id=new_id(), code="ar-rotate", name="ar-rotate")
+    db_session.add(tenant)
+    await db_session.commit()
+    await _seed_claude_code_agent(db_session, tenant)
+
+    # `issue`/`revoke` open their own session via the `get_sessionmaker` name they
+    # imported into THEIR OWN module namespace (`from common.db.session import
+    # get_sessionmaker`) -- patching `common.db.session.get_sessionmaker` itself would
+    # not affect that already-bound reference, so it has to be patched here instead.
+    # Point it at this test's own bound engine so `issue`/`revoke` operate on the same
+    # transaction/rows the test can see (and never touch a real database by accident).
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    fixed_sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(issue_script, "get_sessionmaker", lambda: fixed_sessionmaker)
+
+    old_token = await issue(tenant.code, label="old")
+    new_token = await issue(tenant.code, label="new")  # issuing again revokes nothing
+
+    old_response = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(old_token),
+        json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+    )
+    new_response = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(new_token),
+        json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+    )
+    assert old_response.status_code == 201, old_response.text  # both keys are live
+    assert new_response.status_code == 201, new_response.text
+
+    old_key_id = old_token.split("_", 2)[1]
+    await revoke(tenant.code, old_key_id)
+
+    old_after_revoke = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(old_token),
+        json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+    )
+    new_after_revoke = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(new_token),
+        json={"kind": "session", "external_session_ref": str(uuid.uuid4())},
+    )
+    assert old_after_revoke.status_code == 401  # only the named key was retired
+    assert new_after_revoke.status_code == 201, new_after_revoke.text
+
+
 # ---------------------------------------------------------------------------
 # Session/subagent registration behaviour
 # ---------------------------------------------------------------------------
@@ -292,6 +465,38 @@ async def test_duplicate_session_registration_is_idempotent(client, db_session):
         await db_session.execute(select(Mission).where(Mission.mission_code == session_ref))
     ).scalars().all()
     assert len(missions) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_spellings_of_the_same_uuid_register_one_session_and_one_mission(client, db_session):
+    """Security review round 1, MEDIUM: `uuid.UUID(...)` accepts non-canonical
+    spellings (braces, uppercase, no dashes, a `urn:uuid:` prefix) of the same value --
+    without normalization, two such spellings of one session id would defeat the
+    `(tenant_id, external_session_ref)` idempotency index and could each produce their
+    own Mission."""
+    ctx = await _make_tenant_with_runtime_key(db_session, "ar-uuid-normalize")
+    canonical = uuid.uuid4()
+    braced = f"{{{str(canonical).upper()}}}"
+
+    first = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(ctx["token"]),
+        json={"kind": "session", "external_session_ref": str(canonical)},
+    )
+    second = await client.post(
+        "/api/v1/agent-runtime/sessions", headers=_auth_headers(ctx["token"]),
+        json={"kind": "session", "external_session_ref": braced},
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["external_session_ref"] == str(canonical)
+
+    missions = (
+        await db_session.execute(select(Mission).where(Mission.mission_code == str(canonical)))
+    ).scalars().all()
+    assert len(missions) == 1
+    assert re.match(r"^Claude Code session [0-9a-f-]{36}$", missions[0].title)
 
 
 @pytest.mark.asyncio
@@ -503,36 +708,45 @@ async def test_heartbeat_and_ended_update_the_runtime_session_row(client, db_ses
 # ---------------------------------------------------------------------------
 
 
-def _get_routes_outside_agent_runtime() -> list[str]:
-    """Only routes actually wired behind `forbid_agent_runtime` in `routes/__init__.py`
-    -- i.e. everything under `/api/v1/` except `/api/v1/auth` and
-    `/api/v1/agent-runtime`. FastAPI's own `/docs`, `/openapi.json`, `/redoc` and the
-    unprefixed `/health/*`/`/metrics` routes are not part of that gate and are excluded
-    here rather than asserted 403, matching what `routes/__init__.py` actually wires."""
-    paths = []
+_BODY_METHODS = {"POST", "PUT", "PATCH"}
+
+
+def _get_route_method_pairs_outside_agent_runtime() -> list[tuple[str, str]]:
+    """Every (method, path) pair actually wired behind `forbid_agent_runtime` in
+    `routes/__init__.py` -- i.e. every method on every route under `/api/v1/` except
+    `/api/v1/auth` and `/api/v1/agent-runtime`. Security review round 1, MEDIUM: the
+    original version of this test only checked GET, so it was not table-driven over
+    every route AND method the way T1 acceptance test 3 requires -- a route reachable
+    only by POST/PUT/PATCH/DELETE was never exercised at all. FastAPI's own `/docs`,
+    `/openapi.json`, `/redoc` and the unprefixed `/health/*`/`/metrics` routes are not
+    part of that gate and are excluded here rather than asserted 403, matching what
+    `routes/__init__.py` actually wires."""
+    pairs = []
     for route in app.routes:
         methods = getattr(route, "methods", None) or set()
         path = getattr(route, "path", None)
-        if not path or "GET" not in methods or not path.startswith("/api/v1/"):
+        if not path or not path.startswith("/api/v1/"):
             continue
         if any(path.startswith(prefix) for prefix in _EXEMPT_PREFIXES):
             continue
-        paths.append(path)
-    return paths
+        for method in sorted(methods - {"HEAD", "OPTIONS"}):
+            pairs.append((method, path))
+    return pairs
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", _get_routes_outside_agent_runtime())
-async def test_agent_runtime_gets_403_on_every_get_route_except_its_own(client, db_session, path):
+@pytest.mark.parametrize("method,path", _get_route_method_pairs_outside_agent_runtime())
+async def test_agent_runtime_gets_403_on_every_route_and_method_except_its_own(client, db_session, method, path):
     ctx = await _make_tenant_with_runtime_key(db_session, f"ar403-{uuid.uuid4().hex[:16]}")
     jwt = _agent_runtime_jwt(ctx["service_user"])
     concrete_path = path
     for param in re.findall(r"\{(\w+)\}", path):
         concrete_path = concrete_path.replace("{" + param + "}", str(uuid.uuid4()))
 
-    response = await client.get(concrete_path, headers=_auth_headers(jwt))
+    kwargs = {"json": {}} if method in _BODY_METHODS else {}
+    response = await client.request(method, concrete_path, headers=_auth_headers(jwt), **kwargs)
 
-    assert response.status_code == 403, f"GET {path} -> {response.status_code}: {response.text}"
+    assert response.status_code == 403, f"{method} {path} -> {response.status_code}: {response.text}"
 
 
 @pytest.mark.asyncio
