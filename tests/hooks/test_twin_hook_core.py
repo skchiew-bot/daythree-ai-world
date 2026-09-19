@@ -612,3 +612,49 @@ def test_failure_counters_count_only_failures(hook):
 
     assert hook.failure_count("SubagentStart") == 2
     assert hook.failure_count("Stop") == 0 and hook.failure_count("SessionStart") == 0
+
+
+# ---------------------------------------------------------------------------
+# Review round: hardening found by the pre-PR security review
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_failures_are_all_counted(hook):
+    processes = [
+        hook.popen(payload_bytes("SubagentStart", new_session_id(), agent_id=new_agent_id())) for _ in range(10)
+    ]
+
+    assert [p.wait(timeout=60) for p in processes] == [0] * 10
+    assert hook.failure_count("SubagentStart") == 10  # append-only: no read-modify-write to lose a count
+
+
+def test_a_state_heartbeat_with_leading_zeros_is_read_as_decimal_not_octal(hook):
+    session_id = new_session_id()
+    run = _start(hook, session_id)
+    runtime_id = hook.state(session_id)[1]
+    (hook.state_dir / session_id).write_text(f"{run} {runtime_id} 0000000008\n", newline="\n")
+
+    hook.fire("Stop", session_id)
+
+    assert [r["method"] for r in hook.requests()] == ["POST", "PATCH"]
+
+
+def test_invalid_utf8_after_the_tokens_does_not_blank_the_extraction(hook):
+    session_id = new_session_id()
+    raw = payload_bytes("SessionStart", session_id, source="startup")[:-1] + b',"note":"\xff\xfe\xc3("}'
+
+    result = hook.run(raw, env={"LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"})
+
+    assert result.returncode == 0 and result.stdout == b""
+    assert len(hook.requests()) == 1 and hook.state(session_id) is not None
+
+
+@pytest.mark.parametrize("arg", ["Bogus", "sessionstart", "SessionStart; id", "../SessionStart", "SessionStart "])
+def test_the_argv_event_name_goes_through_the_same_fixed_list_as_the_payload_value(hook, arg):
+    raw = json.dumps({"session_id": new_session_id(), "source": "startup"}).encode()
+
+    result = hook.run(raw, event_arg=arg)
+
+    assert result.returncode == 0 and result.stdout == b"" and result.stderr == b""
+    assert hook.requests() == []
+    assert hook.last_log()[2] == "ignored"

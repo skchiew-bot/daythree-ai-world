@@ -113,7 +113,7 @@ def test_the_script_never_exports_or_echoes_the_key_and_never_writes_the_payload
     assert not re.search(r"\bexport\b", _CODE_TEXT)
     assert not re.search(r"<<<", _CODE_TEXT)  # a here-string can spill a large payload to a temp file
     assert "-H " not in _CODE_TEXT and "--header" not in _CODE_TEXT  # headers travel in the stdin config
-    assert '"$KEY"' in _CODE_TEXT and "-K -" in _CODE_TEXT
+    assert '"$TW_KEY"' in _CODE_TEXT and "-K -" in _CODE_TEXT
 
 
 def test_the_transport_flags_are_pinned():

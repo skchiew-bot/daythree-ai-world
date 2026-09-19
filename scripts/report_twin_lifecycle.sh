@@ -36,10 +36,12 @@
 # State and log (gitignored, ids and enums only, never a secret):
 #   .hook-debug/twin-state/<claude-session-id>   "run-uuid runtime-uuid|- last-heartbeat-epoch"
 #   .hook-debug/twin_lifecycle.log               "UTC event class http-code pid [8-char ref]"
-#   .hook-debug/twin-failures/<event>            failure counter, read at Gate E
+#   .hook-debug/twin-failures/<event>            one epoch line per failure, counted at Gate E
 
 exec >/dev/null 2>&1
 trap 'exit 0' EXIT
+set +x
+unset BASH_XTRACEFD TW_KEY TW_BASE_URL
 LC_ALL=C
 umask 077
 
@@ -72,8 +74,8 @@ SESSION_ID=
 LOG_REF=
 CLEANUP_STATE=
 CONFIG_OK=
-BASE_URL=
-KEY=
+TW_BASE_URL=
+TW_KEY=
 LOOPBACK=
 CURL_OPTS=()
 HTTP_CODE=000
@@ -101,29 +103,33 @@ fmt_utc() {
   printf -v FMT '%04d-%02d-%02dT%02d:%02d:%02dZ' "$y" "$m" "$d" $((secs / 3600)) $((secs % 3600 / 60)) $((secs % 60))
 }
 
-log_line() { # class code ref
-  local ref=${3:-} content
-  now_epoch
-  fmt_utc "$NOW"
-  ref=${ref:0:8}
-  mkdir -p "$STATE_ROOT" || return 0
-  if [ -f "$LOG_FILE" ]; then
-    content=$(<"$LOG_FILE")
+# append_capped FILE LINE: append one line; past 256 KiB keep only the newest half first.
+append_capped() {
+  local file=$1 content
+  mkdir -p "${file%/*}" || return 0
+  if [ -f "$file" ]; then
+    content=$(<"$file")
     if [ "${#content}" -gt "$LOG_CAP" ]; then
       content=${content: -131072}
       content=${content#*$'\n'}
-      printf '%s\n' "$content" >"$LOG_FILE.tmp.$$" && mv -f "$LOG_FILE.tmp.$$" "$LOG_FILE"
+      if printf '%s\n' "$content" >"$file.tmp.$$"; then mv -f "$file.tmp.$$" "$file" || rm -f "$file.tmp.$$"; else rm -f "$file.tmp.$$"; fi
     fi
   fi
-  printf '%s %s %s %s %s %s\n' "$FMT" "${EVENT:--}" "$1" "${2:--}" "$$" "${ref:--}" >>"$LOG_FILE"
+  printf '%s\n' "$2" >>"$file"
 }
 
+log_line() { # class code ref
+  local ref=${3:-}
+  now_epoch
+  fmt_utc "$NOW"
+  ref=${ref:0:8}
+  append_capped "$LOG_FILE" "$FMT ${EVENT:--} $1 ${2:--} $$ ${ref:--}"
+}
+
+# One epoch line per failure, appended (no read-modify-write, so parallel hooks cannot lose
+# a count); Gate E counts the lines, optionally inside a time window.
 bump_failure() {
-  local f="$FAIL_DIR/${EVENT:-unknown}" n=0
-  mkdir -p "$FAIL_DIR" || return 0
-  if [ -f "$f" ]; then IFS= read -r n <"$f"; fi
-  [[ $n =~ ^[0-9]{1,9}$ ]] || n=0
-  printf '%s\n' $((n + 1)) >"$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
+  append_capped "$FAIL_DIR/${EVENT:-unknown}" "$NOW"
 }
 
 # finish CLASS [HTTP-CODE] [REF]: the only exit. One log line, a failure count for every
@@ -146,7 +152,7 @@ finish() {
 # A key sitting inside a JSON string value is escaped in the payload (`\"KEY\"`), so it
 # cannot match; the value is re-validated by the caller either way.
 extract_from() {
-  printf '%s' "$1" | sed -n \
+  printf '%s' "$1" | LC_ALL=C sed -n \
     -e 's/"'"$2"'"[[:space:]]*:[[:space:]]*"\('"$TOKEN"'\)"/\n\1\n/' \
     -e 's/^[^\n]*\n\([^\n]*\)\n.*$/\1/p'
 }
@@ -197,12 +203,13 @@ load_config() {
   local host
   unset DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY
   if [ -f "$KEY_FILE" ]; then . "$KEY_FILE"; fi
-  BASE_URL=${DAYTHREE_TWIN_BASE_URL:-}
-  KEY=${DAYTHREE_TWIN_KEY:-}
+  TW_BASE_URL=${DAYTHREE_TWIN_BASE_URL:-}
+  TW_KEY=${DAYTHREE_TWIN_KEY:-}
   unset DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY # the key must never sit in an environment curl inherits
-  if [ -z "$BASE_URL" ] || [ -z "$KEY" ]; then finish no_key; fi
-  BASE_URL=${BASE_URL%/}
-  if [[ ! $KEY =~ $KEY_RE ]] || [[ ! $BASE_URL =~ $URL_RE ]]; then finish bad_config; fi
+  TW_BASE_URL=${TW_BASE_URL//$'\r'/} TW_KEY=${TW_KEY//$'\r'/} # a key file saved by a Windows editor
+  if [ -z "$TW_BASE_URL" ] || [ -z "$TW_KEY" ]; then finish no_key; fi
+  TW_BASE_URL=${TW_BASE_URL%/}
+  if [[ ! $TW_KEY =~ $KEY_RE ]] || [[ ! $TW_BASE_URL =~ $URL_RE ]]; then finish bad_config; fi
   host=${BASH_REMATCH[2]}
   LOOPBACK=
   case $host in localhost | 127.0.0.1 | '[::1]') LOOPBACK=1 ;; esac
@@ -232,7 +239,7 @@ api_call() {
   if [ -z "$CONFIG_OK" ]; then load_config; fi
   esc=${body//\"/\\\"}
   printf -v cfg 'url = "%s%s"\nrequest = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\ndata = "%s"\n' \
-    "$BASE_URL" "$path" "$method" "$KEY" "$esc"
+    "$TW_BASE_URL" "$path" "$method" "$TW_KEY" "$esc"
   while [ "$attempt" -lt 2 ] && [ "$SECONDS" -lt 3 ]; do
     attempt=$((attempt + 1))
     out=$(printf '%s' "$cfg" | curl -q -s -K - "${CURL_OPTS[@]}" -w '%{http_code}')
@@ -272,8 +279,11 @@ register_session() { # run-uuid -> REG_RT ; 0 on a 2xx carrying a valid runtime 
   return 0
 }
 
-# State exists but the session never registered (the platform was unreachable at start):
-# register the SAME run now (idempotent on the server), then carry on.
+# State exists but the session never registered (the platform was unreachable at start, so
+# the state has no runtime id): re-POST the SAME minted run uuid already in that state, at
+# most once per invocation. The server is idempotent on that ref, so this can never create a
+# second Mission. Never called when there is no state file (that is a logged miss, T3-F12),
+# and never by a heartbeat that already has a runtime id.
 ensure_session() {
   if register_session "$S_RUN"; then
     S_RT=$REG_RT
@@ -371,14 +381,17 @@ on_heartbeat() {
   if ! read_state; then finish no_state; fi
   LOG_REF=$S_RUN
   now_epoch
-  elapsed=$((NOW - S_HB))
+  elapsed=$((NOW - 10#$S_HB))
   if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt "$HEARTBEAT_SECONDS" ]; then finish throttled; fi
   if [ "$S_RT" = - ]; then
     ensure_session # registration itself counts as the heartbeat
     finish ok "$HTTP_CODE"
   fi
   # Stamp the attempt, not the success: a platform outage must not add a slow call to every
-  # prompt. The reaper window (2 hours) is far longer than this interval.
+  # prompt. The reaper window (2 hours) is far longer than this interval. Re-read first: a
+  # SessionEnd or a re-registration that ran in parallel must not be overwritten.
+  local run=$S_RUN
+  if ! read_state || [ "$S_RUN" != "$run" ]; then finish no_state; fi
   write_state "$S_RUN" "$S_RT" "$NOW"
   api_call PATCH "/api/v1/agent-runtime/sessions/$S_RT" '{}'
   case $HTTP_CODE in 2??) finish ok "$HTTP_CODE" ;; esac
@@ -405,9 +418,10 @@ on_session_end() {
 # ---------------------------------------------------------------- main
 
 # Bounded read: at most 1 MiB and 2 seconds, kept in an unexported variable, never written
-# to disk. `timeout 2 head -c` is the fast path (bash reads a pipe one byte at a time, about
-# 30 KB/s on Windows Git Bash, which would stall Claude Code on a large prompt); `read -r -t 2`
-# is the fallback when that yields nothing.
+# to disk. `timeout 2 head -c` is the fast path. Measured on the operator's Windows Git Bash
+# 5.2: `read` on a pipe manages about 30 KB/s (61 KB in the 2 s budget), because bash reads a
+# pipe one byte at a time, so a 50 KB prompt would stall Claude Code for the whole timeout.
+# `read -r -t 2` (the plan's mechanism) stays as the fallback when the fast path yields nothing.
 payload=$(
   timeout 2 head -c $((MAX_PAYLOAD + 1))
   printf x

@@ -167,8 +167,9 @@ class Hook:
         return self.log_lines()[-1]
 
     def failure_count(self, event: str) -> int:
+        """One epoch line per failure: the count is the number of lines."""
         path = self.fail_dir / event
-        return int(path.read_text().strip()) if path.exists() else 0
+        return len(path.read_text().splitlines()) if path.exists() else 0
 
     def state(self, session_id: str) -> Optional[tuple[str, str, int]]:
         path = self.state_dir / session_id

@@ -421,3 +421,77 @@ def test_a_key_in_the_ambient_environment_is_never_a_working_default(tmp_path):
 
     assert result.returncode == 0 and _records(tmp_path, "argv") == []
     assert hook.last_log()[2] == "no_key"
+
+
+def test_a_key_file_with_windows_line_endings_still_works(tmp_path):
+    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9")
+    key_file = hook.home / ".daythree" / "twin_env.sh"
+    key_file.write_bytes(key_file.read_bytes().replace(b"\n", b"\r\n"))
+
+    hook.fire("SessionStart", new_session_id(), source="startup")
+
+    assert len(_records(tmp_path, "argv")) == 1 and hook.last_log()[2] == "ok"
+
+
+@pytest.mark.parametrize("name", ["TW_KEY", "KEY", "BASE_URL", "TW_BASE_URL", "DAYTHREE_TWIN_KEY"])
+def test_an_ambient_variable_of_the_same_name_cannot_carry_the_key_into_curls_environment(tmp_path, name):
+    hook, key = _shimmed(tmp_path, "http://127.0.0.1:9")
+
+    result = hook.run(payload_bytes("SessionStart", new_session_id(), source="startup"), env={name: "ambient-value"})
+
+    assert result.returncode == 0 and len(_records(tmp_path, "env")) == 1
+    (env_text,) = _records(tmp_path, "env")
+    assert key not in env_text and "dtk_" not in env_text
+
+
+# ---------------------------------------------------------------------------
+# Limited re-registration (coordinator decision): only the SAME run, only when the state has
+# no runtime id, at most once per invocation, never with no state at all
+# ---------------------------------------------------------------------------
+
+
+def test_re_registration_re_posts_only_the_run_already_in_the_state_and_only_once(live, stub):
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    live.put_state(session_id, run, "-", 0)
+    stub.on("POST", SESSIONS, (403, '{"detail":"forbidden"}'))
+
+    live.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+
+    assert len(stub.seen) == 1  # one re-POST, no retry on a 4xx, and the subagent is never sent
+    assert json.loads(stub.seen[0]["body"]) == {"kind": "session", "external_session_ref": run}
+    assert live.state(session_id)[:2] == (run, "-")  # still the same run, still unregistered
+
+
+def test_re_registration_reuses_the_same_run_for_the_session_and_its_subagent(live, stub):
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    live.put_state(session_id, run, "-", 0)
+    stub.on("POST", SESSIONS, CREATED, (201, "{}"))
+
+    live.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+
+    first, second = stub.bodies("POST", SESSIONS)
+    assert first == {"kind": "session", "external_session_ref": run}
+    assert second["parent_external_session_ref"] == run  # one Mission's worth of refs, never a second run
+    assert live.state(session_id)[:2] == (run, RUNTIME_ID)
+
+
+def test_a_heartbeat_with_a_runtime_id_never_re_posts(live, stub):
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    live.put_state(session_id, run, RUNTIME_ID, 0)
+    stub.on("PATCH", f"{SESSIONS}/{RUNTIME_ID}", (500, "{}"))
+
+    live.fire("Stop", session_id)
+
+    assert {r["method"] for r in stub.seen} == {"PATCH"}  # only the PATCH (and its one 5xx retry)
+    assert all(r["path"] != SESSIONS for r in stub.seen)
+
+
+@pytest.mark.parametrize(
+    "event,fields",
+    [("SubagentStart", {"agent_id": "a1b2c3d4e5f60718", "agent_type": "planner"}), ("Stop", {}), ("UserPromptSubmit", {})],
+)
+def test_with_no_state_file_nothing_is_ever_registered(live, stub, event, fields):
+    live.fire(event, new_session_id(), **fields)
+
+    assert stub.seen == []
+    assert live.last_log()[2] == "no_state"
