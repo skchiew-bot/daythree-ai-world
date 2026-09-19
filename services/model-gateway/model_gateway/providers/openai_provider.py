@@ -13,6 +13,21 @@ import openai
 from contracts.model import ModelRequest, ModelResponse
 
 
+# OpenAI's Chat Completions reference marks `max_tokens` deprecated in favour of
+# `max_completion_tokens` and "not compatible with o-series models" (checked 2026-09-19:
+# https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create).
+# GPT-4-family models keep accepting `max_tokens`; every other model (o1/o3/o4, gpt-5, and
+# anything newer) gets the documented replacement, so an unknown future model fails safe
+# toward the parameter OpenAI recommends.
+_MAX_TOKENS_MODEL_PREFIXES = ("gpt-4", "gpt-3.5", "chatgpt-4o")
+
+
+def _token_cap_kwargs(model: str, max_output_tokens: int) -> dict[str, int]:
+    if model.startswith(_MAX_TOKENS_MODEL_PREFIXES):
+        return {"max_tokens": max_output_tokens}
+    return {"max_completion_tokens": max_output_tokens}
+
+
 class OpenAIProvider:
     provider_name = "openai"
 
@@ -28,7 +43,7 @@ class OpenAIProvider:
         start = time.monotonic()
         response = await self._client.chat.completions.create(
             model=request.model,
-            max_tokens=request.max_output_tokens,
+            **_token_cap_kwargs(request.model, request.max_output_tokens),
             temperature=request.temperature,
             messages=[
                 {"role": "system", "content": request.system_prompt},

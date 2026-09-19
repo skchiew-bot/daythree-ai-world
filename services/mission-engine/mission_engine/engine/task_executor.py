@@ -6,6 +6,7 @@ path: the runtime adapter decides internally whether to call the model again.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -31,6 +32,7 @@ from event_service.publisher import EventPublisher
 from model_gateway.gateway import BudgetExceededError, ModelGateway, ModelGatewayError
 
 from mission_engine.checkpoints.sql_checkpoint_store import SqlCheckpointStore
+from mission_engine.engine.usage import SqlUsageProvider
 
 REPAIR_INSTRUCTION_TEMPLATE = (
     "\n\nYour previous answer was rejected by the output validator: {error}\n"
@@ -55,6 +57,7 @@ class TaskExecutionError(Exception):
 
 
 async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityId) -> None:
+    attempt_started_at = datetime.now(timezone.utc)
     task = await session.get(Task, task_id)
     if task is None:
         raise TaskExecutionError(f"Task {task_id} does not exist.")
@@ -99,7 +102,10 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         available_context=task.input_context or {},
         model_provider=model_policy.primary_provider, model_name=model_policy.primary_model,
     )
-    adapter = DurableAgentRuntimeAdapter(model_gateway=deps.model_gateway, checkpoint_store=checkpoint_store)
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=deps.model_gateway, checkpoint_store=checkpoint_store,
+        usage_provider=SqlUsageProvider(session, attempt_started_at),
+    )
 
     try:
         if is_resume:
@@ -112,6 +118,7 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
             await _publish(deps, session, EventType.model_requested, mission, task, agent, correlation_id, actor)
             result = await adapter.execute(handle)
     except BudgetExceededError as exc:
+        _record_failed_attempts(session, mission, task, agent, exc.attempts)
         await _publish(
             deps, session, EventType.budget_exceeded, mission, task, agent, correlation_id, actor,
             data={"reason": str(exc)},
@@ -119,6 +126,7 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         await _fail(deps, session, mission, task, agent, correlation_id, actor, str(exc))
         return
     except ModelGatewayError as exc:
+        _record_failed_attempts(session, mission, task, agent, exc.attempts)
         await _publish(
             deps, session, EventType.model_failed, mission, task, agent, correlation_id, actor,
             data={"error": str(exc)},
@@ -126,8 +134,9 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         await _fail(deps, session, mission, task, agent, correlation_id, actor, str(exc))
         return
 
+    _record_failed_attempts(session, mission, task, agent, result.failed_attempt_telemetry)
     if result.model_telemetry is not None:
-        await _record_model_invocation(session, mission, task, agent, result.model_telemetry)
+        _record_model_invocation(session, mission, task, agent, result.model_telemetry)
         await _publish(
             deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
             data={"provider": result.model_telemetry["provider"], "model": result.model_telemetry["model"]},
@@ -164,11 +173,13 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         try:
             repair_result = await adapter.execute(repair_handle)
         except (BudgetExceededError, ModelGatewayError) as exc:
+            _record_failed_attempts(session, mission, task, agent, exc.attempts)
             await _fail(deps, session, mission, task, agent, correlation_id, actor, f"repair attempt failed: {exc}")
             return
 
+        _record_failed_attempts(session, mission, task, agent, repair_result.failed_attempt_telemetry)
         if repair_result.model_telemetry is not None:
-            await _record_model_invocation(session, mission, task, agent, repair_result.model_telemetry)
+            _record_model_invocation(session, mission, task, agent, repair_result.model_telemetry)
             await _publish(deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
                             data={"repair_attempt": True})
             await session.commit()  # same durability reasoning as the first model call, above
@@ -227,7 +238,17 @@ async def _fail(deps, session, mission, task, agent, correlation_id, actor, reas
                     data={"reason": reason})
 
 
-async def _record_model_invocation(session, mission, task, agent, telemetry: dict) -> None:
+def _record_failed_attempts(session, mission, task, agent, attempts) -> None:
+    """Persists one `status=failed` row per failed or timed-out provider attempt. Each can
+    have been billed, and `SqlUsageProvider` counts these rows toward the budget. Attempts
+    arrive as telemetry objects (on the gateway's raised error) or as dicts (from
+    `RunResult.failed_attempt_telemetry`)."""
+    for attempt in attempts:
+        telemetry = attempt if isinstance(attempt, dict) else attempt.model_dump(mode="json")
+        _record_model_invocation(session, mission, task, agent, telemetry)
+
+
+def _record_model_invocation(session, mission, task, agent, telemetry: dict) -> None:
     session.add(
         ModelInvocation(
             tenant_id=mission.tenant_id, mission_id=mission.id, task_id=task.id, agent_id=agent.id,
