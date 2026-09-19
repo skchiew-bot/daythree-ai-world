@@ -39,7 +39,7 @@ operator has merged.
 | T1 | Twins: identity and registration (ADR-010 A) | nothing | now |
 | T2 | Twins: lifecycle closure, reaper, SessionEnd (ADR-010 B, corrected; no output stored) | T1 | T1 merged (2026-09-19, #33) |
 | T2b | Twins: opt-in subagent output capture (D24..D31) | T2 | before Gate E needs reviewable artifacts |
-| T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C, corrected after gate review) | T2 | T2 merged (2026-09-20, #35); payload capture first |
+| T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C, corrected after gate review) | T2 | T2 merged (2026-09-20, #35); payload gate closed (2026-09-20) |
 | T4 | Twins in the 3D world (ADR-010 D) | T3 | T3 merged |
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
 | R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
@@ -329,8 +329,8 @@ capture; the T3 key expires after 90 days. Where this section and ADR-010 disagr
 backstop) get reaped without any manual call, without the hook ever blocking or slowing Claude Code,
 and without any prompt, path, transcript or message text leaving the machine.
 
-**Pre-build gate: the payload contract (T3-F1).** Field names reported by the official hooks
-documentation (checked 2026-09-20, to be confirmed on 2.1.227 by the capture below):
+**Pre-build gate: the payload contract (T3-F1), CLOSED 2026-09-20.** Field names from the official
+hooks documentation, confirmed by a key-names-only capture on Claude Code 2.1.227:
 
 | Event | Fields the script may read | Notes |
 |---|---|---|
@@ -341,19 +341,31 @@ documentation (checked 2026-09-20, to be confirmed on 2.1.227 by the capture bel
 | SubagentStop | `session_id`, `agent_id`, `agent_type` | carries `last_assistant_message`: never read |
 
 Not read, logged, hashed or forwarded, ever: `prompt`/`user_prompt`, `cwd`, `transcript_path`,
-`agent_transcript_path`, `tool_input`, `tool_result`, `last_assistant_message`, `permission_mode` and
-every other field (D32). The docs carry no per-subagent tool-call count, so `tool_call_count` is
-never sent (D39). The docs are silent on subagent stdout injection and hook inheritance, so the
-capture must answer those. **The capture** (operator agrees at that point): one fresh session with a
-temporary hook that writes only the JSON key names and value types (never values) of every event
-above, plus `PreToolUse` for the subagent-spawning tool, to a gitignored file; the chair records the
-Claude Code version and the key sets in the ledger and deletes the file. It must confirm: the field
-names above; that `agent_id` is identical at start and stop and matches `^[A-Za-z0-9._-]{1,64}$`;
-that `session_id` on a subagent event is the parent's; whether hooks fire inside a subagent's own
-session; that `bash --login` prints nothing; and whether hooks hot-reload. If `agent_id` fails any of
-these, the operator chooses between register-and-close in one SubagentStop call (the hook-loss metric
-becomes structurally zero and O2's threshold must be restated) and LIFO matching (persona attribution
-wrong under parallel spawns).
+`agent_transcript_path`, `tool_input`, `tool_result`, `last_assistant_message`, `session_title`,
+`background_tasks`, `session_crons`, `scratchpad_dir`, `permission_mode` and every other field (D32).
+No payload carries a per-subagent tool-call count, so `tool_call_count` is never sent (D39).
+
+**Confirmed by the capture (Claude Code 2.1.227, 2026-09-20, key names and shapes only; evidence in
+the ledger):**
+
+- `SubagentStart` and `SubagentStop` carry `agent_id` and `agent_type`. `agent_id` is 17 lowercase
+  hex characters, matches `^[A-Za-z0-9._-]{1,64}$` and is identical at start and stop, so it is the
+  instance ref; T3-F1's requirement holds and neither fallback is needed. Their `session_id` is the
+  parent session's.
+- `SessionStart` `source` was observed as `startup` and `clear`; `SessionEnd` `reason` as `clear`
+  and `prompt_input_exit`. `resume`, `compact`, `fork`, `logout` and `other` are documented but were
+  not observed; `--continue` was not tested, which does not matter because a run is minted at every
+  start.
+- `/clear` fires `SessionEnd` for the old session and `SessionStart` for a NEW session id in the
+  same second, so state is keyed per Claude session id.
+- Hooks run in parallel (two parallel subagents fired in the same second), so the state file is
+  written atomically (temp file plus rename) and no hook may assume another has finished.
+- `Stop` and `UserPromptSubmit` did not fire inside a subagent's own session; no such event carried an
+  `agent_id`.
+- Hooks added mid-session fired at once (hot-reload works). The final verification still needs a
+  fresh session, because `SessionStart` fires only at session start.
+- The subagent-spawning tool is named `Agent`. `bash --login -c true` printed 0 bytes on the
+  operator's machine.
 
 **Deliverables.**
 
@@ -433,7 +445,8 @@ wrong under parallel spawns).
 3. The emitted body field set equals the T1/T2 allow-list; a custom `agent_type` canary is absent; a
    `last_assistant_message` containing "error" and "failed" still yields `completed`.
 4. State lifecycle: double SessionStart is one run; compact reuses it; resume mints a new one;
-   SubagentStart without state sends nothing; SessionEnd removes the file. Heartbeat throttle: 20 Stop
+   SubagentStart without state sends nothing; ten concurrent hook runs never corrupt the state file
+   (atomic write); SessionEnd removes the file. Heartbeat throttle: 20 Stop
    events in 10 s emit at most one PATCH.
 5. Response table against a stub: 200/201, 404, 409 (each detail), 422, 429, 500, no listener; the
    ended-parent path re-registers exactly once and never loops.
@@ -459,7 +472,7 @@ standard (a timestamp and row ids the operator never typed by hand; counts, pers
 and 8-character ref prefixes only, D44).
 
 **Handoff prompt:** as T1, phase T3, branch `feat/twins-t3-hooks`; read this section first and treat
-T3-F1..F20 and D32..D44 as the acceptance list; the payload capture is done before the branch is cut;
+T3-F1..F20 and D32..D44 as the acceptance list; the payload gate is closed (ledger, 2026-09-20);
 the builder issues no key; end the PR description with the request that the operator start a fresh
 session.
 
