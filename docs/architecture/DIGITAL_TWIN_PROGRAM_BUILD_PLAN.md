@@ -42,7 +42,9 @@ operator has merged.
 | T4 | Twins in the 3D world (ADR-010 D) | T3 | T3 merged |
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
 | R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
-| W1 | 3D world: detail and idle movement (ADR-013) | nothing | now, independent of twins |
+| W1 | 3D world: detail and idle movement (ADR-013) | nothing | merged 2026-09-19 (#23) |
+| P1 | Projects entity and world read (ADR-014) | R0 (migration parent) | R0 merged |
+| W2 | Town layout: buildings, hall, roads, commuting (ADR-014) | P1 | P1 merged, operator answers O15..O17 |
 | L1 | Contribution ledger: accept/reject, mint, upkeep | Gate E | operator opens Gate E |
 | L2 | Materials and workshop (spend, 3D render) | L1 | L1 merged |
 | X1 | Twin merge / succession (ADR-012) | L1 | L1 merged, operator answers O6..O9 |
@@ -366,6 +368,78 @@ names appears on avatars or tooltips.
 
 **Handoff prompt:** as T1, phase W1, branch `feat/world-w1-life`, read ADR-013 decision 6 and D11
 first; frontend only; rebuild the `admin-web` image to verify (no bind mount).
+
+---
+
+## P1. Projects entity and world read (ADR-014)
+
+**Goal.** The platform knows what a project is, a mission can belong to one, and the world read can
+say which building a twin is in, with tenant isolation proven at the database and in the query.
+
+**Deliverables.** Migration `0003c_projects` (`down_revision` = the real head at merge, recorded in
+the docstring): `projects(id, tenant_id, code, name, status, created_at)` with `UNIQUE(tenant_id,
+code)` and `UNIQUE(tenant_id, id)`; `mission_projects(mission_id PK, tenant_id, project_id,
+created_at)` with composite FK `(tenant_id, project_id) -> projects(tenant_id, id)`; explicit
+per-index sweep; `downgrade()` drops both tables. `POST /api/v1/projects`, `POST .../{id}/archive`
+behind a router-local role constant and the `model_policies.py` fixed-window rate limit; `GET
+/api/v1/projects`; validation per ADR-014 decision 2 (code regex and length, name length and
+printable check, per-tenant cap of 48 active); `audit_events` `project.created` /
+`project.archived` with ids, status and actor only. Mission create/update accept `project_id`
+via `get_tenant_scoped_or_404`. `GET /api/v1/agent-rooms`: fix `_latest_task_by_agent` to
+`DISTINCT ON (assigned_agent_id) ... ORDER BY assigned_agent_id, created_at DESC, id DESC` with
+explicit `Mission.tenant_id` and `Project.tenant_id` filters on the outer query; add `project_id`
+per agent under the lifetime contract (non-null only while `assigned`/`working` or inside the
+hold window) and a top-level `projects` array (active plus referenced, one query). Admin UI:
+a Projects page (list, create with the D14 warning, archive) and a project picker on Create
+Mission; `World.tsx` `focusMission.title` and `job_description` cards replaced by allow-listed
+fields (D18). `.github/workflows/ci.yml` gains a migration round-trip step (`upgrade head`,
+`downgrade -1`, `upgrade head`) against the E2E stack, with the operator's approval recorded in
+the PR.
+
+**Tests.** Two tenants with identical `created_at` tasks never see each other's project (security);
+a mission cannot link to another tenant's project (409/404 at the API and an IntegrityError at
+the DB); the active-task pick is stable across 20 consecutive reads; `project_id` is null once
+the hold window passes; archived-but-referenced projects appear in `projects`; cap and rate limit
+enforced; migration upgrade from the parent revision on a populated DB (rows in `missions`) and
+downgrade back; `audit_events.payload` never contains `name` or `code`.
+
+**Exit.** A mission attached to a project shows that `project_id` on its agent in `/agent-rooms`
+while it runs and null afterwards; the two-tenant test is green; the completion report notes the
+F3 and F5 fixes.
+
+**Handoff prompt:** as T1, phase P1, branch `feat/projects-p1`, read ADR-014 first and treat its
+gate findings F1..F11 and warden D12..D18 as the acceptance list; ask before touching `ci.yml`.
+
+---
+
+## W2. Town layout: buildings, hall, roads, commuting (ADR-014)
+
+**Goal.** The world reads as a small town: a residence, a community hall, one building per
+project, roads between them, and twins that commute. Frontend only.
+
+**Deliverables.** In `apps/admin-web/src/world/`: `town.ts` (grid of 48 lots, residence and hall
+on the main street, roads as a graph of waypoints), `lots.ts` (stable placement: probe from
+`hash(project.id)` in the API's `(created_at, id)` order, first free lot), `buildings.ts`
+(procedural project building and hall from primitives; height and footprint from lot and id
+only), `commute.ts` (path over the road graph; vehicle from trip distance and `agent_id`: walk,
+bicycle, motorbike; walk home when a task ends), vehicle meshes, a `WorldProject = {id, code}`
+branded type with its own field-by-field builder, `WorldAgent` gains `project_id`; camera
+overview and click-to-focus; signage renders `code` only; `describeScene` stays counts-only;
+`prefers-reduced-motion` keeps everyone in place; W1's disposal and allow-list tests extended.
+Performance budget unchanged: 60 fps at 25 agents and 20 projects, poll interval 3 s.
+
+**Tests.** Lot placement: adding a project moves no existing lot; 48 distinct lots for 48 projects;
+placement keyed on id, unchanged by renaming. Commute: vehicle is a pure function of distance and
+id; a twin whose `project_id` becomes null walks home over the graph; reassignment still snaps;
+reduced motion disables commuting. Allow-list: raw API rows fail to compile for both agents and
+projects; the key sets are exact. Typecheck, build, vitest, screenshots at 375, 768, 1024, 1440.
+
+**Exit.** With real data the operator sees the residence, the hall, one building per active
+project and twins commuting on roads; no text beyond codes and display names appears in the
+canvas.
+
+**Handoff prompt:** as T1, phase W2, branch `feat/world-w2-town`, read ADR-014 decisions 4 and 5
+and D13..D15 first; frontend only; rebuild the `admin-web` image to verify.
 
 ---
 

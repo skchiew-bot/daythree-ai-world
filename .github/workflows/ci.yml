@@ -96,6 +96,8 @@ jobs:
 
       - run: npm ci
       - run: npm run typecheck
+      - name: Unit tests (vitest)
+        run: npm test
       - run: npm run build
 
   # The heavy, whole-stack proof: brings up every service in docker-compose.yml
