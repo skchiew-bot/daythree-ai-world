@@ -73,11 +73,30 @@ def estimate_input_tokens(system_prompt: str, user_prompt: str) -> int:
     return math.ceil(size / _BYTES_PER_INPUT_TOKEN_ESTIMATE)
 
 
+_HTTP_TOO_MANY_REQUESTS = 429
+
+
 def is_provably_unbilled(error: BaseException) -> bool:
     """True only for an HTTP 4xx rejection (both the OpenAI and Anthropic SDK errors carry
     an integer `status_code`); 408 is a timeout and stays conservative."""
     status = getattr(error, "status_code", None)
     return isinstance(status, int) and 400 <= status < 500 and status != _HTTP_REQUEST_TIMEOUT
+
+
+def is_permanent_rejection(error: BaseException) -> bool:
+    """A provably unbilled 4xx that will fail the same way on every retry (bad request,
+    auth, unknown model). 429 is excluded: a rate limit clears, so it stays retryable."""
+    return is_provably_unbilled(error) and getattr(error, "status_code", None) != _HTTP_TOO_MANY_REQUESTS
+
+
+def estimate_worst_case_attempt(
+    provider: str, model: str, *, system_prompt: str, user_prompt: str, max_output_tokens: int
+) -> tuple[int, int, Decimal]:
+    """(input_tokens, output_tokens, cost_usd) of the worst attempt that could be billed:
+    the estimated input plus the full output cap. Raises `UnpricedModelError`. This is both
+    what a timeout is charged and what an attempt is written ahead at (see the policy above)."""
+    tokens_in = estimate_input_tokens(system_prompt, user_prompt)
+    return tokens_in, max_output_tokens, estimate_cost_usd(provider, model, tokens_in, max_output_tokens)
 
 
 def estimate_failed_attempt(
@@ -88,8 +107,10 @@ def estimate_failed_attempt(
     The token counts are estimates, not provider-reported; see the policy above."""
     if is_provably_unbilled(error):
         return 0, 0, Decimal("0")
-    tokens_in = estimate_input_tokens(system_prompt, user_prompt)
-    return tokens_in, max_output_tokens, estimate_cost_usd(provider, model, tokens_in, max_output_tokens)
+    return estimate_worst_case_attempt(
+        provider, model, system_prompt=system_prompt, user_prompt=user_prompt,
+        max_output_tokens=max_output_tokens,
+    )
 
 
 class ModelInvocationTelemetry(BaseModel):
@@ -109,3 +130,6 @@ class ModelInvocationTelemetry(BaseModel):
     status: ModelInvocationStatus
     request_hash: str
     response_hash: Optional[str] = None
+    # Not persisted (no column): carried to the model.completed audit event so a call whose
+    # provider reported no usage is visible in the trail, not silently priced.
+    usage_estimated: bool = False

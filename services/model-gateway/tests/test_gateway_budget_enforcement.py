@@ -111,10 +111,11 @@ async def test_cost_of_a_failed_attempt_trips_the_cost_ceiling_on_the_retry():
     provider = _ScriptedProvider(TimeoutError(), ok_response())
     gateway = gateway_for(provider)
 
-    # timeout estimate for gpt-4o: 100 in-tokens + 1000 out-tokens = ~$0.01025
+    # A call's worst case (and so a timeout's charge) for gpt-4o here is $0.01025: the first
+    # attempt fits under the $0.02 ceiling, but after it is charged the retry no longer does.
     with pytest.raises(BudgetExceededError) as excinfo:
         await gateway.generate(
-            make_request(), budget_policy=BudgetPolicy(max_model_cost_usd=0.005), usage=BudgetUsage()
+            make_request(), budget_policy=BudgetPolicy(max_model_cost_usd=0.02), usage=BudgetUsage()
         )
     assert provider.calls == 1
     assert "max_model_cost_usd" in excinfo.value.reason

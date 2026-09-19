@@ -30,4 +30,7 @@ class ModelResponse(BaseModel):
     provider: str
     model: str
     finish_reason: str = "stop"
+    # True when the provider returned text but no usage figures, so `input_tokens` and
+    # `output_tokens` are conservative estimates rather than reported numbers (R0, ADR-013).
+    usage_estimated: bool = False
     raw: Optional[dict[str, Any]] = None
