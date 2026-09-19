@@ -68,9 +68,9 @@ describe("WorldProject is only producible by toWorldProject (data-warden D13)", 
     expect(project).toBe(projectRow);
   });
 
-  it("rejects an object literal with the two allowed fields", () => {
+  it("rejects an object literal with the three allowed fields", () => {
     // @ts-expect-error only toWorldProject may build a WorldProject
-    const project: WorldProject = { id: "p", code: "C" };
+    const project: WorldProject = { id: "p", code: "C", status: "active" };
     expect(project.id).toBe("p");
   });
 

@@ -27,6 +27,12 @@ export class CameraRig {
     controls.addEventListener("start", this.cancel);
   }
 
+  /** Cancels any in-flight ease without moving the camera (W3 deliverable 2: entering
+   * walk or follow must cancel a rig ease already underway). */
+  cancelMove(): void {
+    this.moving = false;
+  }
+
   /** Focus a building, or pass null to return to the overview. */
   focus(pick: BuildingPick | null, reducedMotion: boolean): void {
     if (pick) {
