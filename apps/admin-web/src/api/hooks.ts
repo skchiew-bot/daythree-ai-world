@@ -12,8 +12,11 @@ import type {
   ExternalAgentStatus,
   Mission,
   MissionCreateRequest,
+  MissionUpdateRequest,
   ModelInvocation,
   ModelPolicy,
+  Project,
+  ProjectCreateRequest,
   Task,
 } from "@/types/api";
 
@@ -125,6 +128,38 @@ export function useCancelMission() {
   return useMutation({
     mutationFn: (missionId: string) => api.post<Mission>(`/api/v1/missions/${missionId}/cancel`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["missions"] }),
+  });
+}
+
+export function useUpdateMission() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ missionId, payload }: { missionId: string; payload: MissionUpdateRequest }) =>
+      api.patch<Mission>(`/api/v1/missions/${missionId}`, payload),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["missions"] }),
+  });
+}
+
+export function useProjects() {
+  return useQuery({
+    queryKey: ["projects"],
+    queryFn: () => api.get<Project[]>("/api/v1/projects"),
+  });
+}
+
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: ProjectCreateRequest) => api.post<Project>("/api/v1/projects", payload),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
+  });
+}
+
+export function useArchiveProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (projectId: string) => api.post<Project>(`/api/v1/projects/${projectId}/archive`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
   });
 }
 

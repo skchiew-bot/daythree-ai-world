@@ -113,8 +113,8 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_missions_or_tasks(fre
         f"('{agent_id}', '{tenant_id}', 'AGT-POP', 'Pop Agent', 'active')"
     )
     fresh_database.execute(
-        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, budget_policy) VALUES "
-        f"('{mission_id}', '{tenant_id}', 'MSN-POP', 't', 'o', '{{}}')"
+        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, budget_policy) VALUES "
+        f"('{mission_id}', '{tenant_id}', 'MSN-POP', 't', 'o', 'draft', '{{}}')"
     )
     fresh_database.execute(
         f"INSERT INTO tasks (id, mission_id, assigned_agent_id, title, instructions, idempotency_key, budget_policy) "
@@ -164,8 +164,8 @@ def test_composite_fk_rejects_a_mission_project_row_naming_another_tenants_proje
         f"('{agent_a}', '{tenant_a}', 'AGT-A', 'A', 'active')"
     )
     fresh_database.execute(
-        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, budget_policy) VALUES "
-        f"('{mission_a}', '{tenant_a}', 'MSN-A', 't', 'o', '{{}}')"
+        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, budget_policy) VALUES "
+        f"('{mission_a}', '{tenant_a}', 'MSN-A', 't', 'o', 'draft', '{{}}')"
     )
     fresh_database.execute(
         f"INSERT INTO projects (id, tenant_id, code, name, status) VALUES "

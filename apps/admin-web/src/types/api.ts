@@ -74,6 +74,7 @@ export interface Mission {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  project_id: string | null;
 }
 
 export interface MissionCreateRequest {
@@ -82,6 +83,24 @@ export interface MissionCreateRequest {
   assigned_agent_id: string;
   priority?: "low" | "normal" | "high" | "urgent";
   risk_level?: "low" | "medium" | "high";
+  project_id?: string | null;
+}
+
+export interface MissionUpdateRequest {
+  project_id: string | null;
+}
+
+export interface Project {
+  id: string;
+  code: string;
+  name: string;
+  status: "active" | "archived";
+  created_at: string;
+}
+
+export interface ProjectCreateRequest {
+  code: string;
+  name: string;
 }
 
 export interface Task {
@@ -156,12 +175,21 @@ export interface AgentRoom {
   activity: "idle" | "assigned" | "working" | "completed" | "failed";
   active_task_id: string | null;
   activity_changed_at: string | null;
+  project_id: string | null;
+}
+
+export interface ProjectSummary {
+  id: string;
+  code: string;
+  name: string;
+  status: string;
 }
 
 export interface AgentRoomsResponse {
   rooms_per_floor: number;
   default_floor_count: number;
   rooms: AgentRoom[];
+  projects: ProjectSummary[];
 }
 
 export interface DashboardSummary {

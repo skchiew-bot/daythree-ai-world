@@ -5,7 +5,7 @@ import { Link } from "react-router-dom";
 import { z } from "zod";
 
 import { ApiError } from "@/api/client";
-import { useAgents, useCancelMission, useCreateMission, useMissions, useStartMission } from "@/api/hooks";
+import { useAgents, useCancelMission, useCreateMission, useMissions, useProjects, useStartMission } from "@/api/hooks";
 
 const schema = z.object({
   title: z.string().min(1, "Required"),
@@ -13,12 +13,14 @@ const schema = z.object({
   assigned_agent_id: z.string().min(1, "Select an agent"),
   priority: z.enum(["low", "normal", "high", "urgent"]),
   risk_level: z.enum(["low", "medium", "high"]),
+  project_id: z.string().optional(),
 });
 type FormValues = z.infer<typeof schema>;
 
 export function MissionControl() {
   const { data: missions, isLoading } = useMissions();
   const { data: agents } = useAgents();
+  const { data: projects } = useProjects();
   const createMission = useCreateMission();
   const startMission = useStartMission();
   const cancelMission = useCancelMission();
@@ -37,7 +39,7 @@ export function MissionControl() {
   async function onSubmit(values: FormValues) {
     setSubmitError(null);
     try {
-      await createMission.mutateAsync(values);
+      await createMission.mutateAsync({ ...values, project_id: values.project_id || null });
       reset();
     } catch (err) {
       setSubmitError(err instanceof ApiError ? err.message : "Failed to create mission.");
@@ -71,6 +73,19 @@ export function MissionControl() {
             ))}
           </select>
           {errors.assigned_agent_id && <span className="form-error">{errors.assigned_agent_id.message}</span>}
+        </div>
+        <div className="form-field">
+          <label htmlFor="project_id">Project (optional)</label>
+          <select id="project_id" {...register("project_id")}>
+            <option value="">No project — community hall</option>
+            {projects
+              ?.filter((p) => p.status === "active")
+              .map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.code} — {project.name}
+                </option>
+              ))}
+          </select>
         </div>
         <div style={{ display: "flex", gap: "1rem" }}>
           <div className="form-field" style={{ flex: 1 }}>

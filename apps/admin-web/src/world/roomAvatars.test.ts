@@ -24,6 +24,7 @@ function worldAgent(id: string, floor: number, room: number, activity: AgentRoom
     activity,
     active_task_id: null,
     activity_changed_at: null,
+    project_id: null,
   });
 }
 

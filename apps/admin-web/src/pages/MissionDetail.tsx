@@ -8,6 +8,7 @@ import {
   useMissionModelInvocations,
   useMissionTasks,
   useMissionTimeline,
+  useProjects,
   useRetryTask,
 } from "@/api/hooks";
 
@@ -19,6 +20,7 @@ export function MissionDetail() {
   const [tab, setTab] = useState<Tab>("Overview");
 
   const { data: mission } = useMission(missionId);
+  const { data: projects } = useProjects();
   const { data: tasks } = useMissionTasks(missionId);
   const { data: artifacts } = useMissionArtifacts(missionId);
   const { data: timeline } = useMissionTimeline(missionId);
@@ -27,6 +29,8 @@ export function MissionDetail() {
   const downloadArtifact = useArtifactDownloadUrl();
 
   if (!mission) return <p>Loading mission…</p>;
+
+  const project = projects?.find((p) => p.id === mission.project_id);
 
   return (
     <div>
@@ -50,6 +54,9 @@ export function MissionDetail() {
           </p>
           <p>
             <strong>Priority:</strong> {mission.priority} &nbsp; <strong>Risk:</strong> {mission.risk_level}
+          </p>
+          <p>
+            <strong>Project:</strong> {project ? project.code : "— community hall"}
           </p>
           <p>
             <strong>Budget:</strong> ${mission.budget_policy.max_model_cost_usd} / {mission.budget_policy.max_model_calls}{" "}

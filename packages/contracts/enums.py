@@ -93,6 +93,11 @@ class ModelInvocationStatus(str, Enum):
     failed = "failed"
 
 
+class ProjectStatus(str, Enum):
+    active = "active"
+    archived = "archived"
+
+
 class ToolName(str, Enum):
     artifact_write = "artifact.write"
     artifact_read = "artifact.read"
@@ -135,6 +140,11 @@ class EventType(str, Enum):
     # ModelPolicy is created-only, never edited in place (see routes.model_policies) —
     # this is its one lifecycle event, mirroring agent.created's role for Agent.
     model_policy_created = "model_policy.created"
+
+    # ADR-014 decision 2: create/archive are the only two lifecycle events a
+    # Project has (no update-in-place — the same rationale as ModelPolicy above).
+    project_created = "project.created"
+    project_archived = "project.archived"
 
     model_requested = "model.requested"
     model_completed = "model.completed"

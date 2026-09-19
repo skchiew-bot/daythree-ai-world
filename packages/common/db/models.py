@@ -26,6 +26,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -45,6 +46,7 @@ from contracts.enums import (
     MissionPriority,
     MissionStatus,
     ModelInvocationStatus,
+    ProjectStatus,
     RiskLevel,
     RuntimeCheckpointStatus,
     TaskStatus,
@@ -182,6 +184,49 @@ class Mission(Base):
     created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
     started_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+
+
+class Project(Base):
+    """ADR-014 decision 1: a first-class entity a mission may link to through
+    `MissionProject`. `UNIQUE(tenant_id, id)` exists solely so `MissionProject`'s
+    composite FK `(tenant_id, project_id) -> (projects.tenant_id, projects.id)` can be
+    declared — it makes it impossible at the database level for a mission to link to
+    another tenant's project (gate finding F4)."""
+
+    __tablename__ = "projects"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "code", name="uq_projects_tenant_code"),
+        UniqueConstraint("tenant_id", "id", name="uq_projects_tenant_id"),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    code: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default=ProjectStatus.active)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    created_by: Mapped[Optional[EntityId]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+class MissionProject(Base):
+    """Side table linking a mission to a project (ADR-014 decision 1) — no column is
+    added to `missions` itself, since `create_all(checkfirst=True)` can never add a
+    column to a table that already exists on a live database (gate finding F1)."""
+
+    __tablename__ = "mission_projects"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "project_id"], ["projects.tenant_id", "projects.id"],
+            name="fk_mission_projects_tenant_project",
+        ),
+    )
+
+    mission_id: Mapped[EntityId] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("missions.id"), primary_key=True
+    )
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    project_id: Mapped[EntityId] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
 
 
 class Task(Base):

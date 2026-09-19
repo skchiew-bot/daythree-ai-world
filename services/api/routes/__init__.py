@@ -12,6 +12,7 @@ from api.routes import (
     missions,
     model_invocations,
     model_policies,
+    projects,
     tasks,
     tenant,
 )
@@ -24,6 +25,7 @@ api_router.include_router(agents.router)
 api_router.include_router(agent_rooms.router)
 api_router.include_router(model_policies.router)
 api_router.include_router(missions.router)
+api_router.include_router(projects.router)
 api_router.include_router(tasks.router)
 api_router.include_router(artifacts.router)
 api_router.include_router(audit.router)

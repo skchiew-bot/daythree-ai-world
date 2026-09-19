@@ -21,6 +21,20 @@ class AgentRoomOut(BaseModel):
     activity: RoomActivity
     active_task_id: Optional[EntityId]
     activity_changed_at: Optional[datetime]
+    # ADR-014 decision 3: non-null only while `activity` is `assigned`/`working` or
+    # inside the result-hold window; null once the task is idle again (gate F6).
+    project_id: Optional[EntityId] = None
+
+
+class ProjectSummary(BaseModel):
+    """ADR-014 decision 3/5: the world read's own minimal projection — never the
+    full `ProjectResponse` — so a future field added to the Projects page schema
+    doesn't silently start flowing into the polled world read."""
+
+    id: EntityId
+    code: str
+    name: str
+    status: str
 
 
 class AgentRoomsResponse(BaseModel):
@@ -30,3 +44,6 @@ class AgentRoomsResponse(BaseModel):
     rooms_per_floor: int
     default_floor_count: int
     rooms: list[AgentRoomOut]
+    # Every active project plus every project referenced by an emitted
+    # `project_id` above, even if archived (ADR-014 decision 3, gate F6/F10).
+    projects: list[ProjectSummary] = []

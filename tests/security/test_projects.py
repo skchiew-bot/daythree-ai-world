@@ -181,18 +181,25 @@ async def test_invalid_code_or_name_is_422(client, tenant_with_users, code, name
 
 
 @pytest.mark.asyncio
-async def test_forty_ninth_active_project_is_rejected(client, tenant_with_users):
+async def test_forty_ninth_active_project_is_rejected(client, tenant_with_users, db_session):
+    """Seeds the 48 active projects directly at the DB layer (the rate limit — 20
+    creates/minute — is far tighter than the cap and would otherwise trip first over
+    HTTP), then makes exactly one API call to prove the cap itself is enforced."""
     from api.routes.projects import _MAX_ACTIVE_PROJECTS
+
+    for i in range(_MAX_ACTIVE_PROJECTS):
+        db_session.add(
+            Project(
+                id=new_id(), tenant_id=tenant_with_users["tenant"].id, code=f"CAP{i}", name=f"Project {i}",
+                status=ProjectStatus.active.value,
+            )
+        )
+    await db_session.commit()
 
     token = await _login(client, tenant_with_users["tenant_admin"].email)
     headers = {"Authorization": f"Bearer {token}"}
-
-    last_status = None
-    for i in range(_MAX_ACTIVE_PROJECTS + 1):
-        last_status = (
-            await client.post("/api/v1/projects", headers=headers, json=_payload(f"CAP{i}"))
-        ).status_code
-    assert last_status == 409
+    response = await client.post("/api/v1/projects", headers=headers, json=_payload("ONEMORE"))
+    assert response.status_code == 409
 
 
 @pytest.mark.asyncio
