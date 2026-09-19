@@ -15,6 +15,7 @@ from agent_runtime.adapters.durable_adapter import DurableAgentRuntimeAdapter
 from artifact_service.service import commit_artifact
 from artifact_service.storage.object_store import ObjectStore
 from common.db.models import Agent, AgentVersion, Mission, ModelInvocation, ModelPolicy, Task
+from common.hashing import sha256_hex
 from contracts.enums import (
     ActorType,
     ArtifactType,
@@ -30,9 +31,12 @@ from contracts.policy import BudgetPolicy, ToolPolicy
 from contracts.runtime import RunContext
 from event_service.publisher import EventPublisher
 from model_gateway.gateway import BudgetExceededError, ModelGateway, ModelGatewayError
+from model_gateway.telemetry import estimate_failed_attempt
 
 from mission_engine.checkpoints.sql_checkpoint_store import SqlCheckpointStore
 from mission_engine.engine.usage import SqlUsageProvider
+
+_ORPHANED_CALL = TimeoutError("the previous worker died or lost its lease while this call was in flight")
 
 REPAIR_INSTRUCTION_TEMPLATE = (
     "\n\nYour previous answer was rejected by the output validator: {error}\n"
@@ -80,6 +84,9 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
     # `/retry` endpoint just like a fresh one, so status alone can't distinguish them,
     # and a worker-restart resume must also count as a retry, not a fresh start.
     is_first_attempt = task.retry_count == 0 and existing_checkpoint is None
+    # `running` on entry means a worker died (or lost its lease) mid-task and the orphan
+    # sweep found it; `queued` is a fresh task or an operator /retry.
+    found_running = task.status == TaskStatus.running.value
     task.status = TaskStatus.running.value
     if is_first_attempt:
         task.started_at = func.now()
@@ -111,6 +118,8 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         if is_resume:
             await _publish(deps, session, EventType.runtime_recovered, mission, task, agent, correlation_id, actor)
             if existing_checkpoint.state.get("stage") == "prompt_assembled":
+                if found_running:
+                    await _charge_orphaned_call(session, mission, task, agent, existing_checkpoint)
                 await _publish(deps, session, EventType.model_requested, mission, task, agent, correlation_id, actor)
             result = await adapter.resume(existing_checkpoint)
         else:
@@ -236,6 +245,32 @@ async def _fail(deps, session, mission, task, agent, correlation_id, actor, reas
     mission.completed_at = func.now()
     await _publish(deps, session, EventType.mission_failed, mission, task, agent, correlation_id, actor,
                     data={"reason": reason})
+
+
+async def _charge_orphaned_call(session, mission, task, agent, checkpoint) -> None:
+    """A worker died (or lost its lease) after checkpointing the prompt and before recording
+    the provider call's outcome, so that call may have been billed and nothing recorded it.
+    Charge it as one failed call with the conservative timeout estimate
+    (`model_gateway.telemetry.estimate_failed_attempt`) and COMMIT before resuming, so a
+    worker that keeps dying mid-call cannot loop past `max_model_calls` or the cost ceiling
+    for free. This over-counts when the worker died before the call started; that is the
+    deliberate side of "never undercount"."""
+    state = checkpoint.state
+    tokens_in, tokens_out, cost = estimate_failed_attempt(
+        state["provider"], state["model"], system_prompt=state["system_prompt"],
+        user_prompt=state["user_prompt"], max_output_tokens=state["max_output_tokens"], error=_ORPHANED_CALL,
+    )
+    _record_model_invocation(
+        session, mission, task, agent,
+        {
+            "provider": state["provider"], "model": state["model"], "input_tokens": tokens_in,
+            "output_tokens": tokens_out, "estimated_cost": cost, "latency_ms": 0,
+            "status": ModelInvocationStatus.failed.value,
+            "request_hash": sha256_hex(f"orphaned-call:{state.get('assembled_prompt_hash', '')}"),
+            "response_hash": None,
+        },
+    )
+    await session.commit()
 
 
 def _record_failed_attempts(session, mission, task, agent, attempts) -> None:

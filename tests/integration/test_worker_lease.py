@@ -13,12 +13,12 @@ from common.db.models import Task
 from contracts.enums import TaskStatus
 from contracts.model import ModelRequest
 from contracts.policy import BudgetPolicy
-from mission_engine.engine.lease import TaskLease
+from mission_engine.engine.lease import TaskLease, is_leased
 from mission_engine.engine.mission_service import create_mission, start_mission
 from mission_engine.engine.queue import TASK_QUEUE_KEY
 from model_gateway.gateway import ModelGateway
 from model_gateway.providers.mock import MockModelProvider
-from worker.main import process_task, requeue_orphaned_running_tasks
+from worker.main import MAX_AUTO_REQUEUES, process_task, requeue_orphaned_running_tasks
 
 pytestmark = pytest.mark.integration
 
@@ -122,3 +122,42 @@ async def test_orphan_requeue_recovers_a_running_task_with_no_lease_at_all(db_se
     sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
 
     assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 1
+
+
+@pytest.mark.asyncio
+async def test_orphan_requeue_gives_up_on_a_task_that_keeps_coming_back(db_session, fake_redis, seeded):
+    """The sweep now runs every few seconds, so a task that fails for a non-model reason on
+    every recovery must not be re-run (and re-announced in the audit trail) forever."""
+    task = await _running_task(db_session, seeded)
+    task.retry_count = MAX_AUTO_REQUEUES
+    await db_session.commit()
+    sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_lease_release_does_not_crash_the_worker_loop(
+    db_session, fake_redis, seeded, engine_deps
+):
+    task = await _running_task(db_session, seeded)
+    sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    class _BrokenRedis:
+        """acquire() works (delegated); refresh and release, which use a pipeline, blow up."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def pipeline(self, *args, **kwargs):
+            raise ConnectionError("redis went away")
+
+    result = await process_task(_BrokenRedis(fake_redis), sessionmaker, engine_deps, task.id)
+
+    assert result is True  # the error was logged, not raised into the worker loop
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.completed.value
+    assert await is_leased(fake_redis, task.id) is True  # left to expire by its TTL

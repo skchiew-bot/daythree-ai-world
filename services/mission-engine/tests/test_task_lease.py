@@ -90,6 +90,31 @@ async def test_run_keeps_the_lease_alive_while_work_outlasts_the_ttl(redis_clien
 
 
 @pytest.mark.asyncio
+async def test_run_treats_a_hung_redis_as_a_lost_lease_once_the_ttl_has_passed(redis_client):
+    """A half-open Redis connection makes refresh() hang. The worker cannot prove it still
+    holds the lease, so after one TTL without a successful refresh it must stop the work."""
+
+    class _HungRefresh(TaskLease):
+        async def refresh(self) -> bool:
+            await asyncio.sleep(60)
+            return True
+
+    lease = _HungRefresh(redis_client, new_id(), ttl_ms=300, refresh_seconds=0.05)
+    lease.refresh_timeout_seconds = 0.05
+    await lease.acquire()
+    finished = False
+
+    async def slow_work():
+        nonlocal finished
+        await asyncio.sleep(5)
+        finished = True
+
+    with pytest.raises(LeaseLostError):
+        await lease.run(slow_work())
+    assert finished is False
+
+
+@pytest.mark.asyncio
 async def test_run_cancels_the_work_and_raises_when_the_lease_is_lost(redis_client):
     task_id = new_id()
     lease = TaskLease(redis_client, task_id, ttl_ms=5_000, refresh_seconds=0.05)

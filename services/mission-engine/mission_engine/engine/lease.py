@@ -18,6 +18,7 @@ Lua script, so they also work against fakeredis without a Lua runtime.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -33,6 +34,9 @@ logger = structlog.get_logger(__name__)
 LEASE_KEY_PREFIX = "daythree:task_lease:"
 LEASE_TTL_MS = 20_000
 LEASE_REFRESH_SECONDS = 5.0
+# The worker's shared Redis client has socket_timeout=None (BRPOP needs it, see
+# `worker.deps.build_redis_client`), so a half-open connection would hang a refresh forever.
+LEASE_REFRESH_TIMEOUT_SECONDS = 2.0
 
 T = TypeVar("T")
 
@@ -63,6 +67,7 @@ class TaskLease:
         self._token = uuid.uuid4().hex
         self._ttl_ms = ttl_ms
         self._refresh_seconds = refresh_seconds
+        self.refresh_timeout_seconds = LEASE_REFRESH_TIMEOUT_SECONDS
 
     async def acquire(self) -> bool:
         return bool(await self._redis.set(self._key, self._token, nx=True, px=self._ttl_ms))
@@ -83,24 +88,33 @@ class TaskLease:
             await asyncio.wait({runner, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
             if runner.done():
                 return runner.result()
-            runner.cancel()
-            await asyncio.gather(runner, return_exceptions=True)
-            raise LeaseLostError(f"Lease {self._key} was lost while the task was running.")
         finally:
+            # Also runs when this coroutine itself is cancelled: never leave the work
+            # running (and possibly billing) after the lease has been given up.
             heartbeat.cancel()
-            if not runner.done():
-                runner.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            runner.cancel()  # no-op if it already finished
+            await asyncio.gather(heartbeat, runner, return_exceptions=True)
+        raise LeaseLostError(f"Lease {self._key} was lost while the task was running.")
 
     async def _heartbeat(self) -> None:
-        """Returns (ending the race in `run`) only when the lease is definitively lost."""
+        """Returns (ending the race in `run`) once the lease is lost: refresh reports the
+        token gone, or no refresh has succeeded for a full TTL (a hung or failing Redis
+        connection means we can no longer prove we hold it, and another worker may)."""
+        last_ok = time.monotonic()
         while True:
             await asyncio.sleep(self._refresh_seconds)
             try:
-                if not await self.refresh():
-                    return
-            except Exception:  # noqa: BLE001 - a Redis blip must not kill the work; the TTL is the backstop
+                refreshed = await asyncio.wait_for(self.refresh(), timeout=self.refresh_timeout_seconds)
+            except Exception:  # noqa: BLE001 - includes timeouts; a Redis blip must not kill the work by itself
                 logger.exception("task_lease_refresh_failed", key=self._key)
+                refreshed = None
+            if refreshed is False:
+                return
+            if refreshed:
+                last_ok = time.monotonic()
+            elif time.monotonic() - last_ok >= self._ttl_ms / 1000:
+                logger.error("task_lease_unrefreshable_for_a_full_ttl", key=self._key)
+                return
 
     async def _if_ours(self, command) -> bool:
         async with self._redis.pipeline(transaction=True) as pipe:

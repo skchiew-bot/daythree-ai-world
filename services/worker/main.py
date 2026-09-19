@@ -33,6 +33,11 @@ from worker.deps import build_engine_deps, build_redis_client
 logger = structlog.get_logger(__name__)
 
 ORPHAN_SWEEP_INTERVAL_SECONDS = 10.0
+# Every recovery of a task bumps `retry_count` and writes audit events. The sweep runs every
+# few seconds, so a task that fails for a non-model reason on each recovery (an object-store
+# outage, say) must stop being requeued automatically after this many tries; it then stays
+# `running` for an operator, as it did before the periodic sweep existed.
+MAX_AUTO_REQUEUES = 10
 EXECUTABLE_STATUSES = frozenset({TaskStatus.queued.value, TaskStatus.running.value})
 
 
@@ -40,7 +45,11 @@ async def requeue_orphaned_running_tasks(redis_client, sessionmaker: async_sessi
     """Requeues `running` tasks that no live worker holds a lease on."""
     sessionmaker = sessionmaker or get_sessionmaker()
     async with sessionmaker() as session:
-        result = await session.execute(select(Task.id).where(Task.status == TaskStatus.running.value))
+        result = await session.execute(
+            select(Task.id).where(
+                Task.status == TaskStatus.running.value, Task.retry_count < MAX_AUTO_REQUEUES
+            )
+        )
         running_ids = [row[0] for row in result.all()]
 
     requeued = 0
@@ -80,7 +89,10 @@ async def process_task(
                 logger.exception("task_execution_failed", task_id=str(task_id))
         return True
     finally:
-        await lease.release()
+        try:
+            await lease.release()
+        except Exception:  # noqa: BLE001 - the lease expires by TTL anyway; never crash the worker loop over it
+            logger.exception("task_lease_release_failed", task_id=str(task_id))
 
 
 async def run_forever() -> None:
@@ -126,7 +138,18 @@ async def run_forever() -> None:
         if task_id is None:
             continue
 
-        await process_task(redis_client, sessionmaker, deps, task_id)
+        try:
+            await process_task(redis_client, sessionmaker, deps, task_id)
+        except Exception:
+            # Redis or the DB failed around the lease or the task lookup, before or after
+            # the work itself. The task was already popped from the queue, so put it back
+            # (a duplicate entry is harmless: `process_task` skips finished or leased tasks).
+            logger.exception("process_task_failed", task_id=str(task_id))
+            await asyncio.sleep(1)
+            try:
+                await enqueue_task(redis_client, task_id)
+            except Exception:
+                logger.exception("requeue_after_failure_failed", task_id=str(task_id))
 
 
 def main() -> None:
