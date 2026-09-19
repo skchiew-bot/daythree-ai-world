@@ -145,7 +145,10 @@ def test_revision_id_fits_alembic_version_and_chains_onto_0004():
 
 
 def test_upgrade_from_an_empty_database_creates_the_table_and_every_index(fresh_database):
-    command.upgrade(_alembic(), "head")
+    # Revision-targeted, not "head" (defensive per the same lesson T1's own test
+    # learned the hard way once a migration lands on top of this one): this file is
+    # about 0004b specifically, regardless of what stacks on top of it later.
+    command.upgrade(_alembic(), REVISION)
 
     assert NEW_TABLES <= fresh_database.table_names()
     _assert_all_new_indexes(fresh_database)
@@ -159,7 +162,7 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
     ids = _seed_populated_rows(fresh_database)
     columns_before = {t: fresh_database.columns(t) for t in GUARDED_TABLES}
 
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert NEW_TABLES <= fresh_database.table_names()
     _assert_all_new_indexes(fresh_database)
@@ -172,11 +175,11 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
 
 
 def test_downgrade_drops_only_the_new_table_and_index_and_upgrade_restores_them(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
     ids = _seed_populated_rows(fresh_database)
     tables_at_head = fresh_database.table_names()
 
-    command.downgrade(_alembic(), "-1")
+    command.downgrade(_alembic(), PARENT_REVISION)
 
     assert fresh_database.current_revision() == PARENT_REVISION
     assert tables_at_head - fresh_database.table_names() == NEW_TABLES  # dropped exactly this table
@@ -188,7 +191,7 @@ def test_downgrade_drops_only_the_new_table_and_index_and_upgrade_restores_them(
         == "session"
     )
 
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert fresh_database.current_revision() == REVISION
     assert NEW_TABLES <= fresh_database.table_names()
@@ -215,12 +218,23 @@ def test_the_database_itself_refuses_a_second_closure_for_one_runtime_session(fr
 
 
 def test_the_database_itself_refuses_an_unknown_closed_by_or_outcome_value(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
     ids = _seed_populated_rows(fresh_database)
+
+    # 'bogus' fits comfortably inside `closed_by`'s own varchar(16) so the CHECK
+    # constraint is what actually fires here -- a too-long value would instead (and
+    # did, on the first version of this test) raise a length-truncation error, which
+    # proves nothing about the CHECK itself.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        fresh_database.execute(
+            f"INSERT INTO agent_runtime_closures (id, tenant_id, runtime_session_id, task_id, closed_by, outcome, "
+            f"reason_code) VALUES ('{uuid.uuid4()}', '{ids['tenant']}', '{ids['runtime_session']}', "
+            f"'{ids['task']}', 'bogus', 'completed', 'hook_reported')"
+        )
 
     with pytest.raises(asyncpg.exceptions.CheckViolationError):
         fresh_database.execute(
             f"INSERT INTO agent_runtime_closures (id, tenant_id, runtime_session_id, task_id, closed_by, outcome, "
             f"reason_code) VALUES ('{uuid.uuid4()}', '{ids['tenant']}', '{ids['runtime_session']}', "
-            f"'{ids['task']}', 'not_a_real_closer', 'completed', 'hook_reported')"
+            f"'{ids['task']}', 'hook', 'bogus', 'hook_reported')"
         )

@@ -399,11 +399,24 @@ async def test_a_late_hook_close_after_reaping_sets_late_close_at_and_leaves_the
         sub = await session.get(AgentRuntimeSession, rows["subagent_id"])
         sub.started_at = stale_at
         parent = await session.get(AgentRuntimeSession, rows["session_id"])
-        parent.last_heartbeat_at = now  # keep the parent fresh so only the subagent reaps
+        # The reaper's own staleness formula is GREATEST(sub's activity, PARENT's
+        # activity) -- a fresh parent protects every one of its subagents from
+        # reaping (proven by `test_reaper_spares_a_subagent_with_a_fresh_parent_
+        # heartbeat` above), so the parent must be stale too here or nothing reaps
+        # at all (the bug this test originally had: `before.lost` came back 0).
+        parent.started_at = stale_at
         await session.commit()
 
         await reap_stale_runtime_sessions(session, _NoopEventPublisher(), reap_window=timedelta(minutes=30), now=now)
         await session.commit()
+
+    async with sessionmaker() as session:
+        reaped_closure = (
+            await session.execute(
+                select(AgentRuntimeClosure).where(AgentRuntimeClosure.runtime_session_id == rows["subagent_id"])
+            )
+        ).scalar_one()
+        assert reaped_closure.closed_by == "reaper"
 
     since = now - timedelta(hours=1)
     async with sessionmaker() as session:

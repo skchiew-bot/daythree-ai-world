@@ -177,18 +177,23 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
 
 
 def test_downgrade_drops_only_the_three_tables_and_upgrade_restores_them(fresh_database):
-    command.upgrade(_alembic(), "head")
+    # Revision-targeted, not "head" / "-1": a later migration (0004b) now stacks on
+    # top of this one, so "head" no longer means 0004 and "-1" from head no longer
+    # means "undo 0004" -- it would undo whatever the new head is instead. Naming
+    # both ends explicitly keeps this test about 0004 regardless of what stacks on
+    # top of it later (found when 0004b's own CI run broke this exact assumption).
+    command.upgrade(_alembic(), REVISION)
     ids = _seed_populated_rows(fresh_database)
     tables_at_head = fresh_database.table_names()
 
-    command.downgrade(_alembic(), "-1")
+    command.downgrade(_alembic(), PARENT_REVISION)
 
     assert fresh_database.current_revision() == PARENT_REVISION
     assert tables_at_head - fresh_database.table_names() == NEW_TABLES  # dropped exactly these
     assert fresh_database.table_names() <= tables_at_head  # and created nothing
     assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"
 
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert fresh_database.current_revision() == REVISION
     assert NEW_TABLES <= fresh_database.table_names()
