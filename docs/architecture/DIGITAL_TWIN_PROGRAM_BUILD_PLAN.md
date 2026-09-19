@@ -37,7 +37,8 @@ operator has merged.
 | Phase | Name | Depends on | Starts when |
 |---|---|---|---|
 | T1 | Twins: identity and registration (ADR-010 A) | nothing | now |
-| T2 | Twins: lifecycle closure, reaper, per-task artifact (ADR-010 B, corrected) | T1 | T1 merged |
+| T2 | Twins: lifecycle closure, reaper, SessionEnd (ADR-010 B, corrected; no output stored) | T1 | T1 merged (2026-09-19, #33) |
+| T2b | Twins: opt-in subagent output capture (D24..D31) | T2 | before Gate E needs reviewable artifacts |
 | T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C) | T2 | T2 merged |
 | T4 | Twins in the 3D world (ADR-010 D) | T3 | T3 merged |
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
@@ -204,34 +205,115 @@ the 5-floor default (harmless at 5 personas, a note for T4).
 
 ---
 
-## T2. Twins: lifecycle closure, reaper, per-task artifact
+## T2. Twins: lifecycle closure, reaper, SessionEnd
 
-**Goal.** Every Task opened in T1 reaches a terminal state, with a reviewable artifact when the
-subagent has one to give, even if the terminal is killed.
+Gate-reviewed against main at `aee368d` on 2026-09-19: guardian-gatekeeper **BLOCK + ALTERNATIVE**
+(T2-F1..F11) and guardian-data-warden **PASS WITH CONDITIONS** (D24..D31), both folded in below and
+recorded in `docs/council/LEDGER.md`. Operator decisions (2026-09-19): **T2 stores no subagent output**
+(output capture is its own phase, T2b); reap window **2 hours**; the reaper's partial index on
+`agent_runtime_sessions` is approved; any agent-runtime key in a tenant may close any session in that
+tenant (no per-key owner yet). Where this section and ADR-010 disagree, this section wins.
+
+**Goal.** Every twin Task opened in T1 reaches a terminal state, the session's parent Task and Mission
+end, silent sessions are reaped without ever mistaking a live subagent for a lost one, and Gate E can
+read an honest hook-loss rate. No subagent output is stored.
 
 **Deliverables.**
 
-- `POST /api/v1/agent-runtime/sessions/{id}/close` with body `{outcome: completed|failed,
-  output_text?: string, tool_call_count?: int, reason?: string}`. Drives the Task
-  `queued -> running -> completed|failed` (the state machine forbids `running -> running`), emits
-  `task.started` and `task.completed`/`task.failed` through `EventPublisher`, and **never touches
-  the Mission** (ADR-010 B2). When `output_text` is present it is validated with
-  `validate_mission_output` and committed via `artifact_service.commit_artifact` as a
-  `mission_output` artifact bound to that task (ADR-011 gate F1). `tasks.py` is not modified.
-- `SessionEnd` closes the Mission and fails still-open subagent tasks as `abandoned`.
-- A reaper (worker-side, restartable, no resident state) fails tasks whose session heartbeat is
-  older than the O2 window and records `abandoned` with the reason; the count of reaped tasks is
-  the hook-loss measure Gate E reads.
+1. **Migration `0004b_agent_runtime_closures`**, `down_revision = "0004_agent_runtime_sessions"` (keeps
+   the reserved `0005`..`0008` names free; record the parent in the docstring). NEW table only, plus one
+   index on the T1 table (operator-approved):
+   - `agent_runtime_closures(id, tenant_id, runtime_session_id UNIQUE FK agent_runtime_sessions,
+     task_id FK tasks, closed_by enum{hook, session_end, reaper}, outcome enum{completed, failed},
+     reason_code enum, tool_call_count nullable int, artifact_id nullable FK artifacts, closed_at,
+     late_close_at nullable)`. `artifact_id` is always NULL in T2; it exists so T2b needs no ALTER.
+   - Partial index on `agent_runtime_sessions` `WHERE ended_at IS NULL` for the reaper.
+   - Declare both in `packages/common/db/models.py` so tests build them; explicit per-index sweep after
+     `create_all(checkfirst=True)`; `downgrade()` drops exactly the new table and the new index.
+   - `TaskStatus` has no `abandoned`; abandoned is `failed` with `reason_code` held on the closure row.
+     No ALTER on any existing table.
+2. **Close route**, on the agent-runtime router only (T1's `get_agent_runtime_principal`, tenant-scoped,
+   cross-tenant is 404): `POST /api/v1/agent-runtime/subagents/{external_instance_ref}/close`
+   (resolved by tenant plus T1's partial unique index; the stateless T3 hook only knows the ref), and
+   the same handler at `POST /api/v1/agent-runtime/sessions/{id}/close`. Body `extra="forbid"`:
+   `outcome` (completed|failed), `reason_code` (enum, see 5), `tool_call_count` (int 0..10000, optional,
+   labelled "declared, not measured" wherever shown: D29). There is NO `output_text` and NO free-text
+   `reason` field; sending either is a 422 (D28, T2-F2, operator decision). Its own fixed-window rate
+   limit bucket.
+3. **Shared closure service** `services/api/services/agent_runtime_closure.py` (T2-F5). It takes the
+   twin Task `queued -> running -> completed|failed` in one transaction, emits `task.started` and
+   `task.completed`/`task.failed` through `EventPublisher` with ids and enum values only, writes the
+   closure row, and NEVER touches the Mission and never enqueues work. `services/api/routes/tasks.py`
+   and `services/mission-engine/.../recovery.py` are not modified; `complete_task_external`,
+   `task_executor` and `recovery` all complete Missions and must not be reused.
+4. **Idempotency and races** (T2-F9). Lock the runtime-session row with `SELECT ... FOR UPDATE` first;
+   the UNIQUE `runtime_session_id` on the closure table is the backstop; on `IntegrityError`,
+   `await session.rollback()` (T1's pattern) then re-read and return the stored result. A second close
+   is a no-op returning the first result, including under 10 concurrent duplicates. A close for a ref
+   in another session or tenant is 404.
+5. **`reason_code`** is a closed enum (D28): `hook_reported`, `session_ended`, `reaped_stale`. It is stored
+   as a string column so T2b can add `artifact_rejected` and `artifact_store_unavailable` without an
+   ALTER. No free text is stored anywhere (D30).
+6. **PATCH hardening** (T2-F6). T1's `PATCH /sessions/{id}` with an outcome on a `kind=subagent` row
+   returns 409 ("use /close"); on a `kind=session` row it becomes the SessionEnd path below. A session's
+   end state is set once; later PATCHes cannot overwrite it.
+7. **SessionEnd** (T2-F7). Ending a session, in one transaction: take the session's parent Task (the one
+   T1 created via `start_mission`) `queued|running -> completed`, close every still-open subagent Task
+   as `failed` with `closed_by=session_end, reason_code=session_ended`, then take the Mission
+   `running -> completed` (a legal transition). A second SessionEnd changes nothing.
+8. **Reaper** (T2-F1, D30), in the worker loop next to R0's sweep, restartable, no resident state.
+   Staleness = `GREATEST(COALESCE(sub.last_heartbeat_at, sub.started_at), parent.last_heartbeat_at,
+   parent.started_at)` older than the window, a named setting `AGENT_RUNTIME_REAP_WINDOW` defaulting to
+   **2 hours**. It selects with `FOR UPDATE SKIP LOCKED` and closes with a conditional update, joins only
+   through `agent_runtime_sessions`, and carries an explicit guard `runtime_adapter != 'custom_durable'`
+   so it never touches a platform-run task. Reaped subagents close as `failed` with `closed_by=reaper,
+   reason_code=reaped_stale`. When every subagent of a silent session is closed and the parent is also
+   stale, the reaper runs the SessionEnd path for it. Two reapers at once reap each task once.
+9. **Late close** (T2-F1). A hook close that arrives after the reaper already closed the task returns
+   200, leaves the Task `failed`, and sets `late_close_at` on the closure row.
+10. **Hook-loss rate, computed on read** (correction 10): no stored counter. Lost means
+    `closed_by='reaper' AND late_close_at IS NULL`; the rate is lost over all subagent closures in the
+    Gate E window. Ship a small read function (and, if cheap, an operator-only endpoint behind the
+    existing reader roles) that Gate E will use.
+11. **World read.** After the result hold passes, each closed twin shows idle in `GET /agent-rooms` and
+    `AGT-CLAUDE-CODE` is no longer stuck "assigned".
 
-**Tests.** Full close with artifact produces the expected event sequence and one `artifacts` row;
-close without artifact leaves no artifact and still closes; a second close is a no-op (idempotent);
-parallel subagents under one Mission close independently and the Mission stays `running`; reaper
-closes a stale task and never a live one.
+**Not in T2 (T2b, before Gate E needs reviewable artifacts):** storing subagent output. When built it
+must meet data-warden D24..D31: per-tenant opt-in, default OFF (D24); a secret scan that blocks the
+artifact on a match and records only an enum (D25); a size cap of 256 KiB (D26); an operator
+delete/tombstone route for `mission_output` artifacts (D27); a consent notice before the opt-in is
+exposed (D31); validation failure or an object-store outage still closes the Task, with no artifact
+and an enum reason, never a 422 (T2-F3, T2-F8); a fixed artifact title, never the validator's error
+text.
 
-**Exit.** Two parallel subagents in one session produce one Mission, two closed Tasks, one artifact
-each, and the reaper closes a deliberately abandoned third.
+**Tests** (RED first):
+1. Migration `0004b` round-trip from empty and from `0004` on a populated DB; `indexdef` assertions for
+   the closure table's unique index and the new partial index.
+2. A close emits `task.started` then `task.completed`, writes one closure row, creates no artifact, and
+   leaves the Mission `running`.
+3. A body carrying `output_text`, `reason` or any extra field is 422; `tool_call_count` outside 0..10000
+   is 422.
+4. Ten concurrent duplicate closes produce one closure row and one set of events.
+5. Cross-tenant close is 404; a ref from another session is 404; the agent-runtime key still gets 403 on
+   `tasks.py` routes.
+6. The reaper leaves a live subagent that has no heartbeat of its own but a fresh parent heartbeat;
+   reaps a stale one; two reapers at once reap it once; never touches a `custom_durable` task.
+7. A late close after reaping is 200, leaves the Task `failed`, sets `late_close_at`, and removes it
+   from the loss count.
+8. SessionEnd closes the parent Task, fails open subagents with `session_ended`, and completes the
+   Mission; a second SessionEnd changes nothing.
+9. PATCH with an outcome on a subagent is 409; a session's end state cannot be overwritten.
+10. Every `audit_events.payload` the new code writes contains only ids and enum values (recursive check).
+11. The hook-loss function returns the documented ratio on a fixture of hook, session_end, reaper and
+    late-closed rows.
+12. After the result hold, `GET /agent-rooms` shows the closed twins idle.
 
-**Handoff prompt:** as T1, phase T2, branch `feat/twins-t2-lifecycle`.
+**Exit.** Two parallel subagents in one session produce one Mission, two closed Tasks and no artifacts;
+a deliberately silent third is reaped only after the window; SessionEnd completes the Mission; the
+hook-loss function reads the result honestly.
+
+**Handoff prompt:** as T1, phase T2, branch `feat/twins-t2-lifecycle`; read this section first and treat
+T2-F1..F11 and D28..D30 as the acceptance list; T2 stores no subagent output.
 
 ---
 
