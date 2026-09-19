@@ -15,6 +15,7 @@ enums; the canaries appear in no table; and the key gets no access to the operat
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import datetime as dt
 import json
 import os
@@ -79,7 +80,10 @@ def _db(work):
         finally:
             await engine.dispose()
 
-    return asyncio.run(runner())
+    # A worker thread has no running loop: the Playwright journey that runs earlier in this
+    # session leaves one running on the main thread, and asyncio.run refuses to nest.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, runner()).result()
 
 
 def _issue(*args: str) -> subprocess.CompletedProcess:
