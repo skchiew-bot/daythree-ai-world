@@ -11,9 +11,11 @@ actor id (data-warden D17) — `code` and `name` are never placed in event `data
 """
 from __future__ import annotations
 
+import hashlib
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +46,19 @@ _RATE_LIMIT_WINDOW_SECONDS = 60
 _MAX_ACTIVE_PROJECTS = 48
 
 
+async def _lock_tenant_active_project_count(session: AsyncSession, tenant_id: EntityId) -> None:
+    """Security review follow-up (PR #26, MEDIUM): the count-then-insert cap check
+    below has a race window under concurrent creates from the same tenant — two
+    requests can both read `active_count = 47` before either commits its insert,
+    both pass the `< 48` check, and leave the tenant at 49, which breaks the
+    invariant the W2 town grid (48 lots) depends on. A Postgres transaction-scoped
+    advisory lock, keyed per tenant, serializes the count-check-insert sequence
+    across concurrent requests without a schema change; it releases automatically
+    at commit or rollback via `get_db_session`, so no explicit unlock is needed."""
+    lock_key = int.from_bytes(hashlib.sha256(tenant_id.bytes).digest()[:8], "big", signed=True)
+    await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
+
+
 async def _enforce_rate_limit(redis: Redis, tenant_id: EntityId) -> None:
     key = f"ratelimit:projects:create:{tenant_id}"
     count = await redis.incr(key)
@@ -72,6 +87,7 @@ async def create_project(
     publisher=Depends(get_event_publisher),
 ) -> Project:
     await _enforce_rate_limit(redis, user.tenant_id)
+    await _lock_tenant_active_project_count(session, user.tenant_id)
 
     existing = (
         await session.execute(

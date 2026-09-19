@@ -43,19 +43,27 @@ async def _resolve_project_link(session: AsyncSession, project_id: EntityId | No
         )
 
 
-async def _project_ids_for_missions(session: AsyncSession, mission_ids: list[EntityId]) -> dict[EntityId, EntityId]:
+async def _project_ids_for_missions(
+    session: AsyncSession, mission_ids: list[EntityId], tenant_id: EntityId
+) -> dict[EntityId, EntityId]:
+    """Explicit `MissionProject.tenant_id == tenant_id` predicate, matching
+    `agent_rooms.py::_project_id_by_mission` (security review follow-up, PR #26,
+    LOW) — not exploitable today since every caller already passes tenant-scoped
+    `mission_ids` and `mission_id` is the table's PK, but every mission-link read
+    is expected to filter tenant explicitly regardless of what the id alone
+    already guarantees."""
     if not mission_ids:
         return {}
     rows = await session.execute(
         select(MissionProject.mission_id, MissionProject.project_id).where(
-            MissionProject.mission_id.in_(mission_ids)
+            MissionProject.mission_id.in_(mission_ids), MissionProject.tenant_id == tenant_id
         )
     )
     return {mission_id: project_id for mission_id, project_id in rows.all()}
 
 
 async def _mission_response(session: AsyncSession, mission: Mission) -> MissionResponse:
-    project_ids = await _project_ids_for_missions(session, [mission.id])
+    project_ids = await _project_ids_for_missions(session, [mission.id], mission.tenant_id)
     response = MissionResponse.model_validate(mission)
     response.project_id = project_ids.get(mission.id)
     return response
@@ -105,7 +113,7 @@ async def list_missions(
 ) -> list[MissionResponse]:
     result = await session.execute(select(Mission).where(Mission.tenant_id == user.tenant_id))
     missions = list(result.scalars().all())
-    project_ids = await _project_ids_for_missions(session, [m.id for m in missions])
+    project_ids = await _project_ids_for_missions(session, [m.id for m in missions], user.tenant_id)
     responses = []
     for mission in missions:
         response = MissionResponse.model_validate(mission)
