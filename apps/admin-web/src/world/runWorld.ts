@@ -44,7 +44,7 @@ export function runWorld(container: HTMLElement, read: () => WorldInputs): () =>
 
   function frame(now: number) {
     frameId = requestAnimationFrame(frame);
-    const dt = Math.min((now - last) / 1000, MAX_FRAME_SECONDS);
+    const dt = Math.min(Math.max((now - last) / 1000, 0), MAX_FRAME_SECONDS);
     last = now;
     elapsed += dt;
     sinceTint += dt;

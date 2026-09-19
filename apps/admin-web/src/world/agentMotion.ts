@@ -43,11 +43,6 @@ export interface Pose {
   phase: TravelPhase;
 }
 
-/** Only an idle agent wanders; every other state keeps it at its desk. */
-export function wanders(ctx: MotionContext): boolean {
-  return ctx.state === "idle" && !ctx.reducedMotion;
-}
-
 function restHeading(s: number): number {
   return s <= AT_ROUTE_START ? Math.PI / 2 : 0;
 }
