@@ -10,10 +10,13 @@ not just the route functions in isolation.
 """
 from __future__ import annotations
 
+import importlib.util
 import re
 import secrets
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -50,6 +53,26 @@ from api.routes.agent_runtime import _RATE_LIMIT_MAX_REQUESTS
 pytestmark = [pytest.mark.integration, pytest.mark.security]
 
 _EXEMPT_PREFIXES = ("/api/v1/auth", "/api/v1/agent-runtime")
+
+_ISSUE_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "infrastructure" / "scripts" / "issue_agent_runtime_key.py"
+
+
+def _load_issue_script():
+    """`infrastructure/scripts/` is a plain directory, not a package (no
+    `__init__.py`, and the repo root is deliberately not on `pytest`'s configured
+    `pythonpath` in `pyproject.toml`) -- `import infrastructure...` only worked
+    locally because `python -m pytest` happens to add the current working directory
+    to `sys.path`, which the plain `pytest` entrypoint CI actually runs does not do.
+    Loading the file directly by path works under either invocation. Cached on the
+    module under its own name so the three tests that need it share one load."""
+    module_name = "issue_agent_runtime_key"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, _ISSUE_SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class _NoopEventPublisher:
@@ -285,7 +308,8 @@ async def test_the_secret_never_appears_in_captured_logs(client, db_session, cap
     """
     import structlog
 
-    from infrastructure.scripts.issue_agent_runtime_key import _ensure_service_user, _issue_key
+    issue_script = _load_issue_script()
+    _ensure_service_user, _issue_key = issue_script._ensure_service_user, issue_script._issue_key
 
     tenant = Tenant(id=new_id(), code="ar-log-secret", name="ar-log-secret")
     db_session.add(tenant)
@@ -338,9 +362,9 @@ def test_issue_script_prints_the_token_exactly_once_and_only_to_stdout(monkeypat
     real DB in the previous test). Deliberately a plain sync test, not async: `main()`
     itself owns an `asyncio.run(...)` call, which raises "cannot be called from a
     running event loop" if this test were async under `asyncio_mode = "auto"`."""
-    import infrastructure.scripts.issue_agent_runtime_key as issue_script
     from common.config import Settings
 
+    issue_script = _load_issue_script()
     sentinel_token = "dtk_" + ("a" * 32) + "_the-actual-secret-value"
 
     async def _fake_issue(tenant_code, *, label):
@@ -364,8 +388,8 @@ async def test_rotation_is_issue_new_then_revoke_old_with_an_overlap_window(clie
     """Security review round 1, LOW: `issue()` must never revoke anything by itself
     (docstring vs. code mismatch found in round 1) -- a tenant can hold two live keys
     at once, and only a separate, explicit `revoke(key_id)` call retires one."""
-    import infrastructure.scripts.issue_agent_runtime_key as issue_script
-    from infrastructure.scripts.issue_agent_runtime_key import issue, revoke
+    issue_script = _load_issue_script()
+    issue, revoke = issue_script.issue, issue_script.revoke
 
     tenant = Tenant(id=new_id(), code="ar-rotate", name="ar-rotate")
     db_session.add(tenant)
