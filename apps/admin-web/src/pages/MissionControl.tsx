@@ -136,7 +136,7 @@ export function MissionControl() {
               </td>
               <td>{mission.priority}</td>
               <td style={{ display: "flex", gap: "0.4rem" }}>
-                {(mission.status === "draft" || mission.status === "ready") && (
+                {!mission.is_agent_runtime && (mission.status === "draft" || mission.status === "ready") && (
                   <button
                     className="btn secondary"
                     onClick={() => startMission.mutate(mission.id)}
@@ -145,7 +145,7 @@ export function MissionControl() {
                     Start
                   </button>
                 )}
-                {mission.status === "running" && (
+                {!mission.is_agent_runtime && mission.status === "running" && (
                   <button
                     className="btn danger"
                     onClick={() => cancelMission.mutate(mission.id)}

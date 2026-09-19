@@ -45,3 +45,8 @@ class MissionResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     project_id: Optional[EntityId] = None
+    # T1 build-plan condition C4: derived (never persisted -- no column is added to
+    # `missions`), so Mission Control can hide Start/Cancel for a mission an
+    # agent-runtime session owns. The real refusal is the 409 in start_mission_route/
+    # cancel_mission below; this is cosmetic on top of it.
+    is_agent_runtime: bool = False

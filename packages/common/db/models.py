@@ -402,3 +402,92 @@ class AgentRoomAssignment(Base):
     room_index: Mapped[int] = mapped_column(Integer, nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
     released_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+
+
+class AgentRuntimeSession(Base):
+    """One Claude Code session or one subagent spawn, registered by the hook credential
+    (ADR-010, T1). This table is the discriminator for "is this an agent-runtime mission":
+    an EXISTS against `mission_id` — there is deliberately NO `source` column on `missions`
+    (`create_all(checkfirst=True)` cannot add a column to an existing table; gate T1-F2).
+
+    Every field is either an id, a timestamp, an enum value, or one of the two opaque
+    references below. `external_*_ref` are validated tokens (a uuid / a short slug) sent by
+    the hook, never prose; no prompt, cwd, description or reason is stored anywhere.
+
+    The two partial unique indexes are the idempotency guarantee for hook retries (a
+    session is unique per `external_session_ref`, a subagent per `external_instance_ref`).
+    For a subagent row `external_session_ref` holds the PARENT session's ref.
+    """
+
+    __tablename__ = "agent_runtime_sessions"
+    __table_args__ = (
+        CheckConstraint("kind IN ('session', 'subagent')", name="ck_agent_runtime_sessions_kind"),
+        Index(
+            "uq_agent_runtime_sessions_session_ref",
+            "tenant_id", "external_session_ref",
+            unique=True, postgresql_where=text("kind = 'session'"),
+        ),
+        Index(
+            "uq_agent_runtime_sessions_instance_ref",
+            "tenant_id", "external_instance_ref",
+            unique=True, postgresql_where=text("kind = 'subagent'"),
+        ),
+        Index("ix_agent_runtime_sessions_mission_id", "mission_id"),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    agent_id: Mapped[Optional[EntityId]] = mapped_column(ForeignKey("agents.id"), nullable=True)
+    mission_id: Mapped[Optional[EntityId]] = mapped_column(ForeignKey("missions.id"), nullable=True)
+    task_id: Mapped[Optional[EntityId]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
+    external_session_ref: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_instance_ref: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    parent_session_id: Mapped[Optional[EntityId]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runtime_sessions.id"), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+
+class AgentRuntimePersonaSlot(Base):
+    """Atomic per-tenant cap on auto-activated personas (ADR-010 B4, T1-F14): a slot row is
+    claimed BEFORE the persona's `agents` row is inserted, so two concurrent first-sights
+    can never both slip under the cap. The CHECK is the cap enforced by the database
+    itself; `packages/common/agent_runtime.py::PERSONA_SLOT_CAP` mirrors it."""
+
+    __tablename__ = "agent_runtime_persona_slots"
+    __table_args__ = (
+        CheckConstraint("slot >= 0 AND slot < 25", name="ck_agent_runtime_persona_slots_slot"),
+        UniqueConstraint("tenant_id", "slot", name="uq_agent_runtime_persona_slots_tenant_slot"),
+        UniqueConstraint("tenant_id", "agent_code", name="uq_agent_runtime_persona_slots_tenant_code"),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)
+    slot: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_code: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class AgentRuntimeApiKey(Base):
+    """Scoped credential for the hooks (ADR-010 C2). The wire format is
+    `dtk_<key id, 32 hex>_<secret>`; only `sha256(secret)` is stored. Unsalted sha256 is
+    acceptable ONLY because the secret is 256 bits of `secrets.token_urlsafe(32)`: there is
+    nothing to brute-force or rainbow-table, unlike a human password (which stays bcrypt).
+    Revocation is a timestamp read on every request, so it takes effect immediately."""
+
+    __tablename__ = "agent_runtime_api_keys"
+    __table_args__ = (
+        UniqueConstraint("key_hash", name="uq_agent_runtime_api_keys_key_hash"),
+        Index("ix_agent_runtime_api_keys_user_id", "user_id"),
+    )
+
+    id: Mapped[EntityId] = _pk()
+    user_id: Mapped[EntityId] = mapped_column(ForeignKey("users.id"), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime, server_default=func.now())
+    expires_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(TZDateTime, nullable=True)

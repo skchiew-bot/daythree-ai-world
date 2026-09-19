@@ -20,6 +20,10 @@ class UserRole(str, Enum):
     operator = "operator"
     auditor = "auditor"
     viewer = "viewer"
+    # Non-human service credential for the Claude Code hooks (ADR-010, T1). Never
+    # granted by any `require_role(...)` set and refused on every router except its
+    # own (`api.dependencies.agent_runtime_auth.forbid_agent_runtime`).
+    agent_runtime = "agent_runtime"
 
 
 class UserStatus(str, Enum):
@@ -96,6 +100,20 @@ class ModelInvocationStatus(str, Enum):
 class ProjectStatus(str, Enum):
     active = "active"
     archived = "archived"
+
+
+class AgentRuntimeKind(str, Enum):
+    session = "session"
+    subagent = "subagent"
+
+
+class AgentRuntimeOutcome(str, Enum):
+    """The only free-form-looking field a hook may set on an ended session; enumerated
+    so nothing a hook sends can land in the audit trail as text (data-warden D1..D5)."""
+
+    completed = "completed"
+    failed = "failed"
+    abandoned = "abandoned"
 
 
 class ToolName(str, Enum):
