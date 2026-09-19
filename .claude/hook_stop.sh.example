@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# LEGACY, presence-only (PR #13): this hook only reports a Working/Done status to the
+# 3D World page through the admin login. It registers no twin and holds no key. The digital-
+# twin lifecycle (sessions, subagents, heartbeats) is scripts/report_twin_lifecycle.sh,
+# wired in .claude/settings.local.json.example. This presence hook is deleted at phase T4.
+#
 # Copy to .claude/hook_stop.sh (gitignored) and fill in your own values. Called by
 # the Stop hook in .claude/settings.local.json.
 export DAYTHREE_API_BASE_URL="http://localhost:8000"

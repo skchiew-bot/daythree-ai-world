@@ -1,0 +1,38 @@
+# Template for the digital-twin hook's key file. DO NOT copy this into the repo and do
+# not put a real key in any tracked file. The hook (scripts/report_twin_lifecycle.sh)
+# reads exactly one file, at a fixed path OUTSIDE the repository and the Apache web root:
+#
+#     $HOME/.daythree/twin_env.sh        (Windows: %USERPROFILE%\.daythree\twin_env.sh)
+#
+# It sources that file and needs two variables. There are no defaults: with either one
+# missing the hook does nothing and logs one `no_key` line. Never add `export`: the hook
+# clears the variables after reading them so the key is never in an environment.
+#
+# Issue the key yourself, in a terminal OUTSIDE Claude Code (a plain Git Bash or
+# PowerShell window, never a Claude Code Bash tool call), straight into the key file, so
+# the secret is never printed, pasted into a chat, or written anywhere else. The script
+# prints the key once, on its last line of stdout; `tail -n 1` keeps only that line:
+#
+#     mkdir -p "$HOME/.daythree" && umask 077
+#     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code <your-tenant> \
+#         --expires-in-days 90 --label "twin hooks" | tail -n 1 | {
+#       read -r K && printf 'DAYTHREE_TWIN_BASE_URL=%s\nDAYTHREE_TWIN_KEY=%s\n' \
+#         "http://localhost:8000" "$K" > "$HOME/.daythree/twin_env.sh"; unset K; }
+#
+# Then restrict the file to your own account (Windows):
+#
+#     icacls "%USERPROFILE%\.daythree\twin_env.sh" /inheritance:r /grant:r "%USERNAME%:F"
+#
+# The key id is the 32 hexadecimal characters between the first two underscores of the
+# key (the part that follows the three-letter prefix). Record the key id
+# and the expiry date in docs/council/LEDGER.md; never record the secret part.
+#
+# If the key may have been exposed (pasted into a chat, shown on screen, committed): issue
+# a new one the same way, then revoke the old one by id:
+#
+#     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code <your-tenant> --revoke <old-key-id>
+#
+# The value formats below are placeholders on purpose and match no key shape.
+
+DAYTHREE_TWIN_BASE_URL=http://localhost:8000
+DAYTHREE_TWIN_KEY=PASTE_THE_KEY_PRINTED_BY_THE_ISSUE_SCRIPT_HERE

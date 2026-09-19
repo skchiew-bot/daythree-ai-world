@@ -13,6 +13,13 @@
     "- Without '--login', Git Bash's own coreutils (dirname/date/sed) weren't on PATH, since normal profile setup didn't run. Fix: pass --login to bash.exe.",
     "All the machine-specific config (base URL, admin password) lives in the small hook_working.sh/hook_stop.sh wrapper scripts, not inline in this JSON — much easier to get the quoting right with one thing changing (the wrapper's path) instead of several."
   ],
+  "_twin_setup": [
+    "Digital-twin hooks (phase T3): the twin entries in the hooks section (SessionStart, SubagentStart, SubagentStop and SessionEnd, plus a second entry on Stop and on UserPromptSubmit) run scripts/report_twin_lifecycle.sh, which registers this session and its roster subagents with the platform, closes them, and heartbeats the session. They are separate from the presence hooks (hook_working.sh and hook_stop.sh, legacy, presence only).",
+    "1. Issue the API key yourself in a terminal OUTSIDE Claude Code, straight into $HOME/.daythree/twin_env.sh, following the instructions in .claude/twin_env.sh.example. Never paste the key into a chat or a tracked file.",
+    "2. Adjust the two absolute paths in each twin command (the shell executable and the script) for your machine. The command carries no key and no environment prefix; the script takes the event name as its only argument, as a fallback for a payload that omits it.",
+    "3. The permissions.deny rule stops a Claude Code session from reading the key file into its context.",
+    "4. Start a NEW Claude Code session: SessionStart fires only at session start, so a session that was already running has no twin state and its subagents are not registered."
+  ],
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -22,6 +29,15 @@
             "type": "command",
             "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/.claude/hook_working.sh\"",
             "timeout": 8
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" UserPromptSubmit",
+            "timeout": 5
           }
         ]
       }
@@ -36,7 +52,65 @@
             "timeout": 8
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" Stop",
+            "timeout": 5
+          }
+        ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" SubagentStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" SubagentStop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\Program Files\\Git\\usr\\bin\\bash.exe\" --login \"C:/xampp/htdocs/daythree-ai-world/scripts/report_twin_lifecycle.sh\" SessionEnd",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(~/.daythree/**)"
     ]
   }
 }
