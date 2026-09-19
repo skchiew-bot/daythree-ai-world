@@ -195,3 +195,64 @@ async def test_archived_but_referenced_project_still_appears_in_projects_array(c
     assert str(project.id) in project_ids
     matching = next(p for p in body["projects"] if p["id"] == str(project.id))
     assert matching["status"] == "archived"
+
+
+@pytest.mark.asyncio
+async def test_projects_array_is_ordered_by_created_at_then_id_even_after_a_row_is_updated(
+    client, db_session, tenant_admin
+):
+    """ADR-014 gate F7: the town places buildings by probing in the order the API returns
+    `projects[]`, so that order must be `(created_at, id)`, not Postgres's physical row
+    order. An UPDATE writes a new tuple version, which changes the physical order of a
+    heap scan; without an explicit ORDER BY the updated (oldest) project would jump to
+    the end and every later building could shift lots.
+    """
+    tenant_id = tenant_admin["tenant"].id
+    base = datetime.now(timezone.utc) - timedelta(days=3)
+    projects = [
+        Project(
+            id=new_id(), tenant_id=tenant_id, code=f"ORD{i}", name=f"n{i}",
+            status=ProjectStatus.active.value, created_at=base + timedelta(hours=i),
+        )
+        for i in range(4)
+    ]
+    db_session.add_all(projects)
+    await db_session.commit()
+
+    oldest = projects[0]
+    oldest.name = "renamed"
+    await db_session.commit()
+    oldest.status = ProjectStatus.archived.value
+    await db_session.commit()
+    oldest.status = ProjectStatus.active.value
+    await db_session.commit()
+
+    token = await _login(client, tenant_admin["admin"].email)
+    headers = {"Authorization": f"Bearer {token}"}
+    for _ in range(5):
+        body = (await client.get("/api/v1/agent-rooms", headers=headers)).json()
+        assert [p["code"] for p in body["projects"]] == ["ORD0", "ORD1", "ORD2", "ORD3"]
+
+
+@pytest.mark.asyncio
+async def test_projects_created_in_the_same_instant_tie_break_on_id(client, db_session, tenant_admin):
+    tenant_id = tenant_admin["tenant"].id
+    same_instant = datetime.now(timezone.utc) - timedelta(hours=1)
+    ids_descending = sorted((new_id() for _ in range(5)), reverse=True)
+    projects = [
+        Project(
+            id=project_id, tenant_id=tenant_id, code=f"TIE{i}", name="n",
+            status=ProjectStatus.active.value, created_at=same_instant,
+        )
+        for i, project_id in enumerate(ids_descending)
+    ]
+    for project in projects:
+        db_session.add(project)
+        await db_session.flush()
+    await db_session.commit()
+
+    token = await _login(client, tenant_admin["admin"].email)
+    headers = {"Authorization": f"Bearer {token}"}
+    body = (await client.get("/api/v1/agent-rooms", headers=headers)).json()
+    returned = [p["id"] for p in body["projects"]]
+    assert returned == sorted(returned)
