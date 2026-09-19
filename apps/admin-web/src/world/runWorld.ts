@@ -4,7 +4,7 @@ import { ExternalAvatars } from "./externalAvatars";
 import { applyClockTint, fitKeyLight } from "./lighting";
 import type { WorldAgent } from "./renderPayload";
 import { RoomAvatars, type FrameClock } from "./roomAvatars";
-import { createSceneKit } from "./sceneSetup";
+import { createSceneKit, type SceneKit } from "./sceneSetup";
 
 /** Everything the render loop reads each frame. Only allow-listed data lives here. */
 export interface WorldInputs {
@@ -15,27 +15,47 @@ export interface WorldInputs {
   externalStates: ReadonlyMap<string, AgentState>;
 }
 
+/** The parts of setup that can fail; injectable so the failure path can be tested. */
+export interface WorldDeps {
+  createKit: typeof createSceneKit;
+  buildApartment: typeof buildApartment;
+}
+
+const DEFAULT_DEPS: WorldDeps = { createKit: createSceneKit, buildApartment };
 const MAX_FRAME_SECONDS = 0.25;
 const TINT_INTERVAL_SECONDS = 1;
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
+function trackReducedMotion(): { isReduced: () => boolean; stop: () => void } {
+  const query = window.matchMedia(REDUCED_MOTION_QUERY);
+  let reduced = query.matches;
+  const onChange = (event: MediaQueryListEvent) => {
+    reduced = event.matches;
+  };
+  query.addEventListener("change", onChange);
+  return { isReduced: () => reduced, stop: () => query.removeEventListener("change", onChange) };
+}
+
 /** Builds the scene inside `container`, runs it, and returns a teardown function that
- * frees every geometry, material, texture and the WebGL context. */
-export function runWorld(container: HTMLElement, read: () => WorldInputs): () => void {
-  const first = read();
-  const kit = createSceneKit(container, first.floors);
+ * frees every geometry, material, texture and the WebGL context. If setup throws after
+ * the renderer exists, the renderer is released before the error propagates. */
+export function runWorld(container: HTMLElement, read: () => WorldInputs, deps: WorldDeps = DEFAULT_DEPS): () => void {
+  const kit = deps.createKit(container, read().floors);
+  try {
+    return startLoop(kit, read, deps);
+  } catch (error) {
+    kit.dispose();
+    throw error;
+  }
+}
+
+function startLoop(kit: SceneKit, read: () => WorldInputs, deps: WorldDeps): () => void {
   const { scene, lights, materials } = kit;
-  let apartment: ApartmentHandle = buildApartment(scene, first.floors, materials);
+  let apartment: ApartmentHandle = deps.buildApartment(scene, read().floors, materials);
   const roomAvatars = new RoomAvatars(scene, kit.avatarAssets);
   const externalAvatars = new ExternalAvatars(scene, kit.avatarAssets);
   applyClockTint(scene, lights, materials, new Date());
-
-  const motionQuery = window.matchMedia(REDUCED_MOTION_QUERY);
-  let reducedMotion = motionQuery.matches;
-  const onMotionChange = (event: MediaQueryListEvent) => {
-    reducedMotion = event.matches;
-  };
-  motionQuery.addEventListener("change", onMotionChange);
+  const motion = trackReducedMotion();
 
   let frameId = 0;
   let last = performance.now();
@@ -52,7 +72,7 @@ export function runWorld(container: HTMLElement, read: () => WorldInputs): () =>
     const inputs = read();
     if (inputs.floors !== apartment.floors) {
       apartment.dispose();
-      apartment = buildApartment(scene, inputs.floors, materials);
+      apartment = deps.buildApartment(scene, inputs.floors, materials);
       fitKeyLight(lights.key, inputs.floors);
     }
     if (sinceTint >= TINT_INTERVAL_SECONDS) {
@@ -60,7 +80,7 @@ export function runWorld(container: HTMLElement, read: () => WorldInputs): () =>
       sinceTint = 0;
     }
 
-    const clock: FrameClock = { t: elapsed, dt, nowMs: Date.now(), reducedMotion };
+    const clock: FrameClock = { t: elapsed, dt, nowMs: Date.now(), reducedMotion: motion.isReduced() };
     roomAvatars.update(inputs.agents, inputs.agentStates, apartment, clock);
     externalAvatars.update(inputs.externalNames, inputs.externalStates, clock);
 
@@ -71,7 +91,7 @@ export function runWorld(container: HTMLElement, read: () => WorldInputs): () =>
 
   return () => {
     cancelAnimationFrame(frameId);
-    motionQuery.removeEventListener("change", onMotionChange);
+    motion.stop();
     roomAvatars.dispose();
     externalAvatars.dispose();
     apartment.dispose();

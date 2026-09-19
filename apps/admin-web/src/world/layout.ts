@@ -37,6 +37,13 @@ export interface RoomAnchors {
   door: Vec3;
 }
 
+/** Keeps a room index inside 1..ROOMS_PER_FLOOR. The API never sends anything else, but a
+ * bad value must not turn into NaN positions or an undefined lobby spot. */
+export function clampRoomIndex(roomIndex: number): number {
+  if (!Number.isFinite(roomIndex)) return 1;
+  return Math.min(Math.max(Math.round(roomIndex), 1), ROOMS_PER_FLOOR);
+}
+
 export function roomCenterX(roomIndex: number): number {
   const startX = -BUILDING_WIDTH / 2 + ROOM_WIDTH / 2;
   return startX + (roomIndex - 1) * ROOM_WIDTH;

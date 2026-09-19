@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 import { runWorld, type WorldInputs } from "./runWorld";
 
@@ -13,7 +13,11 @@ interface WorldCanvasProps extends WorldInputs {
 export function WorldCanvas({ label, describedBy, ...inputs }: WorldCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const latest = useRef<WorldInputs>(inputs);
-  latest.current = inputs;
+  // Written after commit, not during render, so a discarded concurrent render can never
+  // leak its props into the scene. Layout effects run before the scene effect below.
+  useLayoutEffect(() => {
+    latest.current = inputs;
+  });
 
   useEffect(() => {
     const container = containerRef.current;

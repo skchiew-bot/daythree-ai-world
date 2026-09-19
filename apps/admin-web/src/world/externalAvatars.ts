@@ -14,12 +14,21 @@ interface Entry {
   x: number;
 }
 
+/** Element-wise, so it neither allocates per frame nor confuses ["a|b"] with ["a", "b"]. */
+function sameNames(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 /** External agents (a Claude Code session, a script, anything pinging the status
  * endpoint) stand in a row in front of the building. They hold no room and never wander:
  * the row is unchanged from before ADR-009, only drawn with the new avatar. */
 export class ExternalAvatars {
   private readonly entries = new Map<string, Entry>();
-  private namesKey = "";
+  private lastNames: readonly string[] = [];
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -27,10 +36,9 @@ export class ExternalAvatars {
   ) {}
 
   update(names: readonly string[], states: ReadonlyMap<string, AgentState>, clock: FrameClock): void {
-    const key = names.join("|");
-    if (key !== this.namesKey) {
+    if (!sameNames(names, this.lastNames)) {
       this.sync(names);
-      this.namesKey = key;
+      this.lastNames = [...names];
     }
     for (const [name, entry] of this.entries) {
       const state = states.get(name) ?? "idle";

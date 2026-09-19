@@ -1,4 +1,4 @@
-import { LOBBY_SPOT_XS } from "./layout";
+import { clampRoomIndex, LOBBY_SPOT_XS } from "./layout";
 import { hashString, seededRandom } from "./rng";
 import { buildRoute, type Destination, type Route } from "./routes";
 
@@ -36,7 +36,7 @@ function pickDestination(pick: number, floor: number, roomIndex: number, bucket:
   // (at most four) agents of one floor never stand on the same place.
   const places = LOBBY_SPOT_XS.length;
   const shift = hashString(`${floor}:${bucket}`) % places;
-  if (pick < LOBBY_SHARE) return { kind: "lobby", spot: (roomIndex - 1 + shift) % places };
+  if (pick < LOBBY_SHARE) return { kind: "lobby", spot: (clampRoomIndex(roomIndex) - 1 + shift) % places };
   return { kind: pick < STROLL_LEFT_SHARE ? "strollLeft" : "strollRight", spot: 0 };
 }
 
@@ -58,11 +58,40 @@ function smoothstep(x: number): number {
   return c * c * (3 - 2 * c);
 }
 
+interface CachedPlan {
+  bucket: number;
+  floor: number;
+  roomIndex: number;
+  plan: TripPlan;
+}
+
+/** One slot per agent: a new bucket, floor or room replaces it, so entries from old
+ * buckets are evicted by construction. Bounded, and cleared if it ever outgrows the cap. */
+const planCache = new Map<string, CachedPlan>();
+const MAX_CACHED_AGENTS = 512;
+
+/** `planTrip`, memoized. It runs for every agent on every frame and rebuilds strings,
+ * hashes and a PRNG closure, none of which change within a 40 s bucket. */
+export function cachedPlan(agentId: string, floor: number, roomIndex: number, bucket: number): TripPlan {
+  const hit = planCache.get(agentId);
+  if (hit && hit.bucket === bucket && hit.floor === floor && hit.roomIndex === roomIndex) return hit.plan;
+
+  const plan = planTrip(agentId, floor, roomIndex, bucket);
+  if (!hit && planCache.size >= MAX_CACHED_AGENTS) planCache.clear();
+  planCache.set(agentId, { bucket, floor, roomIndex, plan });
+  return plan;
+}
+
 /** Where an idle agent belongs at `nowMs`: in the room, easing out to the destination,
  * dwelling there, then easing back. A pure function of its arguments. */
 export function idleReference(agentId: string, floor: number, roomIndex: number, nowMs: number): IdleReference {
   const bucket = Math.floor(nowMs / BUCKET_MS);
-  const plan = planTrip(agentId, floor, roomIndex, bucket);
+  return referenceFromPlan(cachedPlan(agentId, floor, roomIndex, bucket), bucket, nowMs);
+}
+
+/** The schedule evaluated against an explicit plan (exported so tests can compare the
+ * memoized path with a fresh `planTrip`). */
+export function referenceFromPlan(plan: TripPlan, bucket: number, nowMs: number): IdleReference {
   const { route } = plan;
   const local = nowMs - bucket * BUCKET_MS - plan.startMs;
   const reach = route.length - route.idleS;

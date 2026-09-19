@@ -18,6 +18,11 @@ interface Entry {
   handle: AvatarHandle;
   anim: AvatarAnimState;
   motion: MotionState;
+  /** Owned by this entry and rewritten every frame, so a frame allocates no context. The
+   * motion functions read it and never keep a reference. */
+  ctx: MotionContext;
+  floor: number;
+  roomIndex: number;
 }
 
 export interface FrameClock {
@@ -46,14 +51,16 @@ export class RoomAvatars {
     clock: FrameClock,
   ): void {
     if (agents !== this.lastAgents) {
-      this.removeMissing(agents);
+      this.reconcile(agents, apartment);
       this.lastAgents = agents;
     }
     for (const agent of agents) {
       const state = states.get(agent.agent_id) ?? agent.activity;
-      const ctx = this.contextFor(agent, state, clock);
-      const entry = this.entryFor(agent, ctx);
-      entry.motion = stepMotion(entry.motion, ctx, clock.dt);
+      const entry = this.entryFor(agent, state, clock);
+      refreshContext(entry.ctx, agent, state, clock);
+      entry.motion = stepMotion(entry.motion, entry.ctx, clock.dt);
+      entry.floor = agent.floor;
+      entry.roomIndex = agent.room_index;
       entry.handle.floorY = floorY(agent.floor);
       updateAvatar(entry.handle, entry.anim, state, poseOf(entry.motion), clock.t, clock.dt, clock.reducedMotion);
       tintRoomPanel(apartment, agent.floor, agent.room_index, state);
@@ -65,8 +72,11 @@ export class RoomAvatars {
     this.entries.clear();
   }
 
-  private contextFor(agent: WorldAgent, state: AgentState, clock: FrameClock): MotionContext {
-    return {
+  private entryFor(agent: WorldAgent, state: AgentState, clock: FrameClock): Entry {
+    const existing = this.entries.get(agent.agent_id);
+    if (existing) return existing;
+
+    const ctx: MotionContext = {
       agentId: agent.agent_id,
       floor: agent.floor,
       roomIndex: agent.room_index,
@@ -74,26 +84,38 @@ export class RoomAvatars {
       nowMs: clock.nowMs,
       reducedMotion: clock.reducedMotion,
     };
-  }
-
-  private entryFor(agent: WorldAgent, ctx: MotionContext): Entry {
-    const existing = this.entries.get(agent.agent_id);
-    if (existing) return existing;
     const entry: Entry = {
       handle: buildAvatar(this.scene, this.assets, agent.agent_id, floorY(agent.floor)),
       anim: createAnimState(agent.agent_id),
       motion: initMotion(ctx),
+      ctx,
+      floor: agent.floor,
+      roomIndex: agent.room_index,
     };
     this.entries.set(agent.agent_id, entry);
     return entry;
   }
 
-  private removeMissing(agents: readonly WorldAgent[]): void {
-    const present = new Set(agents.map((a) => a.agent_id));
+  /** Runs when new data arrives. A room an agent has left (removed or reassigned) has its
+   * status panel put back to the idle tint; occupants re-tint their rooms afterwards in
+   * the same update, so a swap of two rooms still ends up right. */
+  private reconcile(agents: readonly WorldAgent[], apartment: ApartmentHandle): void {
+    const present = new Map(agents.map((a) => [a.agent_id, a]));
     for (const [id, entry] of this.entries) {
-      if (present.has(id)) continue;
+      const agent = present.get(id);
+      if (agent && agent.floor === entry.floor && agent.room_index === entry.roomIndex) continue;
+      tintRoomPanel(apartment, entry.floor, entry.roomIndex, "idle");
+      if (agent) continue;
       entry.handle.dispose();
       this.entries.delete(id);
     }
   }
+}
+
+function refreshContext(ctx: MotionContext, agent: WorldAgent, state: AgentState, clock: FrameClock): void {
+  ctx.floor = agent.floor;
+  ctx.roomIndex = agent.room_index;
+  ctx.state = state;
+  ctx.nowMs = clock.nowMs;
+  ctx.reducedMotion = clock.reducedMotion;
 }

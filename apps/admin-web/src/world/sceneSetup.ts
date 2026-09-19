@@ -56,7 +56,26 @@ function createControls(camera: THREE.Camera, element: HTMLElement): OrbitContro
   return controls;
 }
 
+function releaseRenderer(renderer: THREE.WebGLRenderer): void {
+  renderer.dispose();
+  renderer.forceContextLoss();
+  renderer.domElement.remove();
+}
+
+/** The renderer is created first: `new WebGLRenderer` throws when WebGL is unavailable,
+ * and at that point nothing else exists yet to leak. If anything after it throws, the
+ * renderer and its GL context are released before the error propagates. */
 export function createSceneKit(container: HTMLElement, floors: number): SceneKit {
+  const renderer = createRenderer(container);
+  try {
+    return assembleKit(container, renderer, floors);
+  } catch (error) {
+    releaseRenderer(renderer);
+    throw error;
+  }
+}
+
+function assembleKit(container: HTMLElement, renderer: THREE.WebGLRenderer, floors: number): SceneKit {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xbcd4ea);
   scene.fog = new THREE.Fog(0xbcd4ea, 22, 55);
@@ -69,7 +88,6 @@ export function createSceneKit(container: HTMLElement, floors: number): SceneKit
 
   const camera = new THREE.PerspectiveCamera(FOV, container.clientWidth / Math.max(container.clientHeight, 1), 0.1, 120);
   camera.position.copy(CAMERA_START);
-  const renderer = createRenderer(container);
   const controls = createControls(camera, renderer.domElement);
 
   function resize() {
@@ -101,9 +119,7 @@ export function createSceneKit(container: HTMLElement, floors: number): SceneKit
       disposeObject(scene);
       materials.dispose();
       avatarAssets.dispose();
-      renderer.dispose();
-      renderer.forceContextLoss();
-      renderer.domElement.remove();
+      releaseRenderer(renderer);
     },
   };
 }

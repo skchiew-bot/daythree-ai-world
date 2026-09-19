@@ -1,4 +1,5 @@
 import {
+  clampRoomIndex,
   CORRIDOR_END_X,
   CORRIDOR_LANE_Z,
   LOBBY_SPOT_XS,
@@ -44,7 +45,7 @@ const routeCache = new Map<string, Route>();
 function destinationPoints(dest: Destination): Vec2[] {
   const x =
     dest.kind === "lobby"
-      ? LOBBY_SPOT_XS[dest.spot % LOBBY_SPOT_XS.length]
+      ? LOBBY_SPOT_XS[((dest.spot % LOBBY_SPOT_XS.length) + LOBBY_SPOT_XS.length) % LOBBY_SPOT_XS.length]
       : dest.kind === "strollLeft"
         ? -CORRIDOR_END_X
         : CORRIDOR_END_X;
@@ -60,11 +61,12 @@ export function destinationKey(dest: Destination): string {
 }
 
 export function buildRoute(roomIndex: number, dest: Destination): Route {
-  const key = `${roomIndex}|${destinationKey(dest)}`;
+  const room = clampRoomIndex(roomIndex);
+  const key = `${room}|${destinationKey(dest)}`;
   const cached = routeCache.get(key);
   if (cached) return cached;
 
-  const anchors = roomAnchors(1, roomIndex);
+  const anchors = roomAnchors(1, room);
   const doorLane = { x: anchors.door.x, z: CORRIDOR_LANE_Z };
   const points: Vec2[] = [anchors.desk, anchors.idle, anchors.door, doorLane].map((p) => ({ x: p.x, z: p.z }));
   for (const next of destinationPoints(dest)) {

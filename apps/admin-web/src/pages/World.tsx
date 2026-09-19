@@ -3,18 +3,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useAgentRooms, useExternalAgentStatuses, useMissionTimeline, useMissions } from "@/api/hooks";
 import { deriveExternalAgentState, deriveRoomAgentState, pickFocusMission, type AgentState } from "@/world/agentState";
 import { toWorldAgents } from "@/world/renderPayload";
+import { describeScene } from "@/world/sceneLabel";
 import { WorldCanvas } from "@/world/WorldCanvas";
+import { WorldErrorBoundary } from "@/world/WorldErrorBoundary";
 
 const FALLBACK_FLOOR_COUNT = 5;
-
-function describeScene(agents: { activity: string }[], externalCount: number): string {
-  const count = (activity: string) => agents.filter((a) => a.activity === activity).length;
-  return (
-    `3D view of the agent apartment: ${agents.length} governed agents ` +
-    `(${count("idle")} idle, ${count("assigned")} assigned, ${count("working")} working), ` +
-    `plus ${externalCount} external agents in the front row.`
-  );
-}
 
 export function World() {
   const { data: missions } = useMissions();
@@ -72,15 +65,17 @@ export function World() {
         <code>PUT /api/v1/external-agents/&#123;name&#125;/status</code>.
       </p>
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-        <WorldCanvas
-          agents={worldAgents}
-          agentStates={agentStates}
-          floors={floors}
-          externalNames={externalNames}
-          externalStates={externalStates}
-          label={describeScene(worldAgents, externalList.length)}
-          describedBy="world-room-occupancy"
-        />
+        <WorldErrorBoundary>
+          <WorldCanvas
+            agents={worldAgents}
+            agentStates={agentStates}
+            floors={floors}
+            externalNames={externalNames}
+            externalStates={externalStates}
+            label={describeScene(worldAgents, externalList.length)}
+            describedBy="world-room-occupancy"
+          />
+        </WorldErrorBoundary>
       </div>
       <div className="card" style={{ marginTop: "1rem" }}>
         <strong>Focus mission</strong>{" "}

@@ -145,6 +145,7 @@ export function buildAvatar(scene: THREE.Scene, assets: AvatarAssets, colorSeed:
   const ringMaterial = new THREE.MeshBasicMaterial({ color: 0x4ade80, transparent: true, opacity: 0, side: THREE.DoubleSide });
   const resultRing = new THREE.Mesh(assets.ring, ringMaterial);
   resultRing.rotation.x = -Math.PI / 2;
+  resultRing.visible = false;
   scene.add(resultRing);
 
   return {
@@ -201,6 +202,8 @@ function updateStatus(handle: AvatarHandle, anim: AvatarAnimState, state: AgentS
   anim.lastState = state;
 
   const showRing = state === "completed" || state === "failed";
+  // Hidden rather than drawn at opacity 0, so idle and working avatars cost no ring draw.
+  resultRing.visible = showRing;
   if (!showRing) {
     ringMaterial.opacity = 0;
     return;
