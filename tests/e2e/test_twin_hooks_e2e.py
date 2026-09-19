@@ -202,7 +202,7 @@ def _assert_ids_timestamps_and_enums(value, path="payload") -> None:
         for index, item in enumerate(value):
             _assert_ids_timestamps_and_enums(item, f"{path}[{index}]")
     elif isinstance(value, str):
-        if _UUID.match(value) or re.match(r"^[a-z_]+(\.[a-z_]+)*$", value):
+        if _UUID.match(value) or re.match(r"^[a-z_]+(\.[a-z_]+)*$", value) or re.match(r"^\d+\.\d+$", value):  # enums, ids, schema versions
             return
         try:
             dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
