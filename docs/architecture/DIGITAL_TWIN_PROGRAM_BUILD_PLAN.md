@@ -44,7 +44,8 @@ operator has merged.
 | R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
 | W1 | 3D world: detail and idle movement (ADR-013) | nothing | merged 2026-09-19 (#23) |
 | P1 | Projects entity and world read (ADR-014) | R0 (migration parent) | R0 merged |
-| W2 | Town layout: buildings, hall, roads, commuting (ADR-014) | P1 | P1 merged, operator answers O15..O17 |
+| W2 | Town layout: buildings, hall, roads, commuting (ADR-014) | P1 | merged 2026-09-19 (#29) |
+| W3 | Explore the town: walk, follow a twin, minimap (ADR-014) | W2 | now |
 | L1 | Contribution ledger: accept/reject, mint, upkeep | Gate E | operator opens Gate E |
 | L2 | Materials and workshop (spend, 3D render) | L1 | L1 merged |
 | X1 | Twin merge / succession (ADR-012) | L1 | L1 merged, operator answers O6..O9 |
@@ -526,6 +527,97 @@ canvas.
 
 **Handoff prompt:** as T1, phase W2, branch `feat/world-w2-town`, read ADR-014 decisions 4 and 5
 and D13..D15 first; frontend only; rebuild the `admin-web` image to verify.
+
+---
+
+## W3. Explore the town: walk, follow a twin, minimap (ADR-014)
+
+Operator request (2026-09-19): "I want to be able to explore the town rather than just spinning and
+zooming in using the mouse." Operator agreed to walk mode, follow-a-twin and a minimap. Gate-reviewed
+before build: guardian-gatekeeper **PASS WITH CONDITIONS** (W3-F1..F8, C1..C9) and guardian-data-warden
+**PASS WITH CONDITIONS** (D19..D22), both recorded in `docs/council/LEDGER.md`. Frontend only; no
+backend or payload change.
+
+**Goal.** The operator can walk through the town with the keyboard, ride along behind any twin, and
+navigate with a minimap, without the existing overview, click-to-focus, wandering or commuting changing.
+
+**Deliverables** (all under `apps/admin-web/src/`):
+
+1. **Explore region and modes.** A focusable explore element (`tabIndex=0`, `role="application"`,
+   labelled "Town explorer: WASD or arrows to walk, Shift to run, drag to turn, Esc to return to
+   overview"), separate from the `role="img"` canvas node; overlays and the minimap live outside the
+   `role="img"` node (W3-F5). Three modes: `fly` (the existing OrbitControls overview and
+   click-to-focus), `walk`, `follow`. Mode buttons in the UI; Esc from walk or follow returns to fly.
+2. **One camera owner per frame** (W3-F2). Only `fly` calls `rig.update` and `controls.update`.
+   Entering walk or follow cancels any rig ease and sets `controls.enabled = false`; returning to fly
+   sets `controls.target` first, then re-enables.
+3. **Walk mode.** A client-only operator avatar built from the existing avatar primitives with a
+   constant seed `"operator"`, no label, and nothing from the signed-in user (D20, C5); it is not a
+   governed agent and appears in no payload. WASD/arrows move, Shift runs, drag on the explore element
+   turns (`setPointerCapture`, released on `pointerup`/`pointercancel`); NO pointer lock (C3).
+   Frame-rate independent. Spring-arm third-person camera that pulls in to avoid clipping walls.
+   Collision against axis-aligned footprints from a pure `footprints(projects, lots)` function (lots
+   from `buildingSpec(id, lot)` plus `allLotSlots()[i].center`, the hall from
+   `HALL_CENTER/HALL_WIDTH/HALL_DEPTH`, the residence from `layout.ts`), computed only when the
+   project-set signature changes (W3-F7), clamped to the town bounds. After each town sync, if the
+   operator stands inside a footprint (a freed lot was filled by a shifted project), push them out to
+   the nearest free edge (W3-F6).
+4. **Proximity card.** Within about 3 m of a building's door, an HTML card (outside the canvas) shows
+   the project `code` and `status`, and the `display_name` plus `activity` of twins placed there. Code
+   and status only, never `name` (D19). `WorldProject` is widened to `{id, code, status}` for this,
+   built field by field in `toWorldProject` with the branded-type test updated; the data-warden
+   approved `status` (active/archived, non-sensitive) in D19, resolving gate finding W3-F1.
+5. **Follow a twin.** Pick a twin in the scene or the sidebar; the camera rides behind it. Twin pick
+   proxies use an `agent:` key prefix so they never collide with project ids, `"hall"` or
+   `"residence"` (W3-F4). `TownAvatars` gains a read-only `poseOf(agentId, out): boolean` filling a
+   caller-owned buffer; when it returns false or the twin is at the residence, follow ends or cuts to
+   the residence view, never reading a disposed handle (W3-F3). A small HTML panel shows the twin's
+   `display_name`, `activity` and the `code` of its current place only (D19).
+6. **Picking by mode** (W3-F4). Building picks apply only in fly mode; in walk and follow modes a
+   click selects a twin to follow; a click at the end of a drag never triggers `rig.focus`.
+7. **Minimap.** A small top-down 2D canvas in a corner: roads and buildings as geometry with no labels,
+   twins as dots, the operator as an arrow with heading (D21). The static layer is drawn once per
+   project-set signature on an offscreen canvas; dynamic dots redraw at 10 Hz or less (C6). A hover
+   tooltip, if any, shows twin `display_name` and `activity` only (D21). Click teleports in walk mode
+   and focuses in fly mode. A text alternative lists building codes, the twin count and the operator's
+   current street (C8).
+8. **Keyboard scoping** (C1, C2, W3-F8). The ONLY key listener is on the explore element: no `window`
+   or `document` listeners; `preventDefault` only for handled keys while it has focus; held keys are
+   cleared on `blur`, `visibilitychange`, mode switch and dispose. Listeners are attached inside
+   `runWorld` and removed in its dispose (StrictMode mounts twice).
+9. **Reduced motion** (C7): follow and teleport use camera cuts; walking stays allowed because the user
+   drives it; W1/W2 behaviour under reduced motion is unchanged.
+10. **Performance** (C6): no per-frame allocations (scratch vectors and poses allocated once); the
+    operator avatar adds 12 draw calls or fewer; 60 fps budget unchanged.
+11. **No persistence**: nothing is written to `localStorage` or `sessionStorage` in W3 (the gatekeeper
+    excluded it; the stricter of the two reviews applies).
+
+**Tests** (vitest; pure modules without three.js where possible; RED first where testable):
+1. Typing in a page input (Login, Projects) moves nothing; keys act only while the explore element has
+   focus.
+2. Holding W then blurring the window (and a `visibilitychange`) stops the avatar.
+3. A StrictMode remount leaves exactly one listener set (count listeners).
+4. In walk mode the camera position after a frame equals the spring-arm output (no orbit snap-back).
+5. A short click in walk mode does not call `rig.focus`; a drag-end click never does.
+6. A followed twin that reaches home or leaves the payload ends follow without error.
+7. A lot shift while the operator stands on a freed lot moves them outside all footprints.
+8. The proximity card, follow panel and minimap render no project `name`: a fixture with a sentinel
+   string in `ProjectSummary.name` never appears in their output; `WorldProject` key set is exactly
+   `{id, code, status}` and a raw `ProjectSummary` fails to compile.
+9. The operator avatar receives no auth/session field (type-level and a render-props assertion).
+10. Footprints and the minimap static layer rebuild only when the project-set signature changes.
+11. Collision: the avatar cannot enter any footprint and stays inside the town bounds; movement is
+    frame-rate independent.
+12. `commute.test`, `townAvatars.test`, `lots.test` and every other existing test pass unmodified.
+
+**Exit.** The operator walks the town, gets a card at each building, follows a twin through a commute,
+and navigates by minimap, all by keyboard; fly overview and click-to-focus work exactly as before.
+
+**Out of W3:** building interiors, other operators' presence, sound, server-side or local persistence of
+position, pointer lock.
+
+**Handoff prompt:** as T1, phase W3, branch `feat/world-w3-explore`; read this section first and treat
+W3-F1..F8, C1..C9 and D19..D22 as the acceptance list; frontend only; CI is authoritative.
 
 ---
 
