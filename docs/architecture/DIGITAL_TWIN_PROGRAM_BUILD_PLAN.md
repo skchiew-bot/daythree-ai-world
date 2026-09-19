@@ -41,11 +41,17 @@ operator has merged.
 | T3 | Twins: hook wiring for a 5-persona roster (ADR-010 C) | T2 | T2 merged |
 | T4 | Twins in the 3D world (ADR-010 D) | T3 | T3 merged |
 | Gate E | Evidence gate | T3 running for two weeks | thresholds in O2 met |
+| R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
+| W1 | 3D world: detail and idle movement (ADR-013) | nothing | now, independent of twins |
 | L1 | Contribution ledger: accept/reject, mint, upkeep | Gate E | operator opens Gate E |
 | L2 | Materials and workshop (spend, 3D render) | L1 | L1 merged |
 | X1 | Twin merge / succession (ADR-012) | L1 | L1 merged, operator answers O6..O9 |
+| R1 | R&D metering and visibility (ADR-013) | R0 + L1 | both merged |
+| R2 | R&D allowances as reservations (ADR-013) | R1 | R1 merged, operator answers O11..O13 |
+| R3 | R&D proposals, human start, knowledge notes (ADR-013) | R2 | R2 merged |
 | C1 | Council: reports and proposals | L1 | L1 merged |
-| M1 | Operator model: reviews, profile docs, knowledge_read | L1 | L1 merged |
+| M1 | Operator model: reviews, profile docs, context injection | L1 + R3 | both merged (ADR-013 F6 amendment) |
+| R4 | Bounded standing authorization for R&D (ADR-013) | R3 + C1 | R3 has closed 10 missions |
 | A1 | Autonomy graduation proposals | C1 + M1 | both merged |
 
 T1 to T4 are the ADR-010 phases with the corrections from ADR-011's gate review applied; where this
@@ -285,13 +291,163 @@ for a body naming only a proposal reference; 403 for `agent_runtime`; duplicate 
 same idempotency key returns the first result, without it the second is 409; chained merge A+B→C
 then C+D→E gives `balance(E)` equal to the sum over A, B, C, D, E to the cent; concurrent purchase
 against predecessor and successor lets exactly one succeed; `rationale` never appears in
-`audit_events.payload`; `downgrade()` from `0007` lists agents left in `merged`.
+`audit_events.payload`; `downgrade()` from `0007` lists agents left in `merged`. Receipt (ADR-012
+decision 9): the response carries `merge_id`, ids, balances before and after, rooms released and
+event ids; a forced conservation mismatch rolls the whole merge back; the receipt is reproducible
+from `agent_merges`, the ledger and `audit_events` alone.
 
 **Exit criteria.** ADR-012 conditions M1 to M10 each have a named test; typecheck and build green;
 the completion report's twin section states that successor balances include lineage.
 
 **Handoff prompt:** as T1, phase X1, branch `feat/twins-x1-merge`, read `docs/adr/ADR-012-twin-merge.md`
 first and treat its "Gate Review Outcome" findings as the acceptance list.
+
+---
+
+## R0. Budget enforcement fix (ADR-013, Phase 0 defect)
+
+**Goal.** The per-task `BudgetPolicy` enforces what it says. Today only `max_output_tokens` can fire.
+
+**Deliverables.** `DurableAgentRuntimeAdapter` builds a real `BudgetUsage` from committed
+`model_invocations` for the task plus checkpoint history before every call
+(`durable_adapter.py:128` currently passes `BudgetUsage()`). `ModelGateway.generate` re-runs
+`evaluate_budget` inside the attempt loop with `is_retry=True` and counts a timeout as a billed call
+(`gateway.py:59` vs `72-103`). Every failed or timed-out attempt writes a `model_invocations` row
+with `status=failed` and the best available cost. `estimate_cost_usd` raises on an unpriced
+`(provider, model)`; `_DEFAULT_PRICE` is removed. Index `model_invocations(tenant_id, agent_id,
+created_at)` via the ADR-009 migration pattern (`0008` is reserved for ADR-013's tables; the index
+may ship in `0008` or its own `0007b` if R0 lands first, the builder decides and records it). Worker
+task lease or ownership check so a restarted second worker cannot requeue a task another worker is
+executing (`worker/main.py:26-35`, `queue.py`). Price-table entries in `telemetry.py` are verified
+against the provider's current public pricing page on the day R0 is built, with source URL and date
+in a comment. The operator's provider is OpenAI (ADR-013 O13), so `gpt-4o-mini` and `gpt-4o` are
+checked first, and the builder confirms that `openai_provider.py:31` (`max_tokens`) is accepted by
+every model the operator will use, switching to `max_completion_tokens` where a model requires it.
+
+**Tests.** A task with `max_model_calls=1` and a provider that times out twice makes exactly one
+provider call; `max_model_cost_usd` trips on the second call once the first's cost is committed;
+repair execute counts against the same budget; unpriced model raises; failed attempts appear in
+`model_invocations`; two workers and one running task produce one provider call. Existing unit and
+integration suites stay green.
+
+**Exit.** Completion report's budget section corrected to say what was enforced before and after.
+No real provider key is set in `.env` until this phase is merged.
+
+**Handoff prompt:** as T1, phase R0, branch `fix/budget-enforcement-r0`, read ADR-013 "Context"
+first; this is a defect fix, keep diffs minimal and do not touch twin code.
+
+---
+
+## W1. 3D world: detail and idle movement (ADR-013)
+
+**Goal.** Idle twins visibly live in the world; the world looks intentional rather than boxed. No new
+backend data.
+
+**Deliverables.** An idle behaviour state machine in `apps/admin-web/src/world/` (in room, leave,
+corridor walk, lobby dwell, return; seeded per `agent_id` so movement is deterministic across
+clients), driven only by `activity` and room from `useAgentRooms`; walking resumes to the room and
+snaps on reassignment (ADR-009 behaviour kept). Avatar walk cycle and facing. Lighting (ambient plus
+one key light with shadows), materials (procedural or small embedded textures, no external asset
+CDN), furniture meshes per room, corridor and lobby geometry in `apartment.ts`, day/night tint from
+the local clock. Render payload built from an allow-list (`agent_id`, `display_name`, `activity`,
+`floor`, `room_index`); nothing else from the API reaches the scene (data-warden D11).
+`prefers-reduced-motion` disables wandering. Performance budget: 60 fps at 25 agents on the
+operator's machine, poll interval unchanged at 3 s.
+
+**Tests.** Allow-list field-set test on the render payload builder; state-machine unit tests
+(idle wanders, assigned walks home, working stays home, reassignment snaps); `typecheck` and
+`build`; screenshots at 375, 768, 1024 and 1440 attached to the PR (ecc web testing rule).
+
+**Exit.** Operator sees idle agents moving in a lit, furnished building; no text beyond display
+names appears on avatars or tooltips.
+
+**Handoff prompt:** as T1, phase W1, branch `feat/world-w1-life`, read ADR-013 decision 6 and D11
+first; frontend only; rebuild the `admin-web` image to verify (no bind mount).
+
+---
+
+## R1. R&D metering and visibility (ADR-013)
+
+**Goal.** The operator sees what each twin costs before granting any allowance.
+
+**Deliverables.** Per-twin spend for the current period from `model_invocations` (after R0), a
+`purpose` discriminator (`task` | `rd`) on new rows via the `0008` side table
+`twin_rd_invocations(invocation_id, mission_id, purpose)`, admin UI panel and room label. For
+`external_manual` twins the figure is the declared flat fee (ADR-011 part 2) labeled "declared, not
+measured", side by side with measured figures. Review-latency metric (time from artifact commit to
+operator accept/reject) added to the Gate E dashboard.
+
+**Tests.** Period sum matches committed rows to the cent; declared and measured never mix in one
+number; label present in API and UI. Live smoke test, run by the operator locally with the key in
+`.env` (never pasted anywhere): one real OpenAI call capped at a few cents, its recorded
+`estimated_cost` compared with OpenAI's own usage dashboard, the difference noted in the PR.
+
+**Handoff prompt:** as T1, phase R1, branch `feat/rd-r1-metering`.
+
+---
+
+## R2. R&D allowances as reservations (ADR-013)
+
+**Goal.** A twin's credits unlock a share of an operator-set ceiling; spend can never exceed it.
+
+**Deliverables.** Migration `0008_twin_rd`: `twin_rd_allowances(tenant_id, agent_id nullable,
+period_start, ceiling_usd, bands JSONB, created_by)`, `twin_rd_anchors(tenant_id, agent_id, period,
+reserved_usd, spent_usd)` (the locked row), `twin_rd_proposals` (used in R3). Step function
+`available_draw(credits) -> share of ceiling` from versioned bands (O12); a unit test asserts the
+function is a step function (fewer than 5 distinct outputs over the input range) so it cannot express
+a price. Reservation before every R&D call: `SELECT ... FOR UPDATE` on the anchor, debit
+`max_model_cost_usd`, true up after the call, fail closed. Credits are never debited.
+
+**Tests.** Concurrent R&D calls against one allowance serialize and the sum never exceeds the
+ceiling; a reservation that exceeds remaining allowance is rejected before the provider is called;
+true-up never goes negative; zero ceiling blocks the next reservation.
+
+**Handoff prompt:** as T1, phase R2, branch `feat/rd-r2-reservations`, gate findings F4 and the
+ADR-011 F4 pattern are the acceptance list.
+
+---
+
+## R3. R&D proposals, human start, knowledge notes (ADR-013)
+
+**Goal.** A twin proposes; a human starts; the worker runs it under the allowance; what it learned
+persists and only it can read it.
+
+**Deliverables.** `POST /api/v1/twins/{agent_id}/rd-proposals` (any principal acting as the twin,
+including the `agent_runtime` credential once ADR-010 adds it) writes a `draft` proposal row.
+`POST .../rd-proposals/{id}/start` behind `MUTATORS` creates a mission assigned to a
+`custom_durable` version of the same persona with `BudgetPolicy.max_model_cost_usd` bounded by the
+remaining allowance and `risk_level=low`; `external_manual` versions are refused. `ArtifactType.
+knowledge_note`. At mission creation the platform queries `artifacts` with
+`artifact_type='knowledge_note' AND agent_id=:agent AND tenant_id=:tenant` and injects the notes
+into `task.input_context` under a `knowledge` key (data-warden D6); `knowledge_read` is unchanged.
+Provider data-handling terms named in `docs/operator/PROVIDER_TERMS.md` before the first non-mock
+R&D mission (D8). `runtime_checkpoints` stays off every read path (D9).
+
+**Tests.** A second agent's notes are absent from the first agent's context; an `external_manual`
+version cannot start R&D; proposal start requires a human role; the mission's budget never exceeds
+remaining allowance; note content never appears in `audit_events.payload`.
+
+**Handoff prompt:** as T1, phase R3, branch `feat/rd-r3-proposals`; gate findings F6, F7, F8 and
+warden D6..D10 are the acceptance list.
+
+---
+
+## R4. Bounded standing authorization (ADR-013)
+
+**Goal.** "On their own accord", with recorded human approval granted ahead of time.
+
+**Deliverables.** `twin_rd_authorizations(tenant_id, agent_id, max_missions, max_usd, expires_at,
+revoked_at, signed_by)`; an `audit_events` row `rd.authorization_granted` / `revoked`; the worker
+starts `draft` proposals against an active authorization without a per-mission click, decrementing
+its counters inside the anchor lock. Kill switch: Redis flag `rd:halt:{tenant_id}` checked between
+dequeue and execute and before every provider attempt; zeroing a ceiling also sets the flag.
+
+**Tests.** Expired or revoked authorization starts nothing; counters never exceed limits under
+concurrency; the halt flag stops the next attempt of an in-flight mission; every grant and
+revocation is in `audit_events`.
+
+**Handoff prompt:** as T1, phase R4, branch `feat/rd-r4-authorization`; starts only after R3 has
+closed 10 real R&D missions and the operator has reviewed their notes.
 
 ---
 
