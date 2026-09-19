@@ -192,6 +192,13 @@ async def _register_subagent(
     )
     if parent is None or parent.mission_id is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent session is not registered.")
+    # T3-F2 (operator-approved): a NEW subagent under a session that already ended would
+    # create a Task under a completed Mission, which the reaper then counts as a lost
+    # hook. Refused before any write (no persona row, no Task). The idempotent-replay
+    # early return above is deliberately untouched, so a retried registration of a ref
+    # that already exists still returns its stored row.
+    if parent.ended_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="parent_session_ended")
     parent_id = parent.id
     parent_mission_id = parent.mission_id
 
