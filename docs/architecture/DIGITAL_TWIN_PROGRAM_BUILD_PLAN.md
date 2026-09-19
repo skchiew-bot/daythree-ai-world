@@ -44,7 +44,8 @@ operator has merged.
 | R0 | Budget enforcement fix (ADR-013, Phase 0 defect) | nothing | now, recommended before T1 |
 | W1 | 3D world: detail and idle movement (ADR-013) | nothing | merged 2026-09-19 (#23) |
 | P1 | Projects entity and world read (ADR-014) | R0 (migration parent) | R0 merged |
-| W2 | Town layout: buildings, hall, roads, commuting (ADR-014) | P1 | P1 merged, operator answers O15..O17 |
+| W2 | Town layout: buildings, hall, roads, commuting (ADR-014) | P1 | merged 2026-09-19 (#29) |
+| W3 | Explore the town: walk, follow a twin, minimap (ADR-014) | W2 | now |
 | L1 | Contribution ledger: accept/reject, mint, upkeep | Gate E | operator opens Gate E |
 | L2 | Materials and workshop (spend, 3D render) | L1 | L1 merged |
 | X1 | Twin merge / succession (ADR-012) | L1 | L1 merged, operator answers O6..O9 |
@@ -64,56 +65,142 @@ is now).
 
 ## T1. Twins: identity and registration
 
+Gate-reviewed against main at `b03db74` on 2026-09-19 (guardian-gatekeeper): **BLOCK + ALTERNATIVE**,
+findings T1-F1 to T1-F16, all folded in below; recorded in `docs/council/LEDGER.md`. Where this
+section and ADR-010 disagree, this section wins.
+
 **Goal.** A scoped credential can register a session and a subagent spawn as governed objects, and
 every persona in the roster exists as a governed `agents` row with the right autonomy and tool
-policy, without the hook ever being able to elevate itself.
+policy, without the hook ever being able to elevate itself, reach any other route, or make the
+platform's own worker touch a twin task.
 
 **Deliverables.**
 
-- Migration `0004_agent_runtime_sessions` (`down_revision = "0003b_model_invocations_index"`, the
-  R0 index migration that sits between 0003 and 0004):
-  `agent_runtime_sessions` (tenant-scoped, FK `agents.id`, nullable FK `tasks.id`,
-  `external_session_ref`, `external_instance_ref`, `kind` session|subagent, `started_at`,
-  `last_heartbeat_at`, `ended_at`, `outcome`), `agent_runtime_persona_slots(tenant_id, slot)`
-  with a unique index (the atomic cap, ADR-010 B4), `agent_runtime_api_keys(user_id, key_hash,
-  revoked_at)`.
-- A service `User` row per tenant with role `agent_runtime` and an unusable password hash; a
-  dependency that resolves a bearer API key (sha256 compared) to that user so `require_role` and
-  tenant scoping work unchanged. The secret is printed once by a seed/issue script and never
-  logged.
-- `POST /api/v1/agent-runtime/sessions` (kind=session: idempotent on `external_session_ref`,
-  creates a Mission with `mission_code = session uuid`, `source="agent_runtime"`; kind=subagent:
-  resolves the persona from a server-side registry, creates the `agents` row and `AgentVersion`
-  on first sight with `runtime_adapter="external_manual"` and a tenant-scoped `model_policy_id`,
-  takes a persona slot, creates the Task `queued`, emits `task.created`/`task.assigned`, calls
-  ADR-009 `ensure_assignment` inside the existing exception-contained wrapper).
-- `PATCH /api/v1/agent-runtime/sessions/{id}` for heartbeat and `ended`.
-- Persona registry: `services/api/persona_registry.py` mapping agent type name to display name,
-  autonomy level and tool policy; unknown names bucket to `AGT-CC-GENERAL`; the initial roster
-  (O1) is an allow-list, everything else is opt-in.
-- Mission Control hides Start/Cancel for `source="agent_runtime"` missions (ADR-010 C4).
-- **Gate condition C7 (partial):** narrow `agent_runtime`'s read scope. Introduce a
-  `require_not_role(UserRole.agent_runtime)` guard (or an explicit reader-role set) on
-  `artifacts.download_artifact` and `tasks.get_task`; the runtime credential may read only its own
-  session and task rows.
+1. **Migration `0004_agent_runtime_sessions`**, `down_revision = "0003c_projects"` (the real head;
+   record it in the docstring as `0003c` does, and re-point if another migration merges first).
+   NEW tables only; no column on any existing table (`create_all(checkfirst=True)` cannot add one,
+   tests build schema from models, CI upgrades an empty DB). Explicit per-index sweep after
+   `create_all`; `downgrade()` drops only these three tables.
+   - `agent_runtime_sessions(id, tenant_id, kind session|subagent, agent_id nullable FK agents,
+     mission_id nullable FK missions, task_id nullable FK tasks, external_session_ref,
+     external_instance_ref nullable, parent_session_id nullable, started_at, last_heartbeat_at,
+     ended_at, outcome)` with partial unique indexes `(tenant_id, external_session_ref) WHERE
+     kind='session'` and `(tenant_id, external_instance_ref) WHERE kind='subagent'`. This table is the
+     discriminator for "is this an agent-runtime mission" (an EXISTS against it); there is no
+     `source` column on `missions` and none is added (T1-F2).
+   - `agent_runtime_persona_slots(id, tenant_id, slot, agent_code)` with `UNIQUE(tenant_id, slot)` and
+     `UNIQUE(tenant_id, agent_code)`; the slot is claimed before the persona insert; cap 25 (T1-F14).
+   - `agent_runtime_api_keys(id, user_id, key_hash unique, label, created_at, expires_at, revoked_at)`.
+2. **Credential.** `UserRole.agent_runtime`. One service `User` per tenant: email
+   `agent-runtime+{tenant_code}@daythree.local` (per-tenant unique), `password_hash` a real bcrypt hash
+   of discarded random bytes (never a literal like "!": `verify_password` would raise and 500 the public
+   login route), status active (T1-F8). API key wire format `dtk_<key_id>_<secret>`, secret
+   `secrets.token_urlsafe(32)` (256 bits: the only condition under which unsalted sha256 at rest is
+   acceptable; say so in the docstring); the resolver looks the row up by `key_id` and compares the
+   digest with `hmac.compare_digest`; it rejects revoked, expired, non-active user and non-active
+   tenant; revocation is immediate (no cache); rotation is issue-new then revoke-old; the secret is
+   printed once to stdout by an issue script, never passed to structlog, and the script refuses a
+   non-local `DATABASE_URL` without an explicit flag (T1-F15). A SEPARATE dependency
+   `get_agent_runtime_principal` serves the new router only; `get_current_user`, `require_role` and the
+   JWT path are not modified (T1-F4).
+3. **Default-deny for the credential** (T1-F3). A `forbid_agent_runtime` dependency added at every
+   `api_router.include_router(...)` in `services/api/routes/__init__.py` except `health`, `auth` and the
+   new agent-runtime router, so any route added later inherits the refusal. This explicitly covers
+   `audit.mission_timeline` (whole `audit_events` rows), `artifacts`, `tasks`, `missions`, `agents`,
+   `agent_rooms`, `projects`, `model_policies`, `dashboard`, `model_invocations`, `external_agents`,
+   `tenant`.
+4. **Routes** `POST /api/v1/agent-runtime/sessions` and `PATCH /api/v1/agent-runtime/sessions/{id}`
+   (heartbeat, `ended`). The request schema is `extra="forbid"` with exactly `kind`, `agent_type`,
+   `external_session_ref`, `external_instance_ref`, `parent_external_session_ref` (T1-F13): no prompt,
+   cwd, description, reason, autonomy, tool policy, model policy or agent code is accepted.
+   - kind=session: idempotent on `external_session_ref`; creates a Mission with `mission_code` = the
+     session uuid, `title = "Claude Code session {uuid}"`, `assigned_agent_id` = `AGT-CLAUDE-CODE`, and
+     drives it `draft -> ready -> running` (`transitions.py` forbids `draft -> running`).
+   - kind=subagent: resolve the persona from the registry by EXACT allow-list key; unknown names bucket
+     to `AGT-CC-GENERAL`; `agent_code` values are constants in the registry and never formatted from hook
+     input (T1-F10); a persona that is `suspended` (or, later, `merged`) is a 409, never reactivated. On
+     first sight create the `agents` row and `AgentVersion` (`runtime_adapter="external_manual"`,
+     autonomy level and tool policy from the registry only) with `model_policy_id` resolved READ-ONLY by
+     `(tenant_id, name="claude-code-external")`; absent is a 409 telling the operator to run the
+     issue/seed script; the route never creates a `ModelPolicy` (T1-F11). Claim a persona slot; cap
+     exhaustion is a 409 with a stable error code and NEVER falls back to `AGT-CC-GENERAL` (T1-F14).
+     Create the Task `queued` with `idempotency_key = f"{mission_id}:ar:{external_instance_ref}"`
+     (`start_mission` owns `{mission_id}:task:1`), `title` = registry display name plus instance ref,
+     `instructions` a fixed constant. Emit `task.created` / `task.assigned` with ids and enumerated
+     values only.
+   - Every insert runs inside `begin_nested()`; on `IntegrityError` do `await session.rollback()`, re-run
+     the handler ONCE, and if the row is still missing re-raise (asyncpg gotcha, see
+     `room_assignment.py` lines ~97-109; `Session.rollback()` discards the outer transaction, so
+     continuing mid-transaction is unsafe) (T1-F12).
+   - Do NOT call `ensure_assignment` inside the registration transaction: its `IntegrityError` branch
+     calls `session.rollback()`, which would discard the whole registration (T1-F6). The world read
+     already backfills rooms lazily.
+   - Fixed-window Redis rate limit per tenant and per key id on both routes (the
+     `external_agents.py` pattern); the 61st call in a window is a 429 that creates no rows; size the
+     heartbeat limit for the T3 hook cadence (T1-F9).
+5. **Mission guards** (T1-F5). `start_mission_route` and `cancel_mission` return 409 for a mission that
+   has an `agent_runtime_sessions` row; `MissionResponse` gains a derived `is_agent_runtime` boolean and
+   Mission Control hides Start/Cancel for it (cosmetic on top of the real refusal).
+6. **Worker guards** (T1-F7). Exclude tasks whose assigned agent's active version is not
+   `custom_durable` from `requeue_orphaned_running_tasks` (`services/worker/main.py`) and from R0's
+   sweep; `retry_task` returns 409 for such tasks, mirroring `_load_external_task`.
+7. **Persona registry** `services/api/persona_registry.py`: initial roster (operator decision O1)
+   `planner`, `architect`, `code-reviewer`, `tdd-guide`, `security-reviewer` with constant codes
+   (`AGT-CC-PLANNER`, ...), display names, autonomy level and tool policy per ADR-010 (default A1 and
+   the most restrictive tool policy unless ADR-010 says otherwise); every other name is opt-in up to
+   the cap of 25, bucketing to `AGT-CC-GENERAL`.
+8. **Data exposure** (T1-F13, data-warden D1..D5). The storable-field list is exactly the request
+   schema; `audit_events.payload` and event `data` carry ids and enumerated values only; no free text
+   is stored. Data-warden sign-off is recorded in `docs/council/LEDGER.md` by the chair before merge.
 
-**Tests.** Cross-tenant isolation for every new route; idempotent replay of session and subagent
-registration; persona cap enforced under 10 concurrent first-sights (real Postgres); registration
-survives an `ensure_assignment` exception; `agent_runtime` gets 403 on accept-shaped and download
-routes; migration upgrade from `0003b` and from empty.
+**Tests** (the gatekeeper's acceptance list; RED first):
+1. `alembic upgrade head` from empty and from `0003c_projects` on a populated DB (rows in `missions`,
+   `tasks`, `agents`), then `downgrade -1` and `upgrade head`; `indexdef` assertions for all new indexes.
+2. Cross-tenant: tenant A's key registers a session; tenant B's key gets 404 on that session id.
+3. `agent_runtime` gets 403 on every route in `routes/__init__.py` except its own: table-driven over
+   the app's route list; explicit 403 on `GET /missions/{id}/timeline`, `/artifacts/{id}/download`,
+   `/tasks/{id}`, `/agents`, `/missions`.
+4. `POST /auth/login` with the service user's email returns 401, not 500, for a wrong and an empty
+   password; two tenants with service users do not make login raise.
+5. Idempotent replay: same `external_session_ref` twice yields one Mission and one session row; same
+   `external_instance_ref` twice yields one Task; 10 concurrent duplicates of each on real Postgres
+   yield one row.
+6. Cap: 10 concurrent first-sights of 10 distinct personas at slot 24 give exactly one success and nine
+   409s; never more than 25 slot rows.
+7. Registration survives an `ensure_assignment` failure and never calls it inside the transaction;
+   assert rows by re-query in a fresh session.
+8. `POST /missions/{id}/start` and `/cancel` return 409 for an agent-runtime mission; no Task created,
+   status unchanged.
+9. `POST /tasks/{id}/retry` returns 409 for an `external_manual` task; `requeue_orphaned_running_tasks`
+   returns 0 for a twin task forced to `running` with no lease.
+10. Persona resolution: `"000001"`, `"../"`, `"AGT-000001"`, 500 chars of unicode all bucket to
+    `AGT-CC-GENERAL` and never resolve onto Atlas or `AGT-CLAUDE-CODE`; a suspended persona is 409 and
+    stays suspended.
+11. Elevation: a body carrying `autonomy_level`, `tool_policy`, `model_policy_id` or `agent_code` is
+    422; the created `AgentVersion` matches the registry constants and is `external_manual`.
+12. Rate limit: the 61st call in a window is 429 and creates no rows.
+13. Exposure: the request model's field set equals the allow-list exactly; every `audit_events.payload`
+    the routes write serialises to ids, timestamps and enum values only (recursive check);
+    `missions.title` matches `^Claude Code session [0-9a-f-]{36}$`.
+14. API key: revoked and expired keys 401 immediately; a key for a disabled user or suspended tenant
+    401s; the secret never appears in captured logs.
 
-**Exit.** A scoped-key call creates a persona row, a Mission and a Task visible in `audit_events`,
-and the runtime credential cannot download artifacts.
+**Exit.** A scoped-key call creates a persona row, a Mission and a Task visible in `audit_events`; the
+runtime credential gets 403 everywhere else (proved by test 3); the worker never touches a twin task
+(test 9); the chair has recorded the data-warden sign-off. Note for later phases: `0005`..`0008` chain
+by `down_revision` string and each must be re-pointed at the real head at its own merge; CI has no
+migration round-trip step, so T1 ships its own migration test; at cap 25 the apartment overflows past
+the 5-floor default (harmless at 5 personas, a note for T4).
 
 **Handoff prompt (paste to a Sonnet 5 session in this repo):**
 
-> Implement Phase T1 of `docs/architecture/DIGITAL_TWIN_PROGRAM_BUILD_PLAN.md` exactly as written,
-> on a branch `feat/twins-t1-identity`. Read ADR-010 and ADR-011 first; where they disagree, the
-> build plan wins. Follow the repo's existing patterns: `get_db_session` commit-on-return (no
-> in-route commits), `get_tenant_scoped_or_404`, partial unique indexes as the concurrency
-> guarantee, `create_all(checkfirst=True)` plus an index sweep in the migration, tests against
-> testcontainers Postgres marked `integration`/`security`, and `pytest.mark.unit` on pure tests.
-> Never paste a secret into the chat or a tracked file. Open the PR with a test plan; do not merge.
+> Implement Phase T1 of `docs/architecture/DIGITAL_TWIN_PROGRAM_BUILD_PLAN.md` exactly as written, on a
+> branch `feat/twins-t1-identity`. Read ADR-010 and ADR-011 first; where they disagree, the build plan
+> wins. Follow the repo's existing patterns: `get_db_session` commit-on-return (no in-route commits),
+> `get_tenant_scoped_or_404`, partial unique indexes as the concurrency guarantee,
+> `create_all(checkfirst=True)` plus an index sweep in the migration, tests against testcontainers
+> Postgres marked `integration`/`security`, and `pytest.mark.unit` on pure tests. Never paste a secret
+> into the chat or a tracked file. Open the PR with a test plan; do not merge.
 
 ---
 
@@ -440,6 +527,97 @@ canvas.
 
 **Handoff prompt:** as T1, phase W2, branch `feat/world-w2-town`, read ADR-014 decisions 4 and 5
 and D13..D15 first; frontend only; rebuild the `admin-web` image to verify.
+
+---
+
+## W3. Explore the town: walk, follow a twin, minimap (ADR-014)
+
+Operator request (2026-09-19): "I want to be able to explore the town rather than just spinning and
+zooming in using the mouse." Operator agreed to walk mode, follow-a-twin and a minimap. Gate-reviewed
+before build: guardian-gatekeeper **PASS WITH CONDITIONS** (W3-F1..F8, C1..C9) and guardian-data-warden
+**PASS WITH CONDITIONS** (D19..D22), both recorded in `docs/council/LEDGER.md`. Frontend only; no
+backend or payload change.
+
+**Goal.** The operator can walk through the town with the keyboard, ride along behind any twin, and
+navigate with a minimap, without the existing overview, click-to-focus, wandering or commuting changing.
+
+**Deliverables** (all under `apps/admin-web/src/`):
+
+1. **Explore region and modes.** A focusable explore element (`tabIndex=0`, `role="application"`,
+   labelled "Town explorer: WASD or arrows to walk, Shift to run, drag to turn, Esc to return to
+   overview"), separate from the `role="img"` canvas node; overlays and the minimap live outside the
+   `role="img"` node (W3-F5). Three modes: `fly` (the existing OrbitControls overview and
+   click-to-focus), `walk`, `follow`. Mode buttons in the UI; Esc from walk or follow returns to fly.
+2. **One camera owner per frame** (W3-F2). Only `fly` calls `rig.update` and `controls.update`.
+   Entering walk or follow cancels any rig ease and sets `controls.enabled = false`; returning to fly
+   sets `controls.target` first, then re-enables.
+3. **Walk mode.** A client-only operator avatar built from the existing avatar primitives with a
+   constant seed `"operator"`, no label, and nothing from the signed-in user (D20, C5); it is not a
+   governed agent and appears in no payload. WASD/arrows move, Shift runs, drag on the explore element
+   turns (`setPointerCapture`, released on `pointerup`/`pointercancel`); NO pointer lock (C3).
+   Frame-rate independent. Spring-arm third-person camera that pulls in to avoid clipping walls.
+   Collision against axis-aligned footprints from a pure `footprints(projects, lots)` function (lots
+   from `buildingSpec(id, lot)` plus `allLotSlots()[i].center`, the hall from
+   `HALL_CENTER/HALL_WIDTH/HALL_DEPTH`, the residence from `layout.ts`), computed only when the
+   project-set signature changes (W3-F7), clamped to the town bounds. After each town sync, if the
+   operator stands inside a footprint (a freed lot was filled by a shifted project), push them out to
+   the nearest free edge (W3-F6).
+4. **Proximity card.** Within about 3 m of a building's door, an HTML card (outside the canvas) shows
+   the project `code` and `status`, and the `display_name` plus `activity` of twins placed there. Code
+   and status only, never `name` (D19). `WorldProject` is widened to `{id, code, status}` for this,
+   built field by field in `toWorldProject` with the branded-type test updated; the data-warden
+   approved `status` (active/archived, non-sensitive) in D19, resolving gate finding W3-F1.
+5. **Follow a twin.** Pick a twin in the scene or the sidebar; the camera rides behind it. Twin pick
+   proxies use an `agent:` key prefix so they never collide with project ids, `"hall"` or
+   `"residence"` (W3-F4). `TownAvatars` gains a read-only `poseOf(agentId, out): boolean` filling a
+   caller-owned buffer; when it returns false or the twin is at the residence, follow ends or cuts to
+   the residence view, never reading a disposed handle (W3-F3). A small HTML panel shows the twin's
+   `display_name`, `activity` and the `code` of its current place only (D19).
+6. **Picking by mode** (W3-F4). Building picks apply only in fly mode; in walk and follow modes a
+   click selects a twin to follow; a click at the end of a drag never triggers `rig.focus`.
+7. **Minimap.** A small top-down 2D canvas in a corner: roads and buildings as geometry with no labels,
+   twins as dots, the operator as an arrow with heading (D21). The static layer is drawn once per
+   project-set signature on an offscreen canvas; dynamic dots redraw at 10 Hz or less (C6). A hover
+   tooltip, if any, shows twin `display_name` and `activity` only (D21). Click teleports in walk mode
+   and focuses in fly mode. A text alternative lists building codes, the twin count and the operator's
+   current street (C8).
+8. **Keyboard scoping** (C1, C2, W3-F8). The ONLY key listener is on the explore element: no `window`
+   or `document` listeners; `preventDefault` only for handled keys while it has focus; held keys are
+   cleared on `blur`, `visibilitychange`, mode switch and dispose. Listeners are attached inside
+   `runWorld` and removed in its dispose (StrictMode mounts twice).
+9. **Reduced motion** (C7): follow and teleport use camera cuts; walking stays allowed because the user
+   drives it; W1/W2 behaviour under reduced motion is unchanged.
+10. **Performance** (C6): no per-frame allocations (scratch vectors and poses allocated once); the
+    operator avatar adds 12 draw calls or fewer; 60 fps budget unchanged.
+11. **No persistence**: nothing is written to `localStorage` or `sessionStorage` in W3 (the gatekeeper
+    excluded it; the stricter of the two reviews applies).
+
+**Tests** (vitest; pure modules without three.js where possible; RED first where testable):
+1. Typing in a page input (Login, Projects) moves nothing; keys act only while the explore element has
+   focus.
+2. Holding W then blurring the window (and a `visibilitychange`) stops the avatar.
+3. A StrictMode remount leaves exactly one listener set (count listeners).
+4. In walk mode the camera position after a frame equals the spring-arm output (no orbit snap-back).
+5. A short click in walk mode does not call `rig.focus`; a drag-end click never does.
+6. A followed twin that reaches home or leaves the payload ends follow without error.
+7. A lot shift while the operator stands on a freed lot moves them outside all footprints.
+8. The proximity card, follow panel and minimap render no project `name`: a fixture with a sentinel
+   string in `ProjectSummary.name` never appears in their output; `WorldProject` key set is exactly
+   `{id, code, status}` and a raw `ProjectSummary` fails to compile.
+9. The operator avatar receives no auth/session field (type-level and a render-props assertion).
+10. Footprints and the minimap static layer rebuild only when the project-set signature changes.
+11. Collision: the avatar cannot enter any footprint and stays inside the town bounds; movement is
+    frame-rate independent.
+12. `commute.test`, `townAvatars.test`, `lots.test` and every other existing test pass unmodified.
+
+**Exit.** The operator walks the town, gets a card at each building, follows a twin through a commute,
+and navigates by minimap, all by keyboard; fly overview and click-to-focus work exactly as before.
+
+**Out of W3:** building interiors, other operators' presence, sound, server-side or local persistence of
+position, pointer lock.
+
+**Handoff prompt:** as T1, phase W3, branch `feat/world-w3-explore`; read this section first and treat
+W3-F1..F8, C1..C9 and D19..D22 as the acceptance list; frontend only; CI is authoritative.
 
 ---
 
