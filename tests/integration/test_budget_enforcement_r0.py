@@ -378,6 +378,7 @@ async def test_a_commit_failure_while_finishing_an_attempt_leaves_the_conservati
     db_session, seeded, engine_deps, monkeypatch
 ):
     ledger, task = await _started_ledger(db_session, seeded, engine_deps)
+    task_id = task.id  # captured before the rollback below expires `task`'s attributes
     attempt_id = await ledger.begin_attempt(_worst_case())  # committed write-ahead
 
     real_commit = db_session.commit
@@ -390,9 +391,11 @@ async def test_a_commit_failure_while_finishing_an_attempt_leaves_the_conservati
     with pytest.raises(ConnectionError):
         await ledger.finish_attempt(attempt_id, outcome)
     monkeypatch.setattr(db_session, "commit", real_commit)
-    await db_session.rollback()
+    await db_session.rollback()  # a real failed commit leaves the session's objects expired; `task` itself
+    # is never touched again, only `task_id` (a plain UUID captured above), so no attribute access on it
+    # can trigger the synchronous lazy-load AsyncSession forbids (`MissingGreenlet`).
 
-    usage = await ledger.usage_for_task(task.id)
+    usage = await ledger.usage_for_task(task_id)
     assert usage.calls_made == 1
     assert usage.cost_spent_usd == pytest.approx(0.01025)  # still the worst case, never lost or zeroed
 
