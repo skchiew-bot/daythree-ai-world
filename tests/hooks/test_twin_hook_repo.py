@@ -117,7 +117,10 @@ def test_the_script_never_exports_or_echoes_the_key_and_never_writes_the_payload
 
 
 def test_the_transport_flags_are_pinned():
-    for flag in ("--connect-timeout 1", "--max-time 2", "--max-redirs 0", "--proto '=http,https'", "%{http_code}", "--noproxy '*'"):
+    for flag in (
+        "--connect-timeout 1", '--max-time "$budget"', "--max-redirs 0", "--proto '=http,https'", "%{http_code}",
+        "--noproxy '*'", "budget=$((4 - SECONDS))", 'if [ "$budget" -gt 2 ]; then budget=2; fi',
+    ):
         assert flag in _CODE_TEXT
     assert "read -r -t 2" in _CODE_TEXT
 

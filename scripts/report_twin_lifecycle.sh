@@ -68,7 +68,7 @@ unset -v BASH_XTRACEFD DAYTHREE_TWIN_BASE_URL DAYTHREE_TWIN_KEY \
   tmp host line url key method path body \
   attempt out rc code esc cfg source run \
   type frag refused new_run elapsed reason outcome t \
-  v
+  v budget
 LC_ALL=C
 umask 077
 
@@ -287,17 +287,23 @@ load_config() {
   LOOPBACK=
   case $host in localhost | 127.0.0.1 | '[::1]') LOOPBACK=1 ;; esac
   if [ "${BASH_REMATCH[1]}" = http ] && [ -z "$LOOPBACK" ]; then finish insecure_transport; fi
-  CURL_OPTS=(--connect-timeout 1 --max-time 2 --max-redirs 0 --proto '=http,https' --path-as-is --max-filesize 65536)
+  CURL_OPTS=(--connect-timeout 1 --max-redirs 0 --proto '=http,https' --path-as-is --max-filesize 65536)
   if [ -n "$LOOPBACK" ]; then CURL_OPTS+=(--noproxy '*'); fi
   CONFIG_OK=1
 }
 
 # api_call METHOD PATH JSON-BODY -> HTTP_CODE RESP. The curl configuration (URL, headers,
 # body, and therefore the key) goes to curl on stdin, so the key is in no argv and no
-# environment. One retry only on a connection failure or a 5xx, and only while the
-# shared 5-second hook budget still has room.
+# environment. One retry only on a connection failure or a 5xx.
+#
+# Time budget: the hook has 5 s in total, and its login shell has already used part of that
+# before this script starts, so this script spends at most 4 s. Every attempt is capped at
+# `--max-time min(2, 4 - elapsed)` and may not start once 3 s are gone; a RETRY of the same
+# request may only start in the first 2 s, so a platform that hangs costs one 2 s attempt, not
+# two. (A blanket `elapsed < 2` for every attempt would starve the 409 recovery chain on a slow
+# Windows machine, where its three calls take about 3 s.)
 api_call() {
-  local method=$1 path=$2 body=$3 attempt=0 out rc code esc cfg
+  local method=$1 path=$2 body=$3 attempt=0 out rc code esc cfg budget
   HTTP_CODE=000 RESP=
   if [ "${TWIN_DRY_RUN:-}" = 1 ]; then
     if [ -n "${TWIN_DRY_RUN_FILE:-}" ]; then printf '%s %s %s\n' "$method" "$path" "$body" >>"$TWIN_DRY_RUN_FILE"; fi
@@ -313,9 +319,13 @@ api_call() {
   esc=${body//\"/\\\"}
   printf -v cfg 'url = "%s%s"\nrequest = "%s"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\ndata = "%s"\n' \
     "$TW_BASE_URL" "$path" "$method" "$TW_KEY" "$esc"
-  while [ "$attempt" -lt 2 ] && [ "$SECONDS" -lt 2 ]; do
+  while [ "$attempt" -lt 2 ]; do
+    budget=$((4 - SECONDS))
+    if [ "$budget" -lt 1 ]; then break; fi
+    if [ "$attempt" -ge 1 ] && [ "$SECONDS" -ge 2 ]; then break; fi
+    if [ "$budget" -gt 2 ]; then budget=2; fi
     attempt=$((attempt + 1))
-    out=$(printf '%s' "$cfg" | curl -q -s -K - "${CURL_OPTS[@]}" -w '%{http_code}')
+    out=$(printf '%s' "$cfg" | curl -q -s -K - "${CURL_OPTS[@]}" --max-time "$budget" -w '%{http_code}')
     rc=$?
     code=${out: -3}
     if [ "$rc" -eq 0 ] && [[ $code =~ ^[0-9]{3}$ ]]; then
