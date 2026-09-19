@@ -75,6 +75,7 @@ export interface Mission {
   started_at: string | null;
   completed_at: string | null;
   project_id: string | null;
+  is_agent_runtime: boolean;
 }
 
 export interface MissionCreateRequest {

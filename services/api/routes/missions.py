@@ -5,7 +5,7 @@ from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.db.models import Agent, AgentVersion, Mission, MissionProject, Project, User
+from common.db.models import Agent, AgentRuntimeSession, AgentVersion, Mission, MissionProject, Project, User
 from contracts.enums import EventType, MissionStatus, ProjectStatus, UserRole
 from contracts.events import Actor, ActorType, build_event
 from contracts.ids import EntityId
@@ -62,10 +62,20 @@ async def _project_ids_for_missions(
     return {mission_id: project_id for mission_id, project_id in rows.all()}
 
 
+async def _is_agent_runtime_mission(session: AsyncSession, mission_id: EntityId) -> bool:
+    """T1-F5/T1 deliverable 5: the real discriminator is an EXISTS against
+    `agent_runtime_sessions` (there is no `source` column on `missions` -- T1-F2)."""
+    result = await session.execute(
+        select(AgentRuntimeSession.id).where(AgentRuntimeSession.mission_id == mission_id).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _mission_response(session: AsyncSession, mission: Mission) -> MissionResponse:
     project_ids = await _project_ids_for_missions(session, [mission.id], mission.tenant_id)
     response = MissionResponse.model_validate(mission)
     response.project_id = project_ids.get(mission.id)
+    response.is_agent_runtime = await _is_agent_runtime_mission(session, mission.id)
     return response
 
 
@@ -114,10 +124,19 @@ async def list_missions(
     result = await session.execute(select(Mission).where(Mission.tenant_id == user.tenant_id))
     missions = list(result.scalars().all())
     project_ids = await _project_ids_for_missions(session, [m.id for m in missions], user.tenant_id)
+    runtime_mission_ids = set()
+    if missions:
+        runtime_result = await session.execute(
+            select(AgentRuntimeSession.mission_id).where(
+                AgentRuntimeSession.mission_id.in_([m.id for m in missions])
+            )
+        )
+        runtime_mission_ids = {row[0] for row in runtime_result.all()}
     responses = []
     for mission in missions:
         response = MissionResponse.model_validate(mission)
         response.project_id = project_ids.get(mission.id)
+        response.is_agent_runtime = mission.id in runtime_mission_ids
         responses.append(response)
     return responses
 
@@ -174,6 +193,11 @@ async def start_mission_route(
     mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
     if mission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
+    if await _is_agent_runtime_mission(session, mission_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mission belongs to a Claude Code agent-runtime session and cannot be started here.",
+        )
 
     try:
         result = await start_mission(session, mission_id=mission_id)
@@ -225,6 +249,11 @@ async def cancel_mission(
     mission = await get_tenant_scoped_or_404(session, Mission, mission_id, user.tenant_id)
     if mission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mission not found.")
+    if await _is_agent_runtime_mission(session, mission_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This mission belongs to a Claude Code agent-runtime session and cannot be cancelled here.",
+        )
 
     try:
         await mark_mission_status(session, mission, MissionStatus.cancelled)

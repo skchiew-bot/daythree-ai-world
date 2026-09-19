@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from common.config import get_settings
-from common.db.models import Task
+from common.db.models import Agent, AgentVersion, Task
 from common.db.session import get_sessionmaker
 from contracts.enums import TaskStatus
 from contracts.ids import EntityId
@@ -52,7 +52,16 @@ async def requeue_orphaned_running_tasks(
     `MAX_AUTO_REQUEUES` times is failed instead (`event_publisher` is needed for that)."""
     sessionmaker = sessionmaker or get_sessionmaker()
     async with sessionmaker() as session:
-        result = await session.execute(select(Task.id).where(Task.status == TaskStatus.running.value))
+        # T1-F7 (digital-twin program): a task assigned to a non-`custom_durable`
+        # agent (e.g. a Claude Code twin, `external_manual`) has no internal worker to
+        # ever hold its lease -- the platform's worker must never touch it, mirroring
+        # `routes/tasks.py::_load_external_task`'s same 409 discipline for retry.
+        result = await session.execute(
+            select(Task.id)
+            .join(Agent, Agent.id == Task.assigned_agent_id)
+            .join(AgentVersion, AgentVersion.id == Agent.active_version_id)
+            .where(Task.status == TaskStatus.running.value, AgentVersion.runtime_adapter == "custom_durable")
+        )
         running_ids = [row[0] for row in result.all()]
 
     requeued = 0

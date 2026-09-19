@@ -80,6 +80,23 @@ async def retry_task(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
 
+    # T1-F7 (digital-twin program): a task assigned to a non-`custom_durable` agent
+    # (e.g. a Claude Code twin, `external_manual`) has no internal worker to ever pick
+    # it up off the queue -- re-queueing it here would just leave it stuck `queued`
+    # forever. Mirrors `_load_external_task`'s same check for complete-external/
+    # fail-external.
+    agent = await session.get(Agent, task.assigned_agent_id)
+    agent_version = (
+        await session.get(AgentVersion, agent.active_version_id)
+        if agent is not None and agent.active_version_id is not None
+        else None
+    )
+    if agent_version is None or agent_version.runtime_adapter != "custom_durable":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This task is executed externally and cannot be retried by the platform worker.",
+        )
+
     try:
         validate_task_transition(TaskStatus(task.status), TaskStatus.queued)
     except InvalidTransition as exc:
