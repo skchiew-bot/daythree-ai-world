@@ -64,56 +64,142 @@ is now).
 
 ## T1. Twins: identity and registration
 
+Gate-reviewed against main at `b03db74` on 2026-09-19 (guardian-gatekeeper): **BLOCK + ALTERNATIVE**,
+findings T1-F1 to T1-F16, all folded in below; recorded in `docs/council/LEDGER.md`. Where this
+section and ADR-010 disagree, this section wins.
+
 **Goal.** A scoped credential can register a session and a subagent spawn as governed objects, and
 every persona in the roster exists as a governed `agents` row with the right autonomy and tool
-policy, without the hook ever being able to elevate itself.
+policy, without the hook ever being able to elevate itself, reach any other route, or make the
+platform's own worker touch a twin task.
 
 **Deliverables.**
 
-- Migration `0004_agent_runtime_sessions` (`down_revision = "0003b_model_invocations_index"`, the
-  R0 index migration that sits between 0003 and 0004):
-  `agent_runtime_sessions` (tenant-scoped, FK `agents.id`, nullable FK `tasks.id`,
-  `external_session_ref`, `external_instance_ref`, `kind` session|subagent, `started_at`,
-  `last_heartbeat_at`, `ended_at`, `outcome`), `agent_runtime_persona_slots(tenant_id, slot)`
-  with a unique index (the atomic cap, ADR-010 B4), `agent_runtime_api_keys(user_id, key_hash,
-  revoked_at)`.
-- A service `User` row per tenant with role `agent_runtime` and an unusable password hash; a
-  dependency that resolves a bearer API key (sha256 compared) to that user so `require_role` and
-  tenant scoping work unchanged. The secret is printed once by a seed/issue script and never
-  logged.
-- `POST /api/v1/agent-runtime/sessions` (kind=session: idempotent on `external_session_ref`,
-  creates a Mission with `mission_code = session uuid`, `source="agent_runtime"`; kind=subagent:
-  resolves the persona from a server-side registry, creates the `agents` row and `AgentVersion`
-  on first sight with `runtime_adapter="external_manual"` and a tenant-scoped `model_policy_id`,
-  takes a persona slot, creates the Task `queued`, emits `task.created`/`task.assigned`, calls
-  ADR-009 `ensure_assignment` inside the existing exception-contained wrapper).
-- `PATCH /api/v1/agent-runtime/sessions/{id}` for heartbeat and `ended`.
-- Persona registry: `services/api/persona_registry.py` mapping agent type name to display name,
-  autonomy level and tool policy; unknown names bucket to `AGT-CC-GENERAL`; the initial roster
-  (O1) is an allow-list, everything else is opt-in.
-- Mission Control hides Start/Cancel for `source="agent_runtime"` missions (ADR-010 C4).
-- **Gate condition C7 (partial):** narrow `agent_runtime`'s read scope. Introduce a
-  `require_not_role(UserRole.agent_runtime)` guard (or an explicit reader-role set) on
-  `artifacts.download_artifact` and `tasks.get_task`; the runtime credential may read only its own
-  session and task rows.
+1. **Migration `0004_agent_runtime_sessions`**, `down_revision = "0003c_projects"` (the real head;
+   record it in the docstring as `0003c` does, and re-point if another migration merges first).
+   NEW tables only; no column on any existing table (`create_all(checkfirst=True)` cannot add one,
+   tests build schema from models, CI upgrades an empty DB). Explicit per-index sweep after
+   `create_all`; `downgrade()` drops only these three tables.
+   - `agent_runtime_sessions(id, tenant_id, kind session|subagent, agent_id nullable FK agents,
+     mission_id nullable FK missions, task_id nullable FK tasks, external_session_ref,
+     external_instance_ref nullable, parent_session_id nullable, started_at, last_heartbeat_at,
+     ended_at, outcome)` with partial unique indexes `(tenant_id, external_session_ref) WHERE
+     kind='session'` and `(tenant_id, external_instance_ref) WHERE kind='subagent'`. This table is the
+     discriminator for "is this an agent-runtime mission" (an EXISTS against it); there is no
+     `source` column on `missions` and none is added (T1-F2).
+   - `agent_runtime_persona_slots(id, tenant_id, slot, agent_code)` with `UNIQUE(tenant_id, slot)` and
+     `UNIQUE(tenant_id, agent_code)`; the slot is claimed before the persona insert; cap 25 (T1-F14).
+   - `agent_runtime_api_keys(id, user_id, key_hash unique, label, created_at, expires_at, revoked_at)`.
+2. **Credential.** `UserRole.agent_runtime`. One service `User` per tenant: email
+   `agent-runtime+{tenant_code}@daythree.local` (per-tenant unique), `password_hash` a real bcrypt hash
+   of discarded random bytes (never a literal like "!": `verify_password` would raise and 500 the public
+   login route), status active (T1-F8). API key wire format `dtk_<key_id>_<secret>`, secret
+   `secrets.token_urlsafe(32)` (256 bits: the only condition under which unsalted sha256 at rest is
+   acceptable; say so in the docstring); the resolver looks the row up by `key_id` and compares the
+   digest with `hmac.compare_digest`; it rejects revoked, expired, non-active user and non-active
+   tenant; revocation is immediate (no cache); rotation is issue-new then revoke-old; the secret is
+   printed once to stdout by an issue script, never passed to structlog, and the script refuses a
+   non-local `DATABASE_URL` without an explicit flag (T1-F15). A SEPARATE dependency
+   `get_agent_runtime_principal` serves the new router only; `get_current_user`, `require_role` and the
+   JWT path are not modified (T1-F4).
+3. **Default-deny for the credential** (T1-F3). A `forbid_agent_runtime` dependency added at every
+   `api_router.include_router(...)` in `services/api/routes/__init__.py` except `health`, `auth` and the
+   new agent-runtime router, so any route added later inherits the refusal. This explicitly covers
+   `audit.mission_timeline` (whole `audit_events` rows), `artifacts`, `tasks`, `missions`, `agents`,
+   `agent_rooms`, `projects`, `model_policies`, `dashboard`, `model_invocations`, `external_agents`,
+   `tenant`.
+4. **Routes** `POST /api/v1/agent-runtime/sessions` and `PATCH /api/v1/agent-runtime/sessions/{id}`
+   (heartbeat, `ended`). The request schema is `extra="forbid"` with exactly `kind`, `agent_type`,
+   `external_session_ref`, `external_instance_ref`, `parent_external_session_ref` (T1-F13): no prompt,
+   cwd, description, reason, autonomy, tool policy, model policy or agent code is accepted.
+   - kind=session: idempotent on `external_session_ref`; creates a Mission with `mission_code` = the
+     session uuid, `title = "Claude Code session {uuid}"`, `assigned_agent_id` = `AGT-CLAUDE-CODE`, and
+     drives it `draft -> ready -> running` (`transitions.py` forbids `draft -> running`).
+   - kind=subagent: resolve the persona from the registry by EXACT allow-list key; unknown names bucket
+     to `AGT-CC-GENERAL`; `agent_code` values are constants in the registry and never formatted from hook
+     input (T1-F10); a persona that is `suspended` (or, later, `merged`) is a 409, never reactivated. On
+     first sight create the `agents` row and `AgentVersion` (`runtime_adapter="external_manual"`,
+     autonomy level and tool policy from the registry only) with `model_policy_id` resolved READ-ONLY by
+     `(tenant_id, name="claude-code-external")`; absent is a 409 telling the operator to run the
+     issue/seed script; the route never creates a `ModelPolicy` (T1-F11). Claim a persona slot; cap
+     exhaustion is a 409 with a stable error code and NEVER falls back to `AGT-CC-GENERAL` (T1-F14).
+     Create the Task `queued` with `idempotency_key = f"{mission_id}:ar:{external_instance_ref}"`
+     (`start_mission` owns `{mission_id}:task:1`), `title` = registry display name plus instance ref,
+     `instructions` a fixed constant. Emit `task.created` / `task.assigned` with ids and enumerated
+     values only.
+   - Every insert runs inside `begin_nested()`; on `IntegrityError` do `await session.rollback()`, re-run
+     the handler ONCE, and if the row is still missing re-raise (asyncpg gotcha, see
+     `room_assignment.py` lines ~97-109; `Session.rollback()` discards the outer transaction, so
+     continuing mid-transaction is unsafe) (T1-F12).
+   - Do NOT call `ensure_assignment` inside the registration transaction: its `IntegrityError` branch
+     calls `session.rollback()`, which would discard the whole registration (T1-F6). The world read
+     already backfills rooms lazily.
+   - Fixed-window Redis rate limit per tenant and per key id on both routes (the
+     `external_agents.py` pattern); the 61st call in a window is a 429 that creates no rows; size the
+     heartbeat limit for the T3 hook cadence (T1-F9).
+5. **Mission guards** (T1-F5). `start_mission_route` and `cancel_mission` return 409 for a mission that
+   has an `agent_runtime_sessions` row; `MissionResponse` gains a derived `is_agent_runtime` boolean and
+   Mission Control hides Start/Cancel for it (cosmetic on top of the real refusal).
+6. **Worker guards** (T1-F7). Exclude tasks whose assigned agent's active version is not
+   `custom_durable` from `requeue_orphaned_running_tasks` (`services/worker/main.py`) and from R0's
+   sweep; `retry_task` returns 409 for such tasks, mirroring `_load_external_task`.
+7. **Persona registry** `services/api/persona_registry.py`: initial roster (operator decision O1)
+   `planner`, `architect`, `code-reviewer`, `tdd-guide`, `security-reviewer` with constant codes
+   (`AGT-CC-PLANNER`, ...), display names, autonomy level and tool policy per ADR-010 (default A1 and
+   the most restrictive tool policy unless ADR-010 says otherwise); every other name is opt-in up to
+   the cap of 25, bucketing to `AGT-CC-GENERAL`.
+8. **Data exposure** (T1-F13, data-warden D1..D5). The storable-field list is exactly the request
+   schema; `audit_events.payload` and event `data` carry ids and enumerated values only; no free text
+   is stored. Data-warden sign-off is recorded in `docs/council/LEDGER.md` by the chair before merge.
 
-**Tests.** Cross-tenant isolation for every new route; idempotent replay of session and subagent
-registration; persona cap enforced under 10 concurrent first-sights (real Postgres); registration
-survives an `ensure_assignment` exception; `agent_runtime` gets 403 on accept-shaped and download
-routes; migration upgrade from `0003b` and from empty.
+**Tests** (the gatekeeper's acceptance list; RED first):
+1. `alembic upgrade head` from empty and from `0003c_projects` on a populated DB (rows in `missions`,
+   `tasks`, `agents`), then `downgrade -1` and `upgrade head`; `indexdef` assertions for all new indexes.
+2. Cross-tenant: tenant A's key registers a session; tenant B's key gets 404 on that session id.
+3. `agent_runtime` gets 403 on every route in `routes/__init__.py` except its own: table-driven over
+   the app's route list; explicit 403 on `GET /missions/{id}/timeline`, `/artifacts/{id}/download`,
+   `/tasks/{id}`, `/agents`, `/missions`.
+4. `POST /auth/login` with the service user's email returns 401, not 500, for a wrong and an empty
+   password; two tenants with service users do not make login raise.
+5. Idempotent replay: same `external_session_ref` twice yields one Mission and one session row; same
+   `external_instance_ref` twice yields one Task; 10 concurrent duplicates of each on real Postgres
+   yield one row.
+6. Cap: 10 concurrent first-sights of 10 distinct personas at slot 24 give exactly one success and nine
+   409s; never more than 25 slot rows.
+7. Registration survives an `ensure_assignment` failure and never calls it inside the transaction;
+   assert rows by re-query in a fresh session.
+8. `POST /missions/{id}/start` and `/cancel` return 409 for an agent-runtime mission; no Task created,
+   status unchanged.
+9. `POST /tasks/{id}/retry` returns 409 for an `external_manual` task; `requeue_orphaned_running_tasks`
+   returns 0 for a twin task forced to `running` with no lease.
+10. Persona resolution: `"000001"`, `"../"`, `"AGT-000001"`, 500 chars of unicode all bucket to
+    `AGT-CC-GENERAL` and never resolve onto Atlas or `AGT-CLAUDE-CODE`; a suspended persona is 409 and
+    stays suspended.
+11. Elevation: a body carrying `autonomy_level`, `tool_policy`, `model_policy_id` or `agent_code` is
+    422; the created `AgentVersion` matches the registry constants and is `external_manual`.
+12. Rate limit: the 61st call in a window is 429 and creates no rows.
+13. Exposure: the request model's field set equals the allow-list exactly; every `audit_events.payload`
+    the routes write serialises to ids, timestamps and enum values only (recursive check);
+    `missions.title` matches `^Claude Code session [0-9a-f-]{36}$`.
+14. API key: revoked and expired keys 401 immediately; a key for a disabled user or suspended tenant
+    401s; the secret never appears in captured logs.
 
-**Exit.** A scoped-key call creates a persona row, a Mission and a Task visible in `audit_events`,
-and the runtime credential cannot download artifacts.
+**Exit.** A scoped-key call creates a persona row, a Mission and a Task visible in `audit_events`; the
+runtime credential gets 403 everywhere else (proved by test 3); the worker never touches a twin task
+(test 9); the chair has recorded the data-warden sign-off. Note for later phases: `0005`..`0008` chain
+by `down_revision` string and each must be re-pointed at the real head at its own merge; CI has no
+migration round-trip step, so T1 ships its own migration test; at cap 25 the apartment overflows past
+the 5-floor default (harmless at 5 personas, a note for T4).
 
 **Handoff prompt (paste to a Sonnet 5 session in this repo):**
 
-> Implement Phase T1 of `docs/architecture/DIGITAL_TWIN_PROGRAM_BUILD_PLAN.md` exactly as written,
-> on a branch `feat/twins-t1-identity`. Read ADR-010 and ADR-011 first; where they disagree, the
-> build plan wins. Follow the repo's existing patterns: `get_db_session` commit-on-return (no
-> in-route commits), `get_tenant_scoped_or_404`, partial unique indexes as the concurrency
-> guarantee, `create_all(checkfirst=True)` plus an index sweep in the migration, tests against
-> testcontainers Postgres marked `integration`/`security`, and `pytest.mark.unit` on pure tests.
-> Never paste a secret into the chat or a tracked file. Open the PR with a test plan; do not merge.
+> Implement Phase T1 of `docs/architecture/DIGITAL_TWIN_PROGRAM_BUILD_PLAN.md` exactly as written, on a
+> branch `feat/twins-t1-identity`. Read ADR-010 and ADR-011 first; where they disagree, the build plan
+> wins. Follow the repo's existing patterns: `get_db_session` commit-on-return (no in-route commits),
+> `get_tenant_scoped_or_404`, partial unique indexes as the concurrency guarantee,
+> `create_all(checkfirst=True)` plus an index sweep in the migration, tests against testcontainers
+> Postgres marked `integration`/`security`, and `pytest.mark.unit` on pure tests. Never paste a secret
+> into the chat or a tracked file. Open the PR with a test plan; do not merge.
 
 ---
 
