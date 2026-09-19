@@ -26,3 +26,8 @@ Thumbs.db
 *.log
 /pgdata/
 /miniodata/
+
+# Phase T3 twin hooks: per-session state/log (ids and enums only) and the local key
+# file mirror. The real key lives outside the repo at $HOME/.daythree/twin_env.sh.
+.hook-debug/
+.claude/twin_env.sh
