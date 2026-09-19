@@ -276,6 +276,12 @@ class AuditEvent(Base):
 
 class ModelInvocation(Base):
     __tablename__ = "model_invocations"
+    __table_args__ = (
+        # Per-task usage (SqlUsageProvider: called before every model call) and per-agent
+        # spend over time (ADR-013 metering). Migration 0003b creates these on existing DBs.
+        Index("ix_model_invocations_task_id", "task_id"),
+        Index("ix_model_invocations_tenant_agent_created", "tenant_id", "agent_id", "created_at"),
+    )
 
     id: Mapped[EntityId] = _pk()
     tenant_id: Mapped[EntityId] = mapped_column(ForeignKey("tenants.id"), nullable=False)

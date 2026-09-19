@@ -9,8 +9,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from model_gateway.errors import ModelGatewayError
 
-class CircuitOpenError(Exception):
+
+class CircuitOpenError(ModelGatewayError):
+    """A ModelGatewayError so the mission engine fails the task cleanly instead of leaving
+    it `running` for the orphan sweep to requeue (R0). No request was sent, so `attempts`
+    is empty unless the circuit opened part-way through a call's own retries."""
+
     def __init__(self, provider: str, retry_after_seconds: float):
         self.provider = provider
         self.retry_after_seconds = retry_after_seconds

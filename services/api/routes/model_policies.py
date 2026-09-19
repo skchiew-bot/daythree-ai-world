@@ -22,7 +22,9 @@ from common.db.models import ModelPolicy, User
 from contracts.enums import EventType, UserRole
 from contracts.events import Actor, ActorType, build_event
 from contracts.ids import EntityId, new_id
+from model_gateway.errors import UnpricedModelError
 from model_gateway.provider_registry import available_provider_names
+from model_gateway.telemetry import require_priced
 
 from api.dependencies.auth import get_current_user, require_role
 from api.dependencies.db import get_db_session
@@ -83,6 +85,17 @@ async def create_model_policy(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"'{payload.primary_provider}' is not a registered model provider in this deployment.",
         )
+
+    # The gateway refuses to call a model with no configured price (R0, ADR-013), so a
+    # policy naming one would only produce an agent whose every task fails.
+    try:
+        require_priced(payload.primary_provider, payload.primary_model)
+    except UnpricedModelError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"No price is configured for model '{payload.primary_provider}/{payload.primary_model}'; "
+                   "it cannot be used until a price is added.",
+        ) from None
 
     # No UniqueConstraint on (tenant_id, name) today (flagged separately for its own
     # sign-off — an ALTER on a live table, per guardian-gatekeeper condition A5) — this

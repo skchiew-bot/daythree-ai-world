@@ -1,5 +1,66 @@
 # Phase 0 Completion Report
 
+## Correction (R0), 2026-09-19
+
+This report's budget and cost statements overstated what was enforced. Found by the ADR-013 gate
+review (guardian-gatekeeper findings F1, F2, F3, F5) and fixed by phase R0
+(`fix/budget-enforcement-r0`).
+
+**What was true before R0.** On the durable-adapter path every mission and task actually runs,
+only `BudgetPolicy.max_output_tokens` was enforced. `DurableAgentRuntimeAdapter` passed a fresh
+all-zero `BudgetUsage()` to the model gateway on every call, so the `max_model_calls`,
+`max_model_cost_usd`, `max_runtime_minutes` and `max_retries` comparisons in
+`policy_sdk.budgets.evaluate_budget` could never fail. Further gaps:
+
+- The gateway evaluated the budget once, then made up to 3 provider attempts with no
+  re-evaluation, and the output-repair re-prompt was a second full call. A policy of "6 calls,
+  $2.00" could bill up to 6 calls with no budget check between them.
+- A failed or timed-out attempt wrote no `model_invocations` row, although a timed-out call can
+  still be billed by the provider. Cost was recorded only for successful calls.
+- A model missing from the price table was priced at a Sonnet-class default, which undercounts
+  Opus-class models by 5x.
+- A restarted worker requeued every `running` task globally and the queue had no lease, so a
+  second worker could re-run a task another worker was already calling the model for.
+
+**What TC-P0-009 proved.** `test_budget_exceeded_blocks_the_call_tc_p0_009` builds
+`BudgetUsage(calls_made=1)` by hand and calls `ModelGateway.generate` directly. It proves that the
+gateway calls `evaluate_budget` and refuses when the usage it is given is over the ceiling. It did
+not prove that the Mission Engine supplies real usage, and none of the mission-level paths above
+did. The "Token/cost accounting works" acceptance line in the Gate Decision holds for successful
+calls only, and "Known Defects: None" was wrong. The live `gpt-4o-mini` run stayed under $0.01
+because it made one short call, not because a cost ceiling was enforced.
+
+**What R0 changes.**
+
+- The adapter obtains real usage (calls including failed attempts, summed cost, time since the
+  current execution attempt began) from committed `model_invocations` before every model call:
+  the first execute, the output-repair execute and a resume after a crash.
+- The gateway re-evaluates the budget before every attempt after the first, with `is_retry=True`,
+  the call's own attempts and their cost added; a timeout counts as a billed call; `max_retries`
+  is honoured. The cost ceiling is checked against spent plus the attempt's own worst case, so one
+  call cannot carry a task past it.
+- Every provider attempt is written ahead: a `model_invocations` row at the conservative worst-case
+  cost is committed BEFORE the request is sent, then finished with the actual outcome. A crash,
+  lease loss or commit failure therefore leaves at least one committed charge per request that may
+  have been sent. A timeout is charged the conservative estimate (prompt bytes / 3 input tokens plus
+  the full `max_output_tokens` at the output price); a provider 4xx rejection counts as a call at
+  cost 0 and is not retried. The provider SDK clients no longer retry on their own.
+- An unpriced `(provider, model)` raises `UnpricedModelError` before any provider call;
+  `_DEFAULT_PRICE` is removed. `gpt-4o` and `gpt-4o-mini` prices were re-checked against OpenAI's
+  public pricing page on 2026-09-19; the Anthropic rows were not re-verified.
+- A worker executes a task only while holding a short Redis lease, and the orphan requeue skips
+  tasks with a live lease and runs periodically, so a crashed worker's task is still recovered
+  within about 30 seconds.
+- `model_invocations` gains `ix_model_invocations_task_id` and
+  `ix_model_invocations_tenant_agent_created` (migration `0003b_model_invocations_index`).
+- `OpenAIProvider` sends `max_completion_tokens` instead of the deprecated `max_tokens` for
+  o-series, gpt-5 and other non-GPT-4 models.
+
+**Still not covered.** Two tasks running at once for the same tenant or agent are not summed against
+a shared allowance (reservation is ADR-013 R2). A worker process paused after a request was already
+sent (SIGSTOP, a VM freeze) can outlive its lease and finish a call another worker also makes;
+closing that needs provider-side fencing. Both are listed in the R0 pull request.
+
 ## Executive Summary
 
 Phase 0's walking skeleton is built end-to-end against `docs/architecture/PHASE_0_BUILD_SPEC.md`:
@@ -101,7 +162,7 @@ and unit-tested but has never been exercised against the live Anthropic API.
 | Admin Web (5 pages) | `apps/admin-web/` | Done, verified in CI (Playwright drives the full spec §27 journey through it) |
 | Observability (structlog, OTel, Prometheus, 1 Grafana dashboard) | `services/observability/`, `infrastructure/compose/` | Done; structured logs confirmed flowing in CI job logs, dashboard/tracing not independently inspected |
 | Seed script + demo mission runner | `infrastructure/scripts/` | Done, runs successfully every CI run |
-| 8 ADRs | `docs/adr/` | Done |
+| 8 ADRs (Phase 0) + ADR-009 (post-Phase-0 apartment feature, merged) | `docs/adr/` | Done — `ADR-010` exists as a design doc but is not yet committed (a follow-on feature, out of scope for this build) |
 
 ## Tests
 
@@ -117,7 +178,7 @@ and unit-tested but has never been exercised against the live Anthropic API.
 | TC-P0-006 API Restart | **PASS** | `tests/resilience/test_api_restart.py`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-007 Worker Crash | **PASS** (unit + integration + real container kill/restart) | `test_durable_adapter.py`, `test_recovery.py`, `tests/resilience/test_worker_restart.py`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-008 Model Timeout | **PASS (unit)** | `model-gateway/tests/test_model_gateway.py::test_retries_then_succeeds_tc_p0_008` |
-| TC-P0-009 Budget Exceeded | **PASS (unit)** | `policy_sdk/tests/test_policy_budgets.py` + `test_model_gateway.py::test_budget_exceeded_blocks_the_call_tc_p0_009` |
+| TC-P0-009 Budget Exceeded | **PASS (unit) — evaluator and gateway only; see "Correction (R0)"** | `policy_sdk/tests/test_policy_budgets.py` + `test_model_gateway.py::test_budget_exceeded_blocks_the_call_tc_p0_009`; mission-level enforcement first proven by `tests/integration/test_budget_enforcement_r0.py` |
 | TC-P0-010 Duplicate Start Request | **PASS** | `test_mission_flow.py::test_duplicate_start_request_creates_only_one_run_tc_p0_010`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-011 Artifact Traceability | **PASS** | same file, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-012 Tenant Isolation | **PASS** | `test_authz.py::test_cross_tenant_mission_access_returns_404_not_403_tc_p0_012`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
@@ -240,7 +301,8 @@ Anthropic.
 
 ## Known Defects
 
-**None.** All four real bugs CI's first eight runs found (bad Docker Hub image reference, missing
+**None at the time of writing; corrected 2026-09-19: the budget-enforcement defect described in
+"Correction (R0)" above was open then.** All four real bugs CI's first eight runs found (bad Docker Hub image reference, missing
 `timezone=True` on 17 timestamp columns, `MissingGreenlet` on three agent/mission routes, a worker
 Redis-client timeout race, a dual-write ordering race) are fixed and covered by CI run #8's green
 result — see the Executive Summary and each bug's ADR entry for detail. Remaining, explicitly
@@ -423,13 +485,18 @@ env vars, always exits 0) wired via a `UserPromptSubmit` hook (`working`) and a 
 (`done`) in `.claude/settings.local.json` (gitignored; `.example` version tracked) so a Claude Code
 session reports its own status automatically instead of needing a manual `curl` each time.
 
-**Not verified working automatically** — Claude Code appears to load hook configuration at session
-start rather than hot-reloading it mid-session, and the file was created mid-session, so the hook
-was never registered for the session that authored it. The script itself is directly verified (both
-its success and silent-no-op-on-missing-credentials paths were run by hand and produced the correct
-result); whether the hook actually fires on a fresh session, and whether its bash-style command
-syntax executes as written on Windows (undocumented which shell runs a hook's `command` string
-there), is pending real-world confirmation in a new session.
+**Update — now confirmed firing automatically.** The "pending real-world confirmation" below was
+correct to be cautious: on a genuinely fresh session the hook did not fire. Three distinct Windows-
+shell bugs were found and fixed in [PR #13](https://github.com/skchiew-bot/daythree-ai-world/pull/13)
+— see that section below for detail. The original caveat text is kept for the record:
+
+Originally: **not verified working automatically** — Claude Code appears to load hook configuration
+at session start rather than hot-reloading it mid-session, and the file was created mid-session, so
+the hook was never registered for the session that authored it. The script itself is directly
+verified (both its success and silent-no-op-on-missing-credentials paths were run by hand and
+produced the correct result); whether the hook actually fires on a fresh session, and whether its
+bash-style command syntax executes as written on Windows (undocumented which shell runs a hook's
+`command` string there), is pending real-world confirmation in a new session.
 
 ### Claude Code as a registered, governed Agent ([PR #10](https://github.com/skchiew-bot/daythree-ai-world/pull/10))
 
@@ -460,3 +527,86 @@ but not internal ones, a full `complete-external` run producing a real artifact 
 8-event timeline, invalid-output rejection (422), the internal-agent 409 guard on both new routes,
 and `fail-external`. Full unit + integration + security suite (74 tests) passed locally before this
 PR was opened, in addition to CI's own 4 jobs.
+
+### Desk avatar agent-label bug fix ([PR #12](https://github.com/skchiew-bot/daythree-ai-world/pull/12))
+
+Found live during a step-by-step demo of the "start a mission, complete it from Claude Code, watch
+the 3D world react" flow: the desk avatar's caption was a hardcoded `"Atlas"` string, not derived
+from the focus mission's actual `assigned_agent_id` — so a mission assigned to the newly-registered
+`AGT-CLAUDE-CODE` agent still displayed "Atlas" underneath it. Fixed by looking the assigned agent
+up via `useAgents()` and falling back to "Assigned agent" only when no matching agent record exists.
+
+### Claude Code hook: Windows shell bugs fixed and confirmed firing for real ([PR #13](https://github.com/skchiew-bot/daythree-ai-world/pull/13))
+
+The PR #9 caveat above ("pending real-world confirmation") turned out to be exactly right to flag —
+on a genuinely fresh session, the hook never fired. Three distinct, real Windows-shell bugs, found
+by isolating the hook's `command` string into a standalone `.bat` and running it directly to read the
+exact error at each stage:
+
+1. A trailing `&` used to background the curl calls got killed before completing — the hook runner
+   appears to tear down the process tree before an orphaned background job finishes.
+2. An unqualified `bash` (no path) inside the wrapper script resolved to Windows' own WSL bash
+   launcher (`C:\Windows\System32\bash.exe`), not Git Bash — WSL has a completely different
+   filesystem view where `C:/...` paths don't exist, producing a confusing "No such file or
+   directory" for a file that genuinely exists. Fixed by always using the fully-qualified Git Bash
+   path.
+3. Without `--login`, Git Bash's own coreutils (`dirname`, `date`, `sed`) weren't on `PATH`, since
+   normal profile setup never ran. Fixed by passing `--login` to `bash.exe`.
+
+All machine-specific config (base URL, admin password) was moved out of the hook's `command` string
+and into small gitignored wrapper scripts (`hook_working.sh`/`hook_stop.sh`), so the JSON `command`
+itself stays a single simple invocation with no nested quoting. Verified twice, independently: once
+via a direct `cmd.exe` repro proving the command syntax itself works, and once by a genuinely fresh
+Claude Code session's `Stop` hook firing for real — confirmed by observing `status="done"` at a
+timestamp that was never manually triggered.
+
+### External-agent status endpoint hardened ([PR #14](https://github.com/skchiew-bot/daythree-ai-world/pull/14))
+
+`PUT /api/v1/external-agents/{name}/status` originally accepted any authenticated role and had no
+rate limit — a capacity-DoS path against a table (`external_agent_statuses`) with no delete route,
+flagged by `guardian-gatekeeper`'s review of ADR-009 and required to be fixed before ADR-010's
+Phase A builds on the same ground. Fixed: writes are now restricted to
+`platform_admin`/`tenant_admin`/`operator` (matching `agents.py`'s `MUTATORS` pattern), and a Redis
+fixed-window limit of 60 requests/60s per tenant was added, with a self-healing `NX EXPIRE` so a
+request that dies between `INCR` and `EXPIRE` can't strand the counter above the threshold forever.
+4 new security tests (auth required, upsert semantics unchanged, cross-tenant isolation unchanged,
+viewer role rejected, rate limit enforced).
+
+### ADR-009: agent room assignment — 20-room apartment ([PR #15](https://github.com/skchiew-bot/daythree-ai-world/pull/15))
+
+Every governed agent now gets a persistent, tenant-scoped room in a 5-floor x 4-room apartment,
+replacing the single shared desk in `/world`. Gated by `guardian-gatekeeper` before implementation
+(see `docs/adr/ADR-009-agent-room-assignment.md`) — the gate's own alternative (presentation-layer
+assignment, never gating registration, elastic floors past the 20-room soft cap) is what shipped, in
+preference to the literal "hard 20-room pool" reading of the operator's request, since a hard pool
+would have made agent onboarding capacity-gated with no deallocation path.
+
+New `agent_room_assignments` table (migration `0003`), with two partial unique indexes
+(`WHERE released_at IS NULL`) as the actual concurrency guarantee — one preventing two agents
+double-booking a room, the other preventing one agent holding two active rooms — rather than
+application-level check-then-act, consistent with the idempotency approach in
+`docs/adr/ADR-007-idempotency.md`. `GET /api/v1/agent-rooms` lazily backfills any agent with no room
+yet (so agents seeded before this feature existed are roomed on first read, without touching
+`seed.py`) and derives each room's live activity from the agent's most recent Task. Suspending an
+agent releases its room; reactivating re-ensures one (possibly a different room, if the old one was
+taken meanwhile). `World.tsx` was reworked (`apps/admin-web/src/world/{layout,avatar,apartment,
+agentState}.ts`) so a room's position is always a pure function of `(floor, room_index)`, never array
+order — registering an unrelated agent never moves anyone else's room.
+
+Two real concurrency bugs were found and fixed via a test that races 8 real allocations against a
+testcontainers Postgres: (1) after `session.begin_nested()` catches an `IntegrityError` from a
+colliding INSERT, the SAVEPOINT rollback alone left the ORM `Session` needing an explicit
+`rollback()` before its next query would run (asyncpg raised `PendingRollbackError` otherwise); (2)
+the initial retry budget of 5 attempts was too low for genuine 8-way contention (two of eight callers
+hit exhaustion in testing) — raised to 16.
+
+24 new tests: 10 unit (slot math — first/fourth/fifth/20th/21st occupant, round-trip, released-slot
+reuse), 8 integration (registration assigns a room, idempotency across reads, 21st agent overflows to
+floor 6, suspend releases + the room is reused, seeded-agent lazy backfill, activity reflects the
+task lifecycle, registration survives an allocator exception at both the route and service layer), 3
+concurrency (8 concurrent distinct agents get 8 distinct rooms, 2 concurrent ensures for one agent
+yield 1 row, room reused after release — all against real Postgres, not mocked), 3 cross-tenant
+isolation. Verified live against the running dev stack beyond CI: the migration applies cleanly on
+top of revision `0002`, both partial indexes confirmed present via `pg_indexes`, and
+`GET /api/v1/agent-rooms` correctly lazy-backfilled the pre-existing Atlas and Claude Code agents
+into rooms (1,1) and (1,2) — confirmed both in the raw API response and visually in the browser.

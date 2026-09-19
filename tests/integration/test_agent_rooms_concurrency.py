@@ -7,6 +7,7 @@ race for real.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -17,6 +18,7 @@ from common.db.models import Agent, Tenant
 from contracts.enums import AgentLifecycleState
 from contracts.ids import EntityId, new_id
 
+from api.services import room_assignment
 from api.services.room_assignment import ensure_assignment, get_assignment, release_assignment
 
 pytestmark = pytest.mark.integration
@@ -117,3 +119,42 @@ async def test_room_is_reusable_after_release(sessionmaker, tenant_id):
         second = await ensure_assignment(session, tenant_id, second_agent)
         await session.commit()
         assert (second.floor, second.room_index) == first_slot  # the freed slot, since it's the lowest free one
+
+
+@pytest.mark.asyncio
+async def test_loser_of_a_same_agent_race_returns_the_winners_room(
+    sessionmaker, tenant_id, monkeypatch, caplog
+):
+    """Deterministic form of the same-agent race: a competing caller commits a room for
+    this agent between our initial "does it already have one?" check and our insert.
+    The retry must find that room instead of allocating a second slot, which the
+    one-active-room-per-agent index rejects on every attempt until the budget runs out.
+    """
+    agent_id = await _make_agent(sessionmaker, tenant_id, "AGT-CONC-DET")
+    real_get_assignment = room_assignment.get_assignment
+    checks = 0
+
+    async def racing_get_assignment(session, tenant, agent):
+        nonlocal checks
+        result = await real_get_assignment(session, tenant, agent)
+        checks += 1
+        if checks == 1:
+            async with sessionmaker() as racer:
+                await ensure_assignment(racer, tenant, agent)
+                await racer.commit()
+        return result
+
+    monkeypatch.setattr(room_assignment, "get_assignment", racing_get_assignment)
+
+    with caplog.at_level(logging.WARNING, logger="api.services.room_assignment"):
+        async with sessionmaker() as session:
+            loser = await ensure_assignment(session, tenant_id, agent_id)
+            await session.commit()
+
+    assert loser is not None
+    assert "room_assignment_exhausted" not in caplog.text
+
+    async with sessionmaker() as session:
+        active = await get_assignment(session, tenant_id, agent_id)
+        assert active is not None
+        assert (loser.floor, loser.room_index) == (active.floor, active.room_index)

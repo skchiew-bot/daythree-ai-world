@@ -69,6 +69,10 @@ class RunResult(BaseModel):
     # The Mission Engine reconstructs a typed telemetry object from this before persisting
     # the `model_invocations` row.
     model_telemetry: Optional[dict[str, Any]] = None
+    # One telemetry dict (status=failed) per provider attempt that failed or timed out
+    # before the successful one. They can still have been billed, so the Mission Engine
+    # persists each as a `model_invocations` row (R0, ADR-013).
+    failed_attempt_telemetry: list[dict[str, Any]] = Field(default_factory=list)
     error: Optional[str] = None
     final_checkpoint: Optional[Checkpoint] = None
 

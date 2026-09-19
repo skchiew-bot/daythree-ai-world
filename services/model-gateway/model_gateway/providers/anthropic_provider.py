@@ -20,7 +20,9 @@ class AnthropicProvider:
                 "AnthropicProvider requires ANTHROPIC_API_KEY. Use MockModelProvider "
                 "(DEFAULT_MODEL_PROVIDER=mock) when no key is configured."
             )
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # max_retries=0: the SDK's own retries (default 2) would send up to 3 billed HTTP
+        # requests for one gateway attempt that the write-ahead ledger cannot see.
+        self._client = anthropic.AsyncAnthropic(api_key=api_key, max_retries=0)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         start = time.monotonic()

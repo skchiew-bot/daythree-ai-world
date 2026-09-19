@@ -8,8 +8,9 @@ from contracts.enums import RuntimeCheckpointStatus
 from contracts.ids import new_id
 from contracts.policy import BudgetPolicy, ToolPolicy
 from contracts.runtime import RunContext
-from model_gateway.gateway import ModelGateway
+from model_gateway.gateway import BudgetExceededError, ModelGateway
 from model_gateway.providers.mock import MockModelProvider
+from policy_sdk.budgets import BudgetUsage
 
 pytestmark = pytest.mark.unit
 
@@ -28,10 +29,35 @@ def make_context(**overrides) -> RunContext:
     return RunContext(**defaults)
 
 
-def make_adapter() -> tuple[DurableAgentRuntimeAdapter, InMemoryCheckpointStore]:
+class FakeUsageProvider:
+    """Stands in for the DB-backed provider: returns whatever `usage` is set to and
+    records every lookup, so tests can prove it is consulted before each model call."""
+
+    def __init__(self, usage: BudgetUsage | None = None):
+        self.usage = usage or BudgetUsage()
+        self.lookups: list = []
+        self.begun: list = []
+        self.finished: list = []
+
+    async def usage_for_task(self, task_id):
+        self.lookups.append(task_id)
+        return self.usage
+
+    async def begin_attempt(self, worst_case):
+        self.begun.append(worst_case)
+        return len(self.begun)
+
+    async def finish_attempt(self, attempt_id, outcome):
+        self.finished.append((attempt_id, outcome))
+
+
+def make_adapter(usage_provider: FakeUsageProvider | None = None) -> tuple[DurableAgentRuntimeAdapter, InMemoryCheckpointStore]:
     store = InMemoryCheckpointStore()
     gateway = ModelGateway(providers={"mock": MockModelProvider()})
-    return DurableAgentRuntimeAdapter(model_gateway=gateway, checkpoint_store=store), store
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=gateway, checkpoint_store=store, usage_provider=usage_provider or FakeUsageProvider()
+    )
+    return adapter, store
 
 
 @pytest.mark.asyncio
@@ -133,3 +159,135 @@ async def test_execute_called_twice_for_the_same_task_does_not_collide_on_sequen
     assert len(sequences) == 4  # two checkpoints per execute() call, no collision
     assert repair_result.succeeded is True
     assert first_result.final_checkpoint.sequence < repair_result.final_checkpoint.sequence
+
+
+# --- R0 (ADR-013): real usage reaches the budget check before EVERY model call ----------
+
+
+class _RecordingGateway:
+    """Captures the `usage` each generate() call receives, then delegates to a real gateway."""
+
+    def __init__(self):
+        self._inner = ModelGateway(providers={"mock": MockModelProvider()})
+        self.usages: list[BudgetUsage] = []
+        self.ledgers: list = []
+
+    async def generate(self, request, *, budget_policy, usage, is_retry=False, ledger=None):
+        self.usages.append(usage)
+        self.ledgers.append(ledger)
+        return await self._inner.generate(
+            request, budget_policy=budget_policy, usage=usage, is_retry=is_retry, ledger=ledger
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_passes_the_providers_usage_to_the_gateway_not_zero():
+    usage_provider = FakeUsageProvider(BudgetUsage(calls_made=2, cost_spent_usd=0.5, elapsed_minutes=3.0))
+    gateway = _RecordingGateway()
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=gateway, checkpoint_store=InMemoryCheckpointStore(), usage_provider=usage_provider
+    )
+    context = make_context()
+
+    await adapter.execute(await adapter.initialize_run(context))
+
+    assert gateway.usages == [usage_provider.usage]
+    assert usage_provider.lookups == [context.task_id]
+
+
+@pytest.mark.asyncio
+async def test_every_gateway_call_is_made_with_the_write_ahead_ledger():
+    usage_provider = FakeUsageProvider()
+    gateway = _RecordingGateway()
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=gateway, checkpoint_store=InMemoryCheckpointStore(), usage_provider=usage_provider
+    )
+    await adapter.execute(await adapter.initialize_run(make_context()))
+
+    assert gateway.ledgers == [usage_provider]
+    assert len(usage_provider.begun) == 1 and len(usage_provider.finished) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_model_call_is_made_when_usage_cannot_be_read():
+    class _Boom(FakeUsageProvider):
+        async def usage_for_task(self, task_id):
+            raise ConnectionError("db down")
+
+    class _CountingProvider:
+        calls = 0
+
+        async def generate(self, request):
+            _CountingProvider.calls += 1
+            return await MockModelProvider().generate(request)
+
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=ModelGateway(providers={"mock": _CountingProvider()}),
+        checkpoint_store=InMemoryCheckpointStore(), usage_provider=_Boom(),
+    )
+    with pytest.raises(ConnectionError):
+        await adapter.execute(await adapter.initialize_run(make_context()))
+    assert _CountingProvider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_second_execute_for_repair_looks_usage_up_again():
+    usage_provider = FakeUsageProvider()
+    adapter, _ = make_adapter(usage_provider)
+    context = make_context()
+
+    await adapter.execute(await adapter.initialize_run(context))
+    await adapter.execute(await adapter.initialize_run(context))  # the repair re-prompt
+
+    assert len(usage_provider.lookups) == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_from_prompt_assembled_uses_committed_usage_and_can_be_refused():
+    """A crash-resume re-issues the model call, so it must hit the same budget check —
+    with calls already committed for the task, the resumed call is refused."""
+    usage_provider = FakeUsageProvider(BudgetUsage(calls_made=1))
+    adapter, store = make_adapter(usage_provider)
+    context = make_context(budget_policy=BudgetPolicy(max_model_calls=1))
+
+    from agent_runtime.prompts.assembler import assemble_prompt
+    from contracts.runtime import Checkpoint
+
+    assembly = assemble_prompt(context)
+    checkpoint = await store.save(
+        Checkpoint(
+            run_id=new_id(), task_id=context.task_id, mission_id=context.mission_id,
+            agent_id=context.agent_id, sequence=1, status=RuntimeCheckpointStatus.created,
+            state={
+                "stage": "prompt_assembled", "system_prompt": assembly.system_prompt,
+                "user_prompt": assembly.user_prompt, "provider": "mock", "model": "claude-sonnet-5",
+                "max_output_tokens": context.budget_policy.max_output_tokens,
+                "budget_policy": context.budget_policy.model_dump(),
+            },
+        )
+    )
+
+    with pytest.raises(BudgetExceededError):
+        await adapter.resume(checkpoint)
+    assert usage_provider.lookups == [context.task_id]
+
+
+@pytest.mark.asyncio
+async def test_failed_attempts_from_the_gateway_are_surfaced_on_the_run_result():
+    class _FlakyOnce:
+        calls = 0
+
+        async def generate(self, request):
+            _FlakyOnce.calls += 1
+            if _FlakyOnce.calls == 1:
+                raise RuntimeError("transient")
+            return await MockModelProvider().generate(request)
+
+    gateway = ModelGateway(providers={"mock": _FlakyOnce()}, backoff_base_seconds=0)
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=gateway, checkpoint_store=InMemoryCheckpointStore(), usage_provider=FakeUsageProvider()
+    )
+    result = await adapter.execute(await adapter.initialize_run(make_context()))
+
+    assert [t["status"] for t in result.failed_attempt_telemetry] == ["failed"]
+    assert result.model_telemetry["status"] == "completed"

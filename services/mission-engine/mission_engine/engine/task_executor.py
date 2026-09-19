@@ -6,6 +6,7 @@ path: the runtime adapter decides internally whether to call the model again.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -13,13 +14,12 @@ from sqlalchemy.sql import func
 from agent_runtime.adapters.durable_adapter import DurableAgentRuntimeAdapter
 from artifact_service.service import commit_artifact
 from artifact_service.storage.object_store import ObjectStore
-from common.db.models import Agent, AgentVersion, Mission, ModelInvocation, ModelPolicy, Task
+from common.db.models import Agent, AgentVersion, Mission, ModelPolicy, Task
 from contracts.enums import (
     ActorType,
     ArtifactType,
     EventType,
     MissionStatus,
-    ModelInvocationStatus,
     TaskStatus,
 )
 from contracts.events import Actor, build_event
@@ -31,6 +31,7 @@ from event_service.publisher import EventPublisher
 from model_gateway.gateway import BudgetExceededError, ModelGateway, ModelGatewayError
 
 from mission_engine.checkpoints.sql_checkpoint_store import SqlCheckpointStore
+from mission_engine.engine.usage import SqlUsageProvider
 
 REPAIR_INSTRUCTION_TEMPLATE = (
     "\n\nYour previous answer was rejected by the output validator: {error}\n"
@@ -55,6 +56,7 @@ class TaskExecutionError(Exception):
 
 
 async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityId) -> None:
+    attempt_started_at = datetime.now(timezone.utc)
     task = await session.get(Task, task_id)
     if task is None:
         raise TaskExecutionError(f"Task {task_id} does not exist.")
@@ -76,13 +78,19 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
     # history, not `task.status` — a retried task is re-queued to `queued` by the
     # `/retry` endpoint just like a fresh one, so status alone can't distinguish them,
     # and a worker-restart resume must also count as a retry, not a fresh start.
-    is_first_attempt = task.retry_count == 0 and existing_checkpoint is None
+    # `running` on entry means a worker died (or lost its lease) mid-task and the orphan
+    # sweep recovered it; the sweep already counted that recovery in `retry_count` (and
+    # persisted it, which is what caps automatic recoveries). `queued` is a fresh task or
+    # an operator /retry.
+    found_running = task.status == TaskStatus.running.value
+    is_first_attempt = task.retry_count == 0 and existing_checkpoint is None and not found_running
     task.status = TaskStatus.running.value
     if is_first_attempt:
         task.started_at = func.now()
         await _publish(deps, session, EventType.task_started, mission, task, agent, correlation_id, actor)
     else:
-        task.retry_count += 1
+        if not found_running:
+            task.retry_count += 1
         await _publish(
             deps, session, EventType.task_retry_started, mission, task, agent, correlation_id, actor,
             data={"retry_count": task.retry_count},
@@ -99,7 +107,13 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         available_context=task.input_context or {},
         model_provider=model_policy.primary_provider, model_name=model_policy.primary_model,
     )
-    adapter = DurableAgentRuntimeAdapter(model_gateway=deps.model_gateway, checkpoint_store=checkpoint_store)
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=deps.model_gateway, checkpoint_store=checkpoint_store,
+        usage_provider=SqlUsageProvider(
+            session, tenant_id=mission.tenant_id, mission_id=mission.id, task_id=task.id,
+            agent_id=agent.id, attempt_started_at=attempt_started_at,
+        ),
+    )
 
     try:
         if is_resume:
@@ -126,11 +140,12 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         await _fail(deps, session, mission, task, agent, correlation_id, actor, str(exc))
         return
 
+    # The `model_invocations` rows for every attempt (failed ones included) were already
+    # committed by the write-ahead ledger while the gateway ran; nothing is recorded here.
     if result.model_telemetry is not None:
-        await _record_model_invocation(session, mission, task, agent, result.model_telemetry)
         await _publish(
             deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
-            data={"provider": result.model_telemetry["provider"], "model": result.model_telemetry["model"]},
+            data=_model_completed_data(result.model_telemetry),
         )
 
     if result.final_checkpoint is not None:
@@ -139,16 +154,9 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
             data={"sequence": result.final_checkpoint.sequence},
         )
 
-    # Durability boundary: the checkpoint itself was already committed inside the
-    # adapter (see `SqlCheckpointStore.save`'s docstring), but the model_invocations
-    # row + model.completed event recorded just above were only *added*, not yet
-    # committed. Without this commit, a crash between here and the next durability
-    # boundary would silently lose that telemetry row forever — a resumed task's
-    # `resume()` intentionally does NOT re-record telemetry for a stage it already has
-    # (that's what stops it from being duplicated), so if it was never committed in the
-    # first place, spec §4 rule 9 ("every model/tool call is recorded") would quietly
-    # fail rather than duplicate. Committing here closes that window down to these few
-    # lines instead of the entire rest of task completion.
+    # Durability boundary: the checkpoint itself was already committed inside the adapter
+    # (see `SqlCheckpointStore.save`'s docstring) and so was the model_invocations charge
+    # (write-ahead ledger); this commits the model.completed event just published.
     await session.commit()
 
     final_text = result.output_text
@@ -168,9 +176,8 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
             return
 
         if repair_result.model_telemetry is not None:
-            await _record_model_invocation(session, mission, task, agent, repair_result.model_telemetry)
             await _publish(deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
-                            data={"repair_attempt": True})
+                            data={**_model_completed_data(repair_result.model_telemetry), "repair_attempt": True})
             await session.commit()  # same durability reasoning as the first model call, above
 
         final_text = repair_result.output_text
@@ -227,17 +234,13 @@ async def _fail(deps, session, mission, task, agent, correlation_id, actor, reas
                     data={"reason": reason})
 
 
-async def _record_model_invocation(session, mission, task, agent, telemetry: dict) -> None:
-    session.add(
-        ModelInvocation(
-            tenant_id=mission.tenant_id, mission_id=mission.id, task_id=task.id, agent_id=agent.id,
-            provider=telemetry["provider"], model=telemetry["model"],
-            input_tokens=telemetry["input_tokens"], output_tokens=telemetry["output_tokens"],
-            estimated_cost=telemetry["estimated_cost"], latency_ms=telemetry["latency_ms"],
-            status=ModelInvocationStatus(telemetry["status"]).value,
-            request_hash=telemetry["request_hash"], response_hash=telemetry.get("response_hash"),
-        )
-    )
+def _model_completed_data(telemetry: dict) -> dict:
+    """Payload of `model.completed`. `usage_estimated` is only present when the provider
+    returned text without usage figures, so the audit trail shows a priced-by-estimate call."""
+    data = {"provider": telemetry["provider"], "model": telemetry["model"]}
+    if telemetry.get("usage_estimated"):
+        data["usage_estimated"] = True
+    return data
 
 
 async def _publish(deps: EngineDeps, session, event_type: EventType, mission, task, agent,

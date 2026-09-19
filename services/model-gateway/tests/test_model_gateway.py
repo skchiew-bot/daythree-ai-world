@@ -56,16 +56,16 @@ class _FlakyProvider:
             raise RuntimeError("simulated transient provider failure")
         return ModelResponse(
             text="{}", input_tokens=1, output_tokens=1, latency_ms=1,
-            provider="flaky", model=request.model,
+            provider="mock", model=request.model,
         )
 
 
 @pytest.mark.asyncio
 async def test_retries_then_succeeds_tc_p0_008():
     provider = _FlakyProvider(fail_times=1)
-    gateway = ModelGateway(providers={"flaky": provider}, max_attempts=3, backoff_base_seconds=0)
+    gateway = ModelGateway(providers={"mock": provider}, max_attempts=3, backoff_base_seconds=0)
     outcome = await gateway.generate(
-        make_request(provider="flaky"), budget_policy=BudgetPolicy(), usage=BudgetUsage()
+        make_request(), budget_policy=BudgetPolicy(), usage=BudgetUsage()
     )
     assert outcome.attempts == 2
     assert provider.calls == 2
@@ -74,10 +74,10 @@ async def test_retries_then_succeeds_tc_p0_008():
 @pytest.mark.asyncio
 async def test_retries_exhausted_raises_gateway_error():
     provider = _FlakyProvider(fail_times=10)
-    gateway = ModelGateway(providers={"flaky": provider}, max_attempts=2, backoff_base_seconds=0)
+    gateway = ModelGateway(providers={"mock": provider}, max_attempts=2, backoff_base_seconds=0)
     with pytest.raises(ModelGatewayError):
         await gateway.generate(
-            make_request(provider="flaky"), budget_policy=BudgetPolicy(), usage=BudgetUsage()
+            make_request(), budget_policy=BudgetPolicy(), usage=BudgetUsage()
         )
     assert provider.calls == 2
 
@@ -87,16 +87,16 @@ async def test_circuit_breaker_opens_after_threshold_failures():
     provider = _FlakyProvider(fail_times=999)
     breaker = CircuitBreaker(failure_threshold=2, cooldown_seconds=60)
     gateway = ModelGateway(
-        providers={"flaky": provider}, circuit_breaker=breaker, max_attempts=1, backoff_base_seconds=0
+        providers={"mock": provider}, circuit_breaker=breaker, max_attempts=1, backoff_base_seconds=0
     )
 
     for _ in range(2):
         with pytest.raises(ModelGatewayError):
             await gateway.generate(
-                make_request(provider="flaky"), budget_policy=BudgetPolicy(), usage=BudgetUsage()
+                make_request(), budget_policy=BudgetPolicy(), usage=BudgetUsage()
             )
 
     with pytest.raises(CircuitOpenError):
         await gateway.generate(
-            make_request(provider="flaky"), budget_policy=BudgetPolicy(), usage=BudgetUsage()
+            make_request(), budget_policy=BudgetPolicy(), usage=BudgetUsage()
         )

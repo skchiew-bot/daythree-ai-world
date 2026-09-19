@@ -1,4 +1,6 @@
-import type { AgentRoom, ExternalAgentStatus, Mission } from "@/types/api";
+import type { ExternalAgentStatus, Mission } from "@/types/api";
+
+import type { WorldAgent } from "./renderPayload";
 
 /** Visual state any avatar reacts to. Room-based avatars get this from the server's
  * activity field (already hold-window-adjusted); "thinking" is the one exception —
@@ -26,7 +28,7 @@ export function pickFocusMission(missions: Mission[] | undefined): Mission | nul
 }
 
 export function deriveRoomAgentState(
-  room: AgentRoom,
+  room: WorldAgent,
   focusAgentId: string | null,
   timelineEventTypes: string[],
 ): AgentState {
