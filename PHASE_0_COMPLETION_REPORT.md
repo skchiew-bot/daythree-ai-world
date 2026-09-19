@@ -37,10 +37,14 @@ because it made one short call, not because a cost ceiling was enforced.
   the first execute, the output-repair execute and a resume after a crash.
 - The gateway re-evaluates the budget before every attempt after the first, with `is_retry=True`,
   the call's own attempts and their cost added; a timeout counts as a billed call; `max_retries`
-  is honoured.
-- Every failed or timed-out attempt is stored as a `model_invocations` row with `status=failed`. A
-  timeout is charged a documented conservative estimate (prompt bytes / 3 input tokens plus the
-  full `max_output_tokens` at the output price); a provider 4xx rejection counts as a call at cost 0.
+  is honoured. The cost ceiling is checked against spent plus the attempt's own worst case, so one
+  call cannot carry a task past it.
+- Every provider attempt is written ahead: a `model_invocations` row at the conservative worst-case
+  cost is committed BEFORE the request is sent, then finished with the actual outcome. A crash,
+  lease loss or commit failure therefore leaves at least one committed charge per request that may
+  have been sent. A timeout is charged the conservative estimate (prompt bytes / 3 input tokens plus
+  the full `max_output_tokens` at the output price); a provider 4xx rejection counts as a call at
+  cost 0 and is not retried. The provider SDK clients no longer retry on their own.
 - An unpriced `(provider, model)` raises `UnpricedModelError` before any provider call;
   `_DEFAULT_PRICE` is removed. `gpt-4o` and `gpt-4o-mini` prices were re-checked against OpenAI's
   public pricing page on 2026-09-19; the Anthropic rows were not re-verified.
@@ -52,10 +56,10 @@ because it made one short call, not because a cost ceiling was enforced.
 - `OpenAIProvider` sends `max_completion_tokens` instead of the deprecated `max_tokens` for
   o-series, gpt-5 and other non-GPT-4 models.
 
-**Still not covered.** The ceilings are checked before a call, not reserved: one call can take the
-task past `max_model_cost_usd` by up to its own cost. A worker that dies while a provider call is
-in flight leaves that one call unrecorded until a resume. Both are addressed by ADR-013's later
-phases (reservation in R2) and are listed in the R0 pull request.
+**Still not covered.** Two tasks running at once for the same tenant or agent are not summed against
+a shared allowance (reservation is ADR-013 R2). A worker process paused after a request was already
+sent (SIGSTOP, a VM freeze) can outlive its lease and finish a call another worker also makes;
+closing that needs provider-side fencing. Both are listed in the R0 pull request.
 
 ## Executive Summary
 
