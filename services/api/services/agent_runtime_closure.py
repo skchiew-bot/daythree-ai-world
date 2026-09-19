@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -49,6 +50,14 @@ _TERMINAL_TASK_STATUSES = frozenset(
 _RUNTIME_ADAPTER_EXCLUDED = "custom_durable"
 
 
+async def _get_existing_closure(session: AsyncSession, runtime_session_id: EntityId) -> Optional[AgentRuntimeClosure]:
+    return (
+        await session.execute(
+            select(AgentRuntimeClosure).where(AgentRuntimeClosure.runtime_session_id == runtime_session_id)
+        )
+    ).scalar_one_or_none()
+
+
 async def _publish(publisher, session, event_type, tenant_id, actor, mission_id, task_id=None, agent_id=None, data=None):
     event = build_event(
         event_type=event_type, tenant_id=tenant_id, correlation_id=mission_id, actor=actor, service="api",
@@ -74,6 +83,17 @@ async def _advance_task(
             publisher, session, EventType.task_started, tenant_id, actor, mission_id,
             task_id=task.id, agent_id=task.assigned_agent_id,
         )
+        await session.flush()
+    elif task.status == TaskStatus.waiting.value and target == TaskStatus.completed:
+        # TASK_TRANSITIONS has no waiting->completed edge (only waiting->{running,
+        # failed, cancelled}) -- a twin Task should never actually reach `waiting`
+        # (that state belongs to the internal task_executor's model-call flow, not
+        # an externally-run twin), but closing it as `completed` must not 500 if it
+        # somehow does. `running` is the only legal hop between waiting and
+        # completed; the Task already started earlier (whatever put it in
+        # `waiting` came after `running`), so no new `task.started` event.
+        validate_task_transition(TaskStatus.waiting, TaskStatus.running)
+        task.status = TaskStatus.running.value
         await session.flush()
 
     validate_task_transition(TaskStatus(task.status), target)
@@ -110,15 +130,19 @@ async def close_task(
     `SELECT ... FOR UPDATE` on the runtime-session row is taken FIRST and serializes
     every closer of this row across transactions -- by the time the lock is held, no
     other transaction can be racing to insert a closure for the same
-    `runtime_session_id`, so the existing-closure check just below is race-free and a
-    genuinely new closure can be inserted directly, with no savepoint/rollback dance.
-    This deliberately differs from `routes/agent_runtime.py`'s own IntegrityError-then-
-    `session.rollback()` pattern (T1-F12): THIS function is called in a loop by
-    `end_session` and `reap_stale_runtime_sessions`, both of which must complete
-    several closes inside one shared transaction -- a full `session.rollback()` for one
-    duplicate would discard every sibling close already done in that same transaction.
-    The table's UNIQUE(runtime_session_id) constraint remains the schema-level backstop
-    (T2-F9); it is just never expected to actually fire once the lock above is held.
+    `runtime_session_id`, so the existing-closure check just below is race-free in the
+    ordinary case and a genuinely new closure can be inserted directly. This
+    deliberately differs from `routes/agent_runtime.py`'s own IntegrityError-then-
+    `session.rollback()` pattern (T1-F12) for the EXPECTED path: THIS function is
+    called in a loop by `end_session` and `reap_stale_runtime_sessions`, both of which
+    must complete several closes inside one shared transaction -- a full
+    `session.rollback()` for one duplicate would discard every sibling close already
+    done in that same transaction. The UNIQUE(runtime_session_id) constraint is still
+    a REAL backstop, not just a schema-level comment: the insert below runs inside its
+    own `begin_nested()` savepoint, so if the constraint ever does fire (this function
+    called with a stale lock, a bug elsewhere), only that savepoint rolls back --
+    mirroring `services/api/services/room_assignment.py`'s own asyncpg-safe pattern --
+    and the caller gets the existing row back instead of a poisoned transaction.
     """
     stmt = (
         select(AgentRuntimeSession)
@@ -129,11 +153,7 @@ async def close_task(
     if runtime_session is None:
         return None, False
 
-    existing = (
-        await session.execute(
-            select(AgentRuntimeClosure).where(AgentRuntimeClosure.runtime_session_id == runtime_session_id)
-        )
-    ).scalar_one_or_none()
+    existing = await _get_existing_closure(session, runtime_session_id)
     if existing is not None:
         if (
             closed_by == AgentRuntimeClosedBy.hook
@@ -159,8 +179,20 @@ async def close_task(
         task_id=runtime_session.task_id, closed_by=closed_by.value, outcome=outcome.value,
         reason_code=reason_code.value, tool_call_count=tool_call_count, artifact_id=None,
     )
-    session.add(closure)
-    await session.flush()
+    try:
+        async with session.begin_nested():
+            session.add(closure)
+            await session.flush()
+    except IntegrityError:
+        # The savepoint rollback from `begin_nested()`'s own `__aexit__` is scoped to
+        # just this INSERT -- unlike `routes/agent_runtime.py`'s full-session
+        # rollback, it leaves every earlier statement in THIS transaction (a sibling
+        # close in the same `end_session`/reaper loop) intact and the session fully
+        # usable for the re-read right below.
+        existing = await _get_existing_closure(session, runtime_session_id)
+        if existing is None:
+            raise
+        return existing, False
 
     if task is not None:
         await _advance_task(

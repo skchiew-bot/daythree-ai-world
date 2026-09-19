@@ -36,6 +36,7 @@ from contracts.enums import (
     AgentRuntimeKind,
     AgentRuntimeReasonCode,
     AutonomyLevel,
+    TaskStatus,
     UserRole,
     UserStatus,
 )
@@ -43,9 +44,15 @@ from contracts.events import Actor
 from contracts.ids import new_id
 from contracts.policy import BudgetPolicy, ToolPolicy
 
+import api.services.agent_runtime_closure as agent_runtime_closure_module
 from api.routes.agent_runtime import _register_session, _register_subagent
 from api.schemas.agent_runtime import AgentRuntimeSessionCreateRequest
-from api.services.agent_runtime_closure import close_task, compute_hook_loss_rate, reap_stale_runtime_sessions
+from api.services.agent_runtime_closure import (
+    _advance_task,
+    close_task,
+    compute_hook_loss_rate,
+    reap_stale_runtime_sessions,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -451,3 +458,103 @@ async def test_a_late_hook_close_after_reaping_sets_late_close_at_and_leaves_the
         after = await compute_hook_loss_rate(session, ctx["tenant_id"], since=since)
     assert after.lost == 0  # removed from the loss count
     assert after.total == 1
+
+
+# ---------------------------------------------------------------------------
+# Code review follow-up (PR #35, MEDIUM): the closure table's UNIQUE
+# `runtime_session_id` must be a REAL backstop -- if it ever fires, only its own
+# savepoint should roll back, not the whole transaction (which would discard
+# sibling closes already done by the same `end_session`/reaper loop call).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_task_survives_an_integrity_error_and_returns_the_existing_closure(sessionmaker, monkeypatch):
+    ctx = await _make_tenant_and_agent(sessionmaker)
+    rows = await _register_session_and_subagent(sessionmaker, ctx, "inst-integrity-backstop")
+    actor = Actor(type=ActorType.system)
+
+    # A closure row already exists for this runtime session, inserted directly
+    # (bypassing close_task entirely) so the UNIQUE constraint is primed to fire.
+    async with sessionmaker() as session:
+        pre_existing = AgentRuntimeClosure(
+            id=new_id(), tenant_id=ctx["tenant_id"], runtime_session_id=rows["subagent_id"],
+            task_id=rows["task_id"], closed_by=AgentRuntimeClosedBy.hook.value,
+            outcome=AgentRuntimeCloseOutcome.completed.value, reason_code=AgentRuntimeReasonCode.hook_reported.value,
+        )
+        session.add(pre_existing)
+        await session.commit()
+        pre_existing_id = pre_existing.id
+
+    # Simulate the lock-free pre-check missing the already-committed row (the only
+    # way this branch is reachable in practice) by making the FIRST lookup lie;
+    # the SECOND call (inside the except branch) delegates to the real lookup.
+    call_count = {"n": 0}
+    real_lookup = agent_runtime_closure_module._get_existing_closure
+
+    async def _miss_it_once(session, runtime_session_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return await real_lookup(session, runtime_session_id)
+
+    monkeypatch.setattr(agent_runtime_closure_module, "_get_existing_closure", _miss_it_once)
+
+    async with sessionmaker() as session:
+        closure, is_new = await agent_runtime_closure_module.close_task(
+            session, _NoopEventPublisher(), tenant_id=ctx["tenant_id"], actor=actor,
+            runtime_session_id=rows["subagent_id"], outcome=AgentRuntimeCloseOutcome.failed,
+            reason_code=AgentRuntimeReasonCode.reaped_stale, closed_by=AgentRuntimeClosedBy.reaper,
+            tool_call_count=None,
+        )
+        # asyncpg gotcha check (room_assignment.py's own precedent): a savepoint-
+        # scoped rollback must leave the session itself fully usable -- proven by
+        # actually running another query here, not assumed.
+        still_usable = await session.get(AgentRuntimeSession, rows["subagent_id"])
+        assert still_usable is not None
+        await session.commit()
+
+    assert is_new is False
+    assert closure.id == pre_existing_id
+    assert closure.closed_by == "hook"  # the ORIGINAL row, untouched
+
+    async with sessionmaker() as session:
+        closures = (
+            await session.execute(
+                select(AgentRuntimeClosure).where(AgentRuntimeClosure.runtime_session_id == rows["subagent_id"])
+            )
+        ).scalars().all()
+        assert len(closures) == 1  # no second row was created
+        task = await session.get(Task, rows["task_id"])
+        assert task.status == "queued"  # the pre-existing closure's own outcome was never re-applied
+
+
+# ---------------------------------------------------------------------------
+# Code review follow-up (PR #35, LOW): `_advance_task` had no explicit branch for
+# `TaskStatus.waiting` -- TASK_TRANSITIONS has no waiting->completed edge, so
+# closing a waiting Task as completed must route through running, not 500.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_advance_task_closes_a_waiting_task_as_completed_via_running(sessionmaker):
+    ctx = await _make_tenant_and_agent(sessionmaker)
+    rows = await _register_session_and_subagent(sessionmaker, ctx, "inst-waiting-task")
+    actor = Actor(type=ActorType.system)
+
+    async with sessionmaker() as session:
+        subagent = await session.get(AgentRuntimeSession, rows["subagent_id"])
+        mission_id = subagent.mission_id
+        task = await session.get(Task, rows["task_id"])
+        task.status = TaskStatus.waiting.value
+        await session.commit()
+
+        await _advance_task(
+            session, _NoopEventPublisher(), tenant_id=ctx["tenant_id"], actor=actor,
+            mission_id=mission_id, task=task, target=TaskStatus.completed, reason_code="hook_reported",
+        )
+        await session.commit()
+
+    async with sessionmaker() as session:
+        task = await session.get(Task, rows["task_id"])
+        assert task.status == "completed"
