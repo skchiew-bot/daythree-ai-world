@@ -1,26 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { useEffect, useMemo, useState } from "react";
 
 import { useAgentRooms, useExternalAgentStatuses, useMissionTimeline, useMissions } from "@/api/hooks";
-import type { AgentRoom } from "@/types/api";
-import {
-  deriveExternalAgentState,
-  deriveRoomAgentState,
-  pickFocusMission,
-  type AgentState,
-} from "@/world/agentState";
-import { buildApartment, disposeApartment, tintRoomPanel, type ApartmentHandle } from "@/world/apartment";
-import { buildAvatar, snapAvatar, updateAvatar, type AvatarAnimState, type AvatarHandle } from "@/world/avatar";
-import { roomAnchors, roomKey } from "@/world/layout";
+import { deriveExternalAgentState, deriveRoomAgentState, pickFocusMission, type AgentState } from "@/world/agentState";
+import { toWorldAgents } from "@/world/renderPayload";
+import { WorldCanvas } from "@/world/WorldCanvas";
 
-const EXTERNAL_ROW_Z = 4.4;
 const FALLBACK_FLOOR_COUNT = 5;
 
-interface RoomAvatarEntry {
-  handle: AvatarHandle;
-  anim: AvatarAnimState;
-  roomKey: string;
+function describeScene(agents: { activity: string }[], externalCount: number): string {
+  const count = (activity: string) => agents.filter((a) => a.activity === activity).length;
+  return (
+    `3D view of the agent apartment: ${agents.length} governed agents ` +
+    `(${count("idle")} idle, ${count("assigned")} assigned, ${count("working")} working), ` +
+    `plus ${externalCount} external agents in the front row.`
+  );
 }
 
 export function World() {
@@ -34,6 +27,16 @@ export function World() {
   const timelineEventTypes = useMemo(() => timeline?.map((e) => e.event_type) ?? [], [timeline]);
 
   const rooms = useMemo(() => roomsData?.rooms ?? [], [roomsData]);
+  // Everything the 3D scene sees about a governed agent comes through this one
+  // allow-list (ADR-013, data-warden D11). The tables below keep using the full rows.
+  const worldAgents = useMemo(() => toWorldAgents(rooms), [rooms]);
+  const agentStates = useMemo(
+    () =>
+      new Map<string, AgentState>(
+        worldAgents.map((a) => [a.agent_id, deriveRoomAgentState(a, focusAgentId, timelineEventTypes)]),
+      ),
+    [worldAgents, focusAgentId, timelineEventTypes],
+  );
   const focusAgentName = rooms.find((r) => r.agent_id === focusAgentId)?.display_name ?? "Assigned agent";
   const floors = Math.max(
     roomsData?.default_floor_count ?? FALLBACK_FLOOR_COUNT,
@@ -51,210 +54,33 @@ export function World() {
   }, []);
 
   const externalList = externalAgents ?? [];
-
-  const containerRef = useRef<HTMLDivElement>(null);
-  const roomsRef = useRef<AgentRoom[]>(rooms);
-  roomsRef.current = rooms;
-  const roomStatesRef = useRef<Map<string, AgentState>>(new Map());
-  roomStatesRef.current = new Map(
-    rooms.map((r) => [r.agent_id, deriveRoomAgentState(r, focusAgentId, timelineEventTypes)]),
+  const externalNames = externalList.map((a) => a.name);
+  const externalStates = new Map<string, AgentState>(
+    externalList.map((a) => [a.name, deriveExternalAgentState(a, now)]),
   );
-  const floorsRef = useRef<number>(floors);
-  floorsRef.current = floors;
-
-  const externalStatesRef = useRef<Map<string, AgentState>>(new Map());
-  externalStatesRef.current = new Map(externalList.map((a) => [a.name, deriveExternalAgentState(a, now)]));
-  const externalNamesRef = useRef<string[]>([]);
-  externalNamesRef.current = externalList.map((a) => a.name);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0f172a);
-    scene.fog = new THREE.Fog(0x0f172a, 10, 30);
-
-    const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
-    camera.position.set(6, 6, 11);
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    container.appendChild(renderer.domElement);
-
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 2.5, 0);
-    controls.enableDamping = true;
-    controls.minDistance = 3;
-    controls.maxDistance = 26;
-    controls.maxPolarAngle = Math.PI / 2.05;
-
-    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
-    sun.position.set(6, 10, 4);
-    scene.add(sun);
-
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(28, 28),
-      new THREE.MeshStandardMaterial({ color: 0x1e293b }),
-    );
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -0.05;
-    scene.add(ground);
-    scene.add(new THREE.GridHelper(28, 28, 0x334155, 0x1e293b));
-
-    let apartment: ApartmentHandle = buildApartment(scene, floorsRef.current);
-    let lastSyncedFloors = floorsRef.current;
-
-    // Room-based avatars: one per governed agent that currently has a room, keyed by
-    // agent_id (never array index — a room's position comes only from its own
-    // floor/room_index, per ADR-009).
-    const roomAvatars = new Map<string, RoomAvatarEntry>();
-
-    function syncRoomAvatars() {
-      const currentRooms = roomsRef.current;
-      const currentIds = new Set(currentRooms.map((r) => r.agent_id));
-
-      for (const [agentId, entry] of roomAvatars) {
-        if (!currentIds.has(agentId)) {
-          scene.remove(entry.handle.group);
-          scene.remove(entry.handle.resultRing);
-          roomAvatars.delete(agentId);
-        }
-      }
-
-      for (const room of currentRooms) {
-        const key = roomKey(room.floor, room.room_index);
-        const anchors = roomAnchors(room.floor, room.room_index);
-        const existing = roomAvatars.get(room.agent_id);
-
-        if (!existing) {
-          const handle = buildAvatar(scene, anchors.idle, anchors.desk);
-          roomAvatars.set(room.agent_id, { handle, anim: { ringElapsed: 0, lastState: "idle" }, roomKey: key });
-          continue;
-        }
-
-        if (existing.roomKey !== key) {
-          // Reassigned to a different room (suspend/reactivate) — snap rather than
-          // lerp across the building.
-          existing.handle.basePosition.copy(anchors.idle);
-          existing.handle.workPosition.copy(anchors.desk);
-          const state = roomStatesRef.current.get(room.agent_id) ?? "idle";
-          snapAvatar(existing.handle, state !== "idle");
-          existing.roomKey = key;
-        }
-      }
-    }
-
-    // External agents: unchanged from the pre-ADR-009 desk layout — a growing/
-    // shrinking pool of avatars in their own row in front of the building.
-    const externalHandles = new Map<string, { handle: AvatarHandle; anim: AvatarAnimState }>();
-
-    function slotPosition(index: number, total: number): THREE.Vector3 {
-      const spacing = 1.6;
-      const startX = -((total - 1) * spacing) / 2;
-      return new THREE.Vector3(startX + index * spacing, 0, EXTERNAL_ROW_Z);
-    }
-
-    function syncExternalAvatars() {
-      const names = externalNamesRef.current;
-      for (const [name, entry] of externalHandles) {
-        if (!names.includes(name)) {
-          scene.remove(entry.handle.group);
-          scene.remove(entry.handle.resultRing);
-          externalHandles.delete(name);
-        }
-      }
-      names.forEach((name, i) => {
-        const pos = slotPosition(i, names.length);
-        const entry = externalHandles.get(name);
-        if (entry) {
-          entry.handle.basePosition.copy(pos);
-          entry.handle.workPosition.copy(pos);
-        } else {
-          const handle = buildAvatar(scene, pos, pos.clone());
-          externalHandles.set(name, { handle, anim: { ringElapsed: 0, lastState: "idle" } });
-        }
-      });
-    }
-
-    function handleResize() {
-      if (!container) return;
-      camera.aspect = container.clientWidth / container.clientHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(container.clientWidth, container.clientHeight);
-    }
-    window.addEventListener("resize", handleResize);
-
-    let frameId: number;
-    const clock = new THREE.Clock();
-    let lastSyncedRoomKey = "";
-    let lastSyncedNameKey = "";
-
-    function animate() {
-      frameId = requestAnimationFrame(animate);
-      const dt = clock.getDelta();
-      const t = clock.getElapsedTime();
-
-      if (floorsRef.current !== lastSyncedFloors) {
-        disposeApartment(scene, apartment);
-        apartment = buildApartment(scene, floorsRef.current);
-        lastSyncedFloors = floorsRef.current;
-      }
-
-      const roomSyncKey = roomsRef.current.map((r) => `${r.agent_id}:${r.floor}:${r.room_index}`).join("|");
-      if (roomSyncKey !== lastSyncedRoomKey) {
-        syncRoomAvatars();
-        lastSyncedRoomKey = roomSyncKey;
-      }
-
-      const nameKey = externalNamesRef.current.join("|");
-      if (nameKey !== lastSyncedNameKey) {
-        syncExternalAvatars();
-        lastSyncedNameKey = nameKey;
-      }
-
-      for (const room of roomsRef.current) {
-        const entry = roomAvatars.get(room.agent_id);
-        if (!entry) continue;
-        const state = roomStatesRef.current.get(room.agent_id) ?? "idle";
-        updateAvatar(entry.handle, entry.anim, state, t, dt);
-        tintRoomPanel(apartment, room.floor, room.room_index, state);
-      }
-
-      for (const [name, entry] of externalHandles) {
-        const state = externalStatesRef.current.get(name) ?? "idle";
-        updateAvatar(entry.handle, entry.anim, state, t, dt);
-      }
-
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    animate();
-
-    return () => {
-      cancelAnimationFrame(frameId);
-      window.removeEventListener("resize", handleResize);
-      controls.dispose();
-      renderer.dispose();
-      container.removeChild(renderer.domElement);
-    };
-  }, []);
 
   return (
     <div>
       <h2>3D World</h2>
       <p style={{ color: "var(--text-muted)", marginTop: "-0.5rem" }}>
         Not part of the Phase 0 spec — an additive visualization of the real agent runtime. Every
-        governed agent gets its own room in a per-tenant apartment (ADR-009), walking to its room's
-        desk when it has an active task and back to idle when it doesn't — driven live by{" "}
+        governed agent gets its own room in a per-tenant apartment (ADR-009). It sits at its room's
+        desk when it has an active task; when it is idle it wanders out through the corridor to the
+        lobby and back, on a schedule every browser computes the same way. Driven live by{" "}
         <code>GET /api/v1/agent-rooms</code>, not scripted. The row in front reflects any external
         agent — a Claude Code session, a script, anything — pinging{" "}
         <code>PUT /api/v1/external-agents/&#123;name&#125;/status</code>.
       </p>
       <div className="card" style={{ padding: 0, overflow: "hidden" }}>
-        <div ref={containerRef} style={{ width: "100%", height: "60vh" }} />
+        <WorldCanvas
+          agents={worldAgents}
+          agentStates={agentStates}
+          floors={floors}
+          externalNames={externalNames}
+          externalStates={externalStates}
+          label={describeScene(worldAgents, externalList.length)}
+          describedBy="world-room-occupancy"
+        />
       </div>
       <div className="card" style={{ marginTop: "1rem" }}>
         <strong>Focus mission</strong>{" "}
@@ -269,7 +95,7 @@ export function World() {
           </span>
         )}
       </div>
-      <div className="card" style={{ marginTop: "1rem" }}>
+      <div className="card" id="world-room-occupancy" style={{ marginTop: "1rem" }}>
         <strong>Room occupancy</strong>
         {rooms.length === 0 ? (
           <p style={{ color: "var(--text-muted)" }}>No governed agents registered yet.</p>
