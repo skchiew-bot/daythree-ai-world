@@ -153,14 +153,14 @@ likely to be screenshotted and shared.
   Twins gain nothing they can trigger.
 - The residence is unchanged; every ADR-009 guarantee about rooms holds.
 
-## Operator decisions
+## Operator decisions (Chiew Sin Kwang, 2026-09-19)
 
-- **O15.** Lot count and grid shape (default: 48 lots, 6 streets of 8; the residence and the hall
-  anchor the main street).
-- **O16.** Whether the community hall also hosts the Bench twin when O1's open half is decided
-  (default: yes, but not in this ADR).
-- **O17.** Whether `name` may appear anywhere in the admin UI's World page sidebar, or only in the
-  Projects page (default: sidebar shows `code` and `name`, canvas shows `code`).
+- **O15. Decided:** 48 lots on 6 streets of 8; the residence and the community hall anchor the
+  main street. The per-tenant cap of 48 active projects matches the lot count.
+- **O16. Decided:** yes, the community hall hosts the Bench twin once that twin exists. The Bench
+  twin itself remains ADR-011 O1's open item and is not built in W2.
+- **O17. Decided:** the World page sidebar may show a project's `code` and `name`; the canvas shows
+  `code` only (D13 unchanged).
 
 ## Rollback Path
 
