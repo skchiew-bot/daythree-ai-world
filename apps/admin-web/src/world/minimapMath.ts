@@ -31,6 +31,21 @@ export function canvasToWorld(px: number, py: number, bounds: Bounds, size: numb
   return { x: bounds.minX + (px - offsetX) / scale, z: bounds.minZ + (py - offsetY) / scale };
 }
 
+/** The unit forward direction, in canvas space, for a world heading. Must match
+ * `walkMotion.ts`'s forward vector `(sin h, cos h)` in world (x, z) composed with
+ * `worldToCanvas`'s unflipped `x -> x`, `z -> y` mapping — so the minimap arrow always
+ * points the way the operator is actually walking. */
+export function headingVector(heading: number): CanvasPoint {
+  return { x: Math.sin(heading), y: Math.cos(heading) };
+}
+
+/** The tip of the operator's minimap arrow (deliverable 7): `size` px ahead of `center`
+ * along its heading, using the same forward direction as the walk itself. */
+export function arrowTip(center: CanvasPoint, heading: number, size: number): CanvasPoint {
+  const dir = headingVector(heading);
+  return { x: center.x + dir.x * size, y: center.y + dir.y * size };
+}
+
 /** The index of the closest dot within `maxDistPx`, for the hover tooltip and for
  * distinguishing "clicked a twin" from "clicked empty ground" (D21). */
 export function nearestDot(px: number, py: number, dots: readonly CanvasPoint[], maxDistPx = 8): number | null {

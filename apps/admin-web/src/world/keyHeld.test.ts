@@ -111,6 +111,24 @@ describe("attachExploreKeyboard (C1, C2, W3-F8)", () => {
     keyboard.dispose();
   });
 
+  it("clear() zeroes every held direction without removing any listener (review fix: mode-switch clearing)", () => {
+    const element = new FakeTarget();
+    const win = new FakeTarget();
+    const doc = new FakeTarget();
+    const keyboard = attachExploreKeyboard(element, { onEscape: vi.fn() }, win, doc);
+
+    element.dispatch("keydown", keyEvent("w"));
+    expect(keyboard.held.forward).toBe(true);
+
+    keyboard.clear();
+    expect(keyboard.held.forward).toBe(false);
+
+    // The listeners are untouched: a fresh keydown still moves the operator afterwards.
+    element.dispatch("keydown", keyEvent("d"));
+    expect(keyboard.held.right).toBe(true);
+    keyboard.dispose();
+  });
+
   it("test 3: a StrictMode-style mount, dispose, remount leaves exactly one listener set", () => {
     const element = new FakeTarget();
     const win = new FakeTarget();

@@ -5,7 +5,7 @@
  * once per project-set signature onto an offscreen canvas; the dynamic layer (operator,
  * twins) redraws at C6's 10 Hz cap. */
 import type { Footprint } from "./footprints";
-import { worldToCanvas } from "./minimapMath";
+import { arrowTip, headingVector, worldToCanvas } from "./minimapMath";
 import type { Bounds } from "./footprints";
 import type { RoadGraph } from "./town";
 
@@ -19,10 +19,6 @@ export interface DrawCtx {
   stroke(): void;
   fill(): void;
   arc(x: number, y: number, r: number, startAngle: number, endAngle: number): void;
-  save(): void;
-  restore(): void;
-  translate(x: number, y: number): void;
-  rotate(angle: number): void;
   fillStyle: string | CanvasGradient | CanvasPattern;
   strokeStyle: string | CanvasGradient | CanvasPattern;
   lineWidth: number;
@@ -89,15 +85,20 @@ export function drawDynamicLayer(
   }
 
   const op = worldToCanvas(operator.x, operator.z, bounds, size);
-  ctx.save();
-  ctx.translate(op.x, op.y);
-  ctx.rotate(operator.heading);
+  const tip = arrowTip(op, operator.heading, ARROW_SIZE_PX);
+  // The two trailing corners: back along the heading, then out to either side of it —
+  // built from the same `headingVector` as the tip, so the two can never disagree again.
+  const dir = headingVector(operator.heading);
+  const backX = op.x - dir.x * ARROW_SIZE_PX * 0.7;
+  const backY = op.y - dir.y * ARROW_SIZE_PX * 0.7;
+  const sideX = dir.y * ARROW_SIZE_PX * 0.6;
+  const sideY = -dir.x * ARROW_SIZE_PX * 0.6;
+
   ctx.fillStyle = OPERATOR_COLOR;
   ctx.beginPath();
-  ctx.moveTo(0, -ARROW_SIZE_PX);
-  ctx.lineTo(ARROW_SIZE_PX * 0.6, ARROW_SIZE_PX * 0.7);
-  ctx.lineTo(-ARROW_SIZE_PX * 0.6, ARROW_SIZE_PX * 0.7);
+  ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(backX + sideX, backY + sideY);
+  ctx.lineTo(backX - sideX, backY - sideY);
   ctx.closePath();
   ctx.fill();
-  ctx.restore();
 }

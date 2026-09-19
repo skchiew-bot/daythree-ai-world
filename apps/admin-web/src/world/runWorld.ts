@@ -117,24 +117,28 @@ function startLoop(kit: SceneKit, read: () => WorldInputs, deps: WorldDeps, hook
 
   let mode: ExploreMode = "fly";
   let explorer: Explorer | null = null;
-  if (hooks.exploreElement) {
-    explorer = new Explorer(scene, kit.avatarAssets, kit.camera, hooks.exploreElement, {
-      onEscape: () => setMode("fly"),
-      onPickAgent: (agentId) => {
-        if (explorer) explorer.followAgentId = agentId;
-        if (mode !== "follow") setMode("follow");
-      },
-    });
-  }
 
+  const focus = (key: string | null): void => {
+    const pick = key === null ? undefined : town.pickFor(key);
+    rig.focus(pick ?? null, motion.isReduced());
+  };
+
+  // Review fix: returning to fly must land back at the town overview (the same path
+  // "Back to overview" uses), not at the walk/follow camera's last ground-level pose.
+  // `focus(null)` sets `controls.target` (via the rig) synchronously under reduced
+  // motion, or starts the same eased eave "Back to overview" uses otherwise — either
+  // way `controls.target` is moving toward the overview before `enabled` flips back on.
   function setMode(next: ExploreMode): void {
     if (next === mode) return;
+    // W3-F8 / deliverable 8: a key still physically down when the mode changes must not
+    // silently resume movement on the next walk/follow entry — Esc never blurs the
+    // explore element, so this is the only place that clears it on a mode switch.
+    explorer?.clearHeldKeys();
     if (next !== "fly") {
       rig.cancelMove();
       kit.controls.enabled = false;
     } else {
-      const at = explorer?.walkState;
-      kit.controls.target.set(at?.x ?? kit.controls.target.x, 1, at?.z ?? kit.controls.target.z);
+      focus(null);
       kit.controls.enabled = true;
       if (explorer) explorer.followAgentId = null;
       lastProximityKey = null;
@@ -147,10 +151,16 @@ function startLoop(kit: SceneKit, read: () => WorldInputs, deps: WorldDeps, hook
     hooks.onModeChange?.(next);
   }
 
-  const focus = (key: string | null): void => {
-    const pick = key === null ? undefined : town.pickFor(key);
-    rig.focus(pick ?? null, motion.isReduced());
-  };
+  if (hooks.exploreElement) {
+    explorer = new Explorer(scene, kit.avatarAssets, kit.camera, hooks.exploreElement, {
+      onEscape: () => setMode("fly"),
+      onPickAgent: (agentId) => {
+        if (explorer) explorer.followAgentId = agentId;
+        if (mode !== "follow") setMode("follow");
+      },
+    });
+  }
+
   const detachPicking = attachPicking(kit.renderer.domElement, kit.camera, () => town.pickables, (key) => {
     if (mode !== "fly") return; // W3-F4: building picks apply only in fly mode
     focus(key);

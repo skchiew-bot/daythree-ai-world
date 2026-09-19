@@ -15,10 +15,6 @@ function fakeCtx(): DrawCtx {
     stroke: vi.fn(),
     fill: vi.fn(),
     arc: vi.fn(),
-    save: vi.fn(),
-    restore: vi.fn(),
-    translate: vi.fn(),
-    rotate: vi.fn(),
     fillStyle: "",
     strokeStyle: "",
     lineWidth: 0,
@@ -57,11 +53,21 @@ describe("drawStaticLayer (ADR-014 W3 deliverable 7)", () => {
 });
 
 describe("drawDynamicLayer", () => {
-  it("draws one arc per twin and one operator arrow", () => {
+  it("draws one arc per twin and one operator arrow triangle", () => {
     const ctx = fakeCtx();
     drawDynamicLayer(ctx, 100, BOUNDS, { x: 0, z: 0, heading: 0 }, [{ x: 1, z: 1 }, { x: 2, z: 2 }]);
     expect(ctx.arc).toHaveBeenCalledTimes(2);
-    expect(ctx.save).toHaveBeenCalledTimes(1);
-    expect(ctx.restore).toHaveBeenCalledTimes(1);
+    expect(ctx.moveTo).toHaveBeenCalledTimes(1);
+    expect(ctx.lineTo).toHaveBeenCalledTimes(2);
+    expect(ctx.fill).toHaveBeenCalledTimes(3); // 2 twin dots + 1 operator arrow
+  });
+
+  it("moves the arrow tip toward +canvas-y at heading 0 (review fix: was drawing north)", () => {
+    const ctx = fakeCtx();
+    drawDynamicLayer(ctx, 100, BOUNDS, { x: 0, z: 0, heading: 0 }, []);
+    const [tipX, tipY] = (ctx.moveTo as ReturnType<typeof vi.fn>).mock.calls[0];
+    const center = { x: 50, y: 50 }; // (0,0) world is the canvas center for these bounds
+    expect(tipY).toBeGreaterThan(center.y);
+    expect(tipX).toBeCloseTo(center.x, 5);
   });
 });

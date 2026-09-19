@@ -1,8 +1,12 @@
 /** The only keyboard listener in W3 (C1, C2, W3-F8): attached to the explore element
  * itself, never `window` or `document`. Held keys are cleared on blur (the element losing
  * focus, or the browser window losing it) and on `visibilitychange`, so a key stuck down
- * when the user alt-tabs away never keeps the operator walking. `dispose` removes every
- * listener this attached, so a StrictMode double-mount leaves exactly one active set. */
+ * when the user alt-tabs away never keeps the operator walking. They are also cleared on
+ * a mode switch via the returned `clear()` — the caller's responsibility, since Esc is
+ * handled inside this same listener and never blurs the element (a key held through an
+ * Esc-triggered switch must not silently resume movement on the next walk entry).
+ * `dispose` removes every listener this attached, so a StrictMode double-mount leaves
+ * exactly one active set. */
 export interface KeyTarget {
   addEventListener(type: string, listener: (event: KeyLikeEvent) => void): void;
   removeEventListener(type: string, listener: (event: KeyLikeEvent) => void): void;
@@ -39,6 +43,9 @@ export interface ExploreKeyboardHandlers {
 
 export interface ExploreKeyboard {
   readonly held: Readonly<Record<WalkKey, boolean>>;
+  /** Zeroes every held direction without touching the listeners — call this on every
+   * mode switch (deliverable 8). */
+  clear: () => void;
   dispose: () => void;
 }
 
@@ -95,6 +102,7 @@ export function attachExploreKeyboard(
 
   return {
     held,
+    clear: clearAll,
     dispose: () => {
       clearAll();
       element.removeEventListener("keydown", onKeyDown);

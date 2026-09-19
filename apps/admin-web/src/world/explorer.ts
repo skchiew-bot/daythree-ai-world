@@ -140,6 +140,16 @@ export class Explorer {
     this.headingDelta = 0;
   }
 
+  /** Zeroes every held direction (deliverable 8: cleared "on ... mode switch"). Esc is
+   * handled inside the same keydown listener that sets `held.forward` etc. and never
+   * blurs the element, so nothing in `keyHeld.ts` clears it on its own — the caller
+   * (`runWorld`'s `setMode`) calls this on every transition, so a key still physically
+   * down when the mode changes can never silently resume movement on the next walk
+   * entry; it takes a fresh keydown. */
+  clearHeldKeys(): void {
+    this.keyboard.clear();
+  }
+
   /** Advances the operator by one walk-mode frame: movement, collision, the avatar's own
    * animation, and the spring-arm camera. This is the only place W3 writes `camera`
    * outside of `stepFollow` (deliverable 2: fly owns the camera in every other mode). */

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Bounds } from "./footprints";
-import { canvasToWorld, minimapSummary, nearestDot, nearestStreetLabel, worldToCanvas } from "./minimapMath";
+import { arrowTip, canvasToWorld, minimapSummary, nearestDot, nearestStreetLabel, worldToCanvas } from "./minimapMath";
 import { streetZ } from "./town";
 
 const BOUNDS: Bounds = { minX: -10, maxX: 10, minZ: -10, maxZ: 10 };
@@ -29,6 +29,39 @@ describe("nearestDot", () => {
 
   it("returns null when nothing is within range", () => {
     expect(nearestDot(0, 0, [{ x: 50, y: 50 }])).toBeNull();
+  });
+});
+
+describe("arrowTip (minimap operator arrow, review fix: wrong axis)", () => {
+  // walkMotion.ts's forward is (sin h, cos h) in world (x, z); worldToCanvas maps world
+  // x -> canvas x and world z -> canvas y with no flip. So the tip, `size` px ahead of
+  // the operator's canvas point, must sit at center + size*(sin h, cos h) for every
+  // heading — the drawn arrow must always match the walk direction.
+  const center = { x: 50, y: 50 };
+  const size = 10;
+
+  it("points toward +canvas-y (matching +world-z) at heading 0", () => {
+    const tip = arrowTip(center, 0, size);
+    expect(tip.x).toBeCloseTo(50, 5);
+    expect(tip.y).toBeCloseTo(60, 5);
+  });
+
+  it("points toward +canvas-x at heading pi/2", () => {
+    const tip = arrowTip(center, Math.PI / 2, size);
+    expect(tip.x).toBeCloseTo(60, 5);
+    expect(tip.y).toBeCloseTo(50, 5);
+  });
+
+  it("points toward -canvas-y at heading pi", () => {
+    const tip = arrowTip(center, Math.PI, size);
+    expect(tip.x).toBeCloseTo(50, 5);
+    expect(tip.y).toBeCloseTo(40, 5);
+  });
+
+  it("points toward -canvas-x at heading 3pi/2", () => {
+    const tip = arrowTip(center, (3 * Math.PI) / 2, size);
+    expect(tip.x).toBeCloseTo(40, 5);
+    expect(tip.y).toBeCloseTo(50, 5);
   });
 });
 
