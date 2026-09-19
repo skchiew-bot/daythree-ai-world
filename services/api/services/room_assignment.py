@@ -72,11 +72,14 @@ async def ensure_assignment(
     concern that must never block agent registration or activation.
     """
     try:
-        existing = await get_assignment(session, tenant_id, agent_id)
-        if existing is not None:
-            return existing
-
         for _ in range(_MAX_ALLOCATION_ATTEMPTS):
+            # Re-checked on every attempt, not once up front: a collision can mean a
+            # concurrent caller just gave this very agent a room, and retrying into a
+            # different slot would then violate the one-active-room-per-agent index.
+            existing = await get_assignment(session, tenant_id, agent_id)
+            if existing is not None:
+                return existing
+
             occupied = {
                 room_to_slot(a.floor, a.room_index)
                 for a in await list_assignments(session, tenant_id)
