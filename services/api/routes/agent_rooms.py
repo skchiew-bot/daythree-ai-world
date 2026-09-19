@@ -92,12 +92,20 @@ async def _project_id_by_mission(session: AsyncSession, tenant_id, mission_ids: 
 async def _projects_summary(session: AsyncSession, tenant_id, referenced_ids: set) -> list[ProjectSummary]:
     """Every active project plus every project referenced by an emitted
     `project_id`, even archived (gate finding F6) — loaded in exactly one query
-    over the id set (gate finding F10)."""
+    over the id set (gate finding F10).
+
+    Ordered by `(created_at, id)` because the town places buildings by probing in this
+    order (gate finding F7): without an explicit ORDER BY the order is Postgres's
+    physical row order, which changes when any project row is updated, and every later
+    building could shift lots.
+    """
     result = await session.execute(
-        select(Project).where(
+        select(Project)
+        .where(
             Project.tenant_id == tenant_id,
             or_(Project.status == ProjectStatus.active.value, Project.id.in_(referenced_ids)),
         )
+        .order_by(Project.created_at, Project.id)
     )
     return [
         ProjectSummary(id=p.id, code=p.code, name=p.name, status=p.status)
