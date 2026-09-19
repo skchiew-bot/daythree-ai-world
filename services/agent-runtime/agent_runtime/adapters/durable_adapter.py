@@ -35,7 +35,9 @@ class DurableAgentRuntimeAdapter:
     checkpoint_store: CheckpointStore
     # Required, not defaulted: a zero-usage fallback is exactly the pre-R0 defect (the
     # budget could never trip on calls, cost or runtime). Consulted before EVERY gateway
-    # call: the first execute, the output-repair execute and a resume after a crash.
+    # call: the first execute, the output-repair execute and a resume after a crash. It is
+    # also handed to the gateway as its write-ahead ledger, so every provider attempt is
+    # committed as a charge before it is sent.
     usage_provider: UsageProvider
 
     async def initialize_run(self, context: RunContext) -> RunHandle:
@@ -129,7 +131,9 @@ class DurableAgentRuntimeAdapter:
         budget_policy = BudgetPolicy(**state["budget_policy"])
 
         usage = await self.usage_provider.usage_for_task(prompt_checkpoint.task_id)
-        outcome = await self.model_gateway.generate(request, budget_policy=budget_policy, usage=usage)
+        outcome = await self.model_gateway.generate(
+            request, budget_policy=budget_policy, usage=usage, ledger=self.usage_provider
+        )
 
         response_checkpoint = await self.checkpoint_store.save(
             Checkpoint(

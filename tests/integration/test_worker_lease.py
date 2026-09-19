@@ -57,15 +57,23 @@ async def test_two_workers_and_one_running_task_make_exactly_one_provider_call(
     task = await _running_task(db_session, seeded)
     provider = SlowCountingProvider()
     deps = dataclasses.replace(engine_deps, model_gateway=ModelGateway(providers={"mock": provider}))
-    sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    real_sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    sessions_opened = []
+
+    def counting_sessionmaker():
+        sessions_opened.append(1)
+        return real_sessionmaker()
 
     results = await asyncio.gather(
-        process_task(fake_redis, sessionmaker, deps, task.id),
-        process_task(fake_redis, sessionmaker, deps, task.id),
+        process_task(fake_redis, counting_sessionmaker, deps, task.id),
+        process_task(fake_redis, counting_sessionmaker, deps, task.id),
     )
 
     assert sorted(results) == [False, True]  # one worker ran it, the other backed off
     assert provider.calls == 1
+    # The loser backs off before it opens a DB session at all: only the lease holder touches
+    # the database (each worker would otherwise open its own pooled connection).
+    assert len(sessions_opened) == 1
     await db_session.refresh(task)
     assert task.status == TaskStatus.completed.value
 

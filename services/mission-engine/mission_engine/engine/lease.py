@@ -98,9 +98,18 @@ class TaskLease:
 
     async def _heartbeat(self) -> None:
         """Returns (ending the race in `run`) once the lease is lost: refresh reports the
-        token gone, or no refresh has succeeded for a full TTL (a hung or failing Redis
-        connection means we can no longer prove we hold it, and another worker may)."""
+        token gone, or refreshes keep failing to the point that the NEXT check could land
+        after the key has expired (a hung or failing Redis connection means we can no longer
+        prove we hold it, and another worker may soon).
+
+        Residual window, not closable here: a process that is paused after a provider request
+        was already sent (SIGSTOP, a VM freeze) can outlive its lease and finish a call
+        another worker also makes. Closing that needs provider-side fencing (idempotency
+        keys), which the OpenAI and Anthropic APIs do not offer for completions."""
         last_ok = time.monotonic()
+        ttl = self._ttl_ms / 1000
+        # One heartbeat cycle is at most a refresh interval plus the refresh timeout.
+        worst_cycle = self._refresh_seconds + self.refresh_timeout_seconds
         while True:
             await asyncio.sleep(self._refresh_seconds)
             try:
@@ -112,8 +121,8 @@ class TaskLease:
                 return
             if refreshed:
                 last_ok = time.monotonic()
-            elif time.monotonic() - last_ok >= self._ttl_ms / 1000:
-                logger.error("task_lease_unrefreshable_for_a_full_ttl", key=self._key)
+            elif time.monotonic() - last_ok + worst_cycle >= ttl:
+                logger.error("task_lease_unrefreshable_before_expiry", key=self._key)
                 return
 
     async def _if_ours(self, command) -> bool:

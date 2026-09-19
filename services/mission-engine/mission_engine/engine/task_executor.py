@@ -14,14 +14,12 @@ from sqlalchemy.sql import func
 from agent_runtime.adapters.durable_adapter import DurableAgentRuntimeAdapter
 from artifact_service.service import commit_artifact
 from artifact_service.storage.object_store import ObjectStore
-from common.db.models import Agent, AgentVersion, Mission, ModelInvocation, ModelPolicy, Task
-from common.hashing import sha256_hex
+from common.db.models import Agent, AgentVersion, Mission, ModelPolicy, Task
 from contracts.enums import (
     ActorType,
     ArtifactType,
     EventType,
     MissionStatus,
-    ModelInvocationStatus,
     TaskStatus,
 )
 from contracts.events import Actor, build_event
@@ -31,12 +29,9 @@ from contracts.policy import BudgetPolicy, ToolPolicy
 from contracts.runtime import RunContext
 from event_service.publisher import EventPublisher
 from model_gateway.gateway import BudgetExceededError, ModelGateway, ModelGatewayError
-from model_gateway.telemetry import estimate_failed_attempt
 
 from mission_engine.checkpoints.sql_checkpoint_store import SqlCheckpointStore
 from mission_engine.engine.usage import SqlUsageProvider
-
-_ORPHANED_CALL = TimeoutError("the previous worker died or lost its lease while this call was in flight")
 
 REPAIR_INSTRUCTION_TEMPLATE = (
     "\n\nYour previous answer was rejected by the output validator: {error}\n"
@@ -83,16 +78,19 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
     # history, not `task.status` — a retried task is re-queued to `queued` by the
     # `/retry` endpoint just like a fresh one, so status alone can't distinguish them,
     # and a worker-restart resume must also count as a retry, not a fresh start.
-    is_first_attempt = task.retry_count == 0 and existing_checkpoint is None
     # `running` on entry means a worker died (or lost its lease) mid-task and the orphan
-    # sweep found it; `queued` is a fresh task or an operator /retry.
+    # sweep recovered it; the sweep already counted that recovery in `retry_count` (and
+    # persisted it, which is what caps automatic recoveries). `queued` is a fresh task or
+    # an operator /retry.
     found_running = task.status == TaskStatus.running.value
+    is_first_attempt = task.retry_count == 0 and existing_checkpoint is None and not found_running
     task.status = TaskStatus.running.value
     if is_first_attempt:
         task.started_at = func.now()
         await _publish(deps, session, EventType.task_started, mission, task, agent, correlation_id, actor)
     else:
-        task.retry_count += 1
+        if not found_running:
+            task.retry_count += 1
         await _publish(
             deps, session, EventType.task_retry_started, mission, task, agent, correlation_id, actor,
             data={"retry_count": task.retry_count},
@@ -111,15 +109,16 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
     )
     adapter = DurableAgentRuntimeAdapter(
         model_gateway=deps.model_gateway, checkpoint_store=checkpoint_store,
-        usage_provider=SqlUsageProvider(session, attempt_started_at),
+        usage_provider=SqlUsageProvider(
+            session, tenant_id=mission.tenant_id, mission_id=mission.id, task_id=task.id,
+            agent_id=agent.id, attempt_started_at=attempt_started_at,
+        ),
     )
 
     try:
         if is_resume:
             await _publish(deps, session, EventType.runtime_recovered, mission, task, agent, correlation_id, actor)
             if existing_checkpoint.state.get("stage") == "prompt_assembled":
-                if found_running:
-                    await _charge_orphaned_call(session, mission, task, agent, existing_checkpoint)
                 await _publish(deps, session, EventType.model_requested, mission, task, agent, correlation_id, actor)
             result = await adapter.resume(existing_checkpoint)
         else:
@@ -127,7 +126,6 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
             await _publish(deps, session, EventType.model_requested, mission, task, agent, correlation_id, actor)
             result = await adapter.execute(handle)
     except BudgetExceededError as exc:
-        _record_failed_attempts(session, mission, task, agent, exc.attempts)
         await _publish(
             deps, session, EventType.budget_exceeded, mission, task, agent, correlation_id, actor,
             data={"reason": str(exc)},
@@ -135,7 +133,6 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         await _fail(deps, session, mission, task, agent, correlation_id, actor, str(exc))
         return
     except ModelGatewayError as exc:
-        _record_failed_attempts(session, mission, task, agent, exc.attempts)
         await _publish(
             deps, session, EventType.model_failed, mission, task, agent, correlation_id, actor,
             data={"error": str(exc)},
@@ -143,12 +140,12 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         await _fail(deps, session, mission, task, agent, correlation_id, actor, str(exc))
         return
 
-    _record_failed_attempts(session, mission, task, agent, result.failed_attempt_telemetry)
+    # The `model_invocations` rows for every attempt (failed ones included) were already
+    # committed by the write-ahead ledger while the gateway ran; nothing is recorded here.
     if result.model_telemetry is not None:
-        _record_model_invocation(session, mission, task, agent, result.model_telemetry)
         await _publish(
             deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
-            data={"provider": result.model_telemetry["provider"], "model": result.model_telemetry["model"]},
+            data=_model_completed_data(result.model_telemetry),
         )
 
     if result.final_checkpoint is not None:
@@ -157,16 +154,9 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
             data={"sequence": result.final_checkpoint.sequence},
         )
 
-    # Durability boundary: the checkpoint itself was already committed inside the
-    # adapter (see `SqlCheckpointStore.save`'s docstring), but the model_invocations
-    # row + model.completed event recorded just above were only *added*, not yet
-    # committed. Without this commit, a crash between here and the next durability
-    # boundary would silently lose that telemetry row forever — a resumed task's
-    # `resume()` intentionally does NOT re-record telemetry for a stage it already has
-    # (that's what stops it from being duplicated), so if it was never committed in the
-    # first place, spec §4 rule 9 ("every model/tool call is recorded") would quietly
-    # fail rather than duplicate. Committing here closes that window down to these few
-    # lines instead of the entire rest of task completion.
+    # Durability boundary: the checkpoint itself was already committed inside the adapter
+    # (see `SqlCheckpointStore.save`'s docstring) and so was the model_invocations charge
+    # (write-ahead ledger); this commits the model.completed event just published.
     await session.commit()
 
     final_text = result.output_text
@@ -182,15 +172,12 @@ async def execute_task(session: AsyncSession, deps: EngineDeps, task_id: EntityI
         try:
             repair_result = await adapter.execute(repair_handle)
         except (BudgetExceededError, ModelGatewayError) as exc:
-            _record_failed_attempts(session, mission, task, agent, exc.attempts)
             await _fail(deps, session, mission, task, agent, correlation_id, actor, f"repair attempt failed: {exc}")
             return
 
-        _record_failed_attempts(session, mission, task, agent, repair_result.failed_attempt_telemetry)
         if repair_result.model_telemetry is not None:
-            _record_model_invocation(session, mission, task, agent, repair_result.model_telemetry)
             await _publish(deps, session, EventType.model_completed, mission, task, agent, correlation_id, actor,
-                            data={"repair_attempt": True})
+                            data={**_model_completed_data(repair_result.model_telemetry), "repair_attempt": True})
             await session.commit()  # same durability reasoning as the first model call, above
 
         final_text = repair_result.output_text
@@ -247,53 +234,13 @@ async def _fail(deps, session, mission, task, agent, correlation_id, actor, reas
                     data={"reason": reason})
 
 
-async def _charge_orphaned_call(session, mission, task, agent, checkpoint) -> None:
-    """A worker died (or lost its lease) after checkpointing the prompt and before recording
-    the provider call's outcome, so that call may have been billed and nothing recorded it.
-    Charge it as one failed call with the conservative timeout estimate
-    (`model_gateway.telemetry.estimate_failed_attempt`) and COMMIT before resuming, so a
-    worker that keeps dying mid-call cannot loop past `max_model_calls` or the cost ceiling
-    for free. This over-counts when the worker died before the call started; that is the
-    deliberate side of "never undercount"."""
-    state = checkpoint.state
-    tokens_in, tokens_out, cost = estimate_failed_attempt(
-        state["provider"], state["model"], system_prompt=state["system_prompt"],
-        user_prompt=state["user_prompt"], max_output_tokens=state["max_output_tokens"], error=_ORPHANED_CALL,
-    )
-    _record_model_invocation(
-        session, mission, task, agent,
-        {
-            "provider": state["provider"], "model": state["model"], "input_tokens": tokens_in,
-            "output_tokens": tokens_out, "estimated_cost": cost, "latency_ms": 0,
-            "status": ModelInvocationStatus.failed.value,
-            "request_hash": sha256_hex(f"orphaned-call:{state.get('assembled_prompt_hash', '')}"),
-            "response_hash": None,
-        },
-    )
-    await session.commit()
-
-
-def _record_failed_attempts(session, mission, task, agent, attempts) -> None:
-    """Persists one `status=failed` row per failed or timed-out provider attempt. Each can
-    have been billed, and `SqlUsageProvider` counts these rows toward the budget. Attempts
-    arrive as telemetry objects (on the gateway's raised error) or as dicts (from
-    `RunResult.failed_attempt_telemetry`)."""
-    for attempt in attempts:
-        telemetry = attempt if isinstance(attempt, dict) else attempt.model_dump(mode="json")
-        _record_model_invocation(session, mission, task, agent, telemetry)
-
-
-def _record_model_invocation(session, mission, task, agent, telemetry: dict) -> None:
-    session.add(
-        ModelInvocation(
-            tenant_id=mission.tenant_id, mission_id=mission.id, task_id=task.id, agent_id=agent.id,
-            provider=telemetry["provider"], model=telemetry["model"],
-            input_tokens=telemetry["input_tokens"], output_tokens=telemetry["output_tokens"],
-            estimated_cost=telemetry["estimated_cost"], latency_ms=telemetry["latency_ms"],
-            status=ModelInvocationStatus(telemetry["status"]).value,
-            request_hash=telemetry["request_hash"], response_hash=telemetry.get("response_hash"),
-        )
-    )
+def _model_completed_data(telemetry: dict) -> dict:
+    """Payload of `model.completed`. `usage_estimated` is only present when the provider
+    returned text without usage figures, so the audit trail shows a priced-by-estimate call."""
+    data = {"provider": telemetry["provider"], "model": telemetry["model"]}
+    if telemetry.get("usage_estimated"):
+        data["usage_estimated"] = True
+    return data
 
 
 async def _publish(deps: EngineDeps, session, event_type: EventType, mission, task, agent,

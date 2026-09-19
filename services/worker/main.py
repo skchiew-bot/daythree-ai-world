@@ -26,6 +26,7 @@ from contracts.enums import TaskStatus
 from contracts.ids import EntityId
 from mission_engine.engine.lease import LeaseLostError, TaskLease, is_leased
 from mission_engine.engine.queue import dequeue_task, enqueue_task
+from mission_engine.engine.recovery import register_recovery
 from mission_engine.engine.task_executor import EngineDeps, execute_task
 
 from worker.deps import build_engine_deps, build_redis_client
@@ -33,32 +34,40 @@ from worker.deps import build_engine_deps, build_redis_client
 logger = structlog.get_logger(__name__)
 
 ORPHAN_SWEEP_INTERVAL_SECONDS = 10.0
-# Every recovery of a task bumps `retry_count` and writes audit events. The sweep runs every
-# few seconds, so a task that fails for a non-model reason on each recovery (an object-store
-# outage, say) must stop being requeued automatically after this many tries; it then stays
-# `running` for an operator, as it did before the periodic sweep existed.
+# Every recovery of a task bumps `retry_count` (persisted by the sweep itself) and writes
+# audit events. The sweep runs every few seconds, so a task that fails for a non-model
+# reason on each recovery (an object-store outage, say) must stop being requeued after this
+# many tries; the sweep then fails it with reason `max_requeues`.
 MAX_AUTO_REQUEUES = 10
 EXECUTABLE_STATUSES = frozenset({TaskStatus.queued.value, TaskStatus.running.value})
 
 
-async def requeue_orphaned_running_tasks(redis_client, sessionmaker: async_sessionmaker | None = None) -> int:
-    """Requeues `running` tasks that no live worker holds a lease on."""
+async def requeue_orphaned_running_tasks(
+    redis_client, sessionmaker: async_sessionmaker | None = None, event_publisher=None
+) -> int:
+    """Requeues `running` tasks that no live worker holds a lease on.
+
+    Each recovery is counted in `retry_count` and committed BEFORE the task is re-enqueued
+    (`mission_engine.engine.recovery`); a task that has already been recovered
+    `MAX_AUTO_REQUEUES` times is failed instead (`event_publisher` is needed for that)."""
     sessionmaker = sessionmaker or get_sessionmaker()
     async with sessionmaker() as session:
-        result = await session.execute(
-            select(Task.id).where(
-                Task.status == TaskStatus.running.value, Task.retry_count < MAX_AUTO_REQUEUES
-            )
-        )
+        result = await session.execute(select(Task.id).where(Task.status == TaskStatus.running.value))
         running_ids = [row[0] for row in result.all()]
 
     requeued = 0
     for task_id in running_ids:
         if await is_leased(redis_client, task_id):
             continue  # another worker is executing it right now
-        await enqueue_task(redis_client, task_id)
-        logger.info("requeued_orphaned_task", task_id=str(task_id))
-        requeued += 1
+        async with sessionmaker() as session:
+            should_requeue = await register_recovery(
+                session, event_publisher, task_id, max_requeues=MAX_AUTO_REQUEUES
+            )
+            await session.commit()
+        if should_requeue:
+            await enqueue_task(redis_client, task_id)
+            logger.info("requeued_orphaned_task", task_id=str(task_id))
+            requeued += 1
     return requeued
 
 
@@ -102,7 +111,7 @@ async def run_forever() -> None:
     redis_client = build_redis_client(settings)
     sessionmaker = get_sessionmaker()
 
-    requeued = await requeue_orphaned_running_tasks(redis_client)
+    requeued = await requeue_orphaned_running_tasks(redis_client, event_publisher=deps.event_publisher)
     logger.info("worker_started", requeued_orphaned_tasks=requeued)
     last_sweep = time.monotonic()
 
@@ -122,7 +131,7 @@ async def run_forever() -> None:
         if time.monotonic() - last_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
             last_sweep = time.monotonic()
             try:
-                await requeue_orphaned_running_tasks(redis_client)
+                await requeue_orphaned_running_tasks(redis_client, event_publisher=deps.event_publisher)
             except Exception:
                 logger.exception("orphan_sweep_failed")
         try:
