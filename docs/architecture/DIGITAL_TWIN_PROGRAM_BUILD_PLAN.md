@@ -70,7 +70,8 @@ policy, without the hook ever being able to elevate itself.
 
 **Deliverables.**
 
-- Migration `0004_agent_runtime_sessions` (`down_revision = "0003_agent_room_assignments"`):
+- Migration `0004_agent_runtime_sessions` (`down_revision = "0003b_model_invocations_index"`, the
+  R0 index migration that sits between 0003 and 0004):
   `agent_runtime_sessions` (tenant-scoped, FK `agents.id`, nullable FK `tasks.id`,
   `external_session_ref`, `external_instance_ref`, `kind` session|subagent, `started_at`,
   `last_heartbeat_at`, `ended_at`, `outcome`), `agent_runtime_persona_slots(tenant_id, slot)`
@@ -99,7 +100,7 @@ policy, without the hook ever being able to elevate itself.
 **Tests.** Cross-tenant isolation for every new route; idempotent replay of session and subagent
 registration; persona cap enforced under 10 concurrent first-sights (real Postgres); registration
 survives an `ensure_assignment` exception; `agent_runtime` gets 403 on accept-shaped and download
-routes; migration upgrade from `0003` and from empty.
+routes; migration upgrade from `0003b` and from empty.
 
 **Exit.** A scoped-key call creates a persona row, a Mission and a Task visible in `audit_events`,
 and the runtime credential cannot download artifacts.
@@ -317,8 +318,10 @@ first and treat its "Gate Review Outcome" findings as the acceptance list.
 (`gateway.py:59` vs `72-103`). Every failed or timed-out attempt writes a `model_invocations` row
 with `status=failed` and the best available cost. `estimate_cost_usd` raises on an unpriced
 `(provider, model)`; `_DEFAULT_PRICE` is removed. Index `model_invocations(tenant_id, agent_id,
-created_at)` via the ADR-009 migration pattern (`0008` is reserved for ADR-013's tables; the index
-may ship in `0008` or its own `0007b` if R0 lands first, the builder decides and records it). Worker
+created_at)` via the ADR-009 migration pattern. **Shipped as its own migration
+`0003b_model_invocations_index`** (`down_revision = "0003_agent_room_assignments"`), so 0004 to
+0008 stay free for ADR-010/011/012/013; R0 also adds `ix_model_invocations_task_id` for the
+per-task usage query, and `0008_twin_rd` no longer carries the `model_invocations` index. Worker
 task lease or ownership check so a restarted second worker cannot requeue a task another worker is
 executing (`worker/main.py:26-35`, `queue.py`). Price-table entries in `telemetry.py` are verified
 against the provider's current public pricing page on the day R0 is built, with source URL and date

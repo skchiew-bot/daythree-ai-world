@@ -135,6 +135,32 @@ async def test_unregistered_provider_is_rejected(client, tenant_with_users):
 
 
 @pytest.mark.asyncio
+async def test_a_model_with_no_configured_price_is_rejected_at_creation(client, tenant_with_users):
+    """R0 (ADR-013): the gateway refuses to call an unpriced model, so accepting the policy
+    here would only produce an agent whose every task fails. Reject it up front, in plain
+    language."""
+    from common.config import Settings, get_settings
+
+    app.dependency_overrides[get_settings] = lambda: Settings(openai_api_key="sk-test-not-a-real-key")
+    token = await _login(client, tenant_with_users["tenant_admin"].email)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    unpriced = await client.post(
+        "/api/v1/model-policies", headers=headers,
+        json={"name": "unpriced", "primary_provider": "openai", "primary_model": "gpt-not-priced"},
+    )
+    assert unpriced.status_code == 422
+    assert "gpt-not-priced" in unpriced.json()["detail"]
+    assert "Traceback" not in unpriced.text
+
+    priced = await client.post(
+        "/api/v1/model-policies", headers=headers,
+        json={"name": "priced", "primary_provider": "openai", "primary_model": "gpt-4o-mini"},
+    )
+    assert priced.status_code == 201, priced.text
+
+
+@pytest.mark.asyncio
 async def test_model_policy_creation_is_rate_limited(client, tenant_with_users):
     from api.routes.model_policies import _RATE_LIMIT_MAX_REQUESTS
 

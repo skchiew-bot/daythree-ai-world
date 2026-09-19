@@ -1,5 +1,66 @@
 # Phase 0 Completion Report
 
+## Correction (R0), 2026-09-19
+
+This report's budget and cost statements overstated what was enforced. Found by the ADR-013 gate
+review (guardian-gatekeeper findings F1, F2, F3, F5) and fixed by phase R0
+(`fix/budget-enforcement-r0`).
+
+**What was true before R0.** On the durable-adapter path every mission and task actually runs,
+only `BudgetPolicy.max_output_tokens` was enforced. `DurableAgentRuntimeAdapter` passed a fresh
+all-zero `BudgetUsage()` to the model gateway on every call, so the `max_model_calls`,
+`max_model_cost_usd`, `max_runtime_minutes` and `max_retries` comparisons in
+`policy_sdk.budgets.evaluate_budget` could never fail. Further gaps:
+
+- The gateway evaluated the budget once, then made up to 3 provider attempts with no
+  re-evaluation, and the output-repair re-prompt was a second full call. A policy of "6 calls,
+  $2.00" could bill up to 6 calls with no budget check between them.
+- A failed or timed-out attempt wrote no `model_invocations` row, although a timed-out call can
+  still be billed by the provider. Cost was recorded only for successful calls.
+- A model missing from the price table was priced at a Sonnet-class default, which undercounts
+  Opus-class models by 5x.
+- A restarted worker requeued every `running` task globally and the queue had no lease, so a
+  second worker could re-run a task another worker was already calling the model for.
+
+**What TC-P0-009 proved.** `test_budget_exceeded_blocks_the_call_tc_p0_009` builds
+`BudgetUsage(calls_made=1)` by hand and calls `ModelGateway.generate` directly. It proves that the
+gateway calls `evaluate_budget` and refuses when the usage it is given is over the ceiling. It did
+not prove that the Mission Engine supplies real usage, and none of the mission-level paths above
+did. The "Token/cost accounting works" acceptance line in the Gate Decision holds for successful
+calls only, and "Known Defects: None" was wrong. The live `gpt-4o-mini` run stayed under $0.01
+because it made one short call, not because a cost ceiling was enforced.
+
+**What R0 changes.**
+
+- The adapter obtains real usage (calls including failed attempts, summed cost, time since the
+  current execution attempt began) from committed `model_invocations` before every model call:
+  the first execute, the output-repair execute and a resume after a crash.
+- The gateway re-evaluates the budget before every attempt after the first, with `is_retry=True`,
+  the call's own attempts and their cost added; a timeout counts as a billed call; `max_retries`
+  is honoured. The cost ceiling is checked against spent plus the attempt's own worst case, so one
+  call cannot carry a task past it.
+- Every provider attempt is written ahead: a `model_invocations` row at the conservative worst-case
+  cost is committed BEFORE the request is sent, then finished with the actual outcome. A crash,
+  lease loss or commit failure therefore leaves at least one committed charge per request that may
+  have been sent. A timeout is charged the conservative estimate (prompt bytes / 3 input tokens plus
+  the full `max_output_tokens` at the output price); a provider 4xx rejection counts as a call at
+  cost 0 and is not retried. The provider SDK clients no longer retry on their own.
+- An unpriced `(provider, model)` raises `UnpricedModelError` before any provider call;
+  `_DEFAULT_PRICE` is removed. `gpt-4o` and `gpt-4o-mini` prices were re-checked against OpenAI's
+  public pricing page on 2026-09-19; the Anthropic rows were not re-verified.
+- A worker executes a task only while holding a short Redis lease, and the orphan requeue skips
+  tasks with a live lease and runs periodically, so a crashed worker's task is still recovered
+  within about 30 seconds.
+- `model_invocations` gains `ix_model_invocations_task_id` and
+  `ix_model_invocations_tenant_agent_created` (migration `0003b_model_invocations_index`).
+- `OpenAIProvider` sends `max_completion_tokens` instead of the deprecated `max_tokens` for
+  o-series, gpt-5 and other non-GPT-4 models.
+
+**Still not covered.** Two tasks running at once for the same tenant or agent are not summed against
+a shared allowance (reservation is ADR-013 R2). A worker process paused after a request was already
+sent (SIGSTOP, a VM freeze) can outlive its lease and finish a call another worker also makes;
+closing that needs provider-side fencing. Both are listed in the R0 pull request.
+
 ## Executive Summary
 
 Phase 0's walking skeleton is built end-to-end against `docs/architecture/PHASE_0_BUILD_SPEC.md`:
@@ -117,7 +178,7 @@ and unit-tested but has never been exercised against the live Anthropic API.
 | TC-P0-006 API Restart | **PASS** | `tests/resilience/test_api_restart.py`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-007 Worker Crash | **PASS** (unit + integration + real container kill/restart) | `test_durable_adapter.py`, `test_recovery.py`, `tests/resilience/test_worker_restart.py`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-008 Model Timeout | **PASS (unit)** | `model-gateway/tests/test_model_gateway.py::test_retries_then_succeeds_tc_p0_008` |
-| TC-P0-009 Budget Exceeded | **PASS (unit)** | `policy_sdk/tests/test_policy_budgets.py` + `test_model_gateway.py::test_budget_exceeded_blocks_the_call_tc_p0_009` |
+| TC-P0-009 Budget Exceeded | **PASS (unit) — evaluator and gateway only; see "Correction (R0)"** | `policy_sdk/tests/test_policy_budgets.py` + `test_model_gateway.py::test_budget_exceeded_blocks_the_call_tc_p0_009`; mission-level enforcement first proven by `tests/integration/test_budget_enforcement_r0.py` |
 | TC-P0-010 Duplicate Start Request | **PASS** | `test_mission_flow.py::test_duplicate_start_request_creates_only_one_run_tc_p0_010`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-011 Artifact Traceability | **PASS** | same file, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
 | TC-P0-012 Tenant Isolation | **PASS** | `test_authz.py::test_cross_tenant_mission_access_returns_404_not_403_tc_p0_012`, [CI run #8](https://github.com/skchiew-bot/daythree-ai-world/actions/runs/34795874791) |
@@ -240,7 +301,8 @@ Anthropic.
 
 ## Known Defects
 
-**None.** All four real bugs CI's first eight runs found (bad Docker Hub image reference, missing
+**None at the time of writing; corrected 2026-09-19: the budget-enforcement defect described in
+"Correction (R0)" above was open then.** All four real bugs CI's first eight runs found (bad Docker Hub image reference, missing
 `timezone=True` on 17 timestamp columns, `MissingGreenlet` on three agent/mission routes, a worker
 Redis-client timeout race, a dual-write ordering race) are fixed and covered by CI run #8's green
 result — see the Executive Summary and each bug's ADR entry for detail. Remaining, explicitly

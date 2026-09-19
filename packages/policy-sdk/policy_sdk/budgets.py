@@ -28,15 +28,23 @@ def evaluate_budget(
     *,
     requested_output_tokens: int,
     is_retry: bool = False,
+    worst_case_cost_usd: float = 0.0,
 ) -> BudgetDecision:
     """Every check is a hard ceiling — none of them "round up" or grant slack, per
     spec §4 rule 15 (no silent fallback): a task that would exceed budget is rejected
     outright, not throttled or partially served.
+
+    `worst_case_cost_usd` is what the call about to be made could cost at most (its
+    estimated input plus its full output cap); the cost ceiling is checked against
+    spent + worst case, so one call cannot carry a task past the ceiling (R0, ADR-013).
+    The default 0.0 keeps the old "spent has already reached the ceiling" behaviour.
     """
     if usage.calls_made >= policy.max_model_calls:
         return BudgetDecision(False, f"max_model_calls ({policy.max_model_calls}) reached.")
 
-    if usage.cost_spent_usd >= policy.max_model_cost_usd:
+    if usage.cost_spent_usd >= policy.max_model_cost_usd or (
+        usage.cost_spent_usd + worst_case_cost_usd > policy.max_model_cost_usd
+    ):
         return BudgetDecision(
             False, f"max_model_cost_usd (${policy.max_model_cost_usd:.2f}) reached."
         )
