@@ -43,7 +43,16 @@ _NEW_TABLES = (
 
 def upgrade() -> None:
     bind = op.get_bind()
-    Base.metadata.create_all(bind=bind, checkfirst=True)
+    # `tables=_NEW_TABLES` restricts `create_all` to exactly this migration's own
+    # three tables (found via 0004b's own CI run): an unrestricted `create_all`
+    # walks the WHOLE of today's `Base.metadata`, so once a LATER migration's model
+    # (e.g. `AgentRuntimeClosure`, added in 0004b) exists in the current codebase,
+    # upgrading to 0004 in isolation would silently create that later table too --
+    # and then 0004's own `downgrade()` could no longer drop `agent_runtime_sessions`
+    # (a live FK from the incidentally-created table blocks it). Passing `tables=`
+    # keeps this migration's effect scoped to precisely what it declares, regardless
+    # of what the models module looks like by the time it runs.
+    Base.metadata.create_all(bind=bind, checkfirst=True, tables=_NEW_TABLES)
     for table in _NEW_TABLES:
         for index in table.indexes:
             index.create(bind=bind, checkfirst=True)

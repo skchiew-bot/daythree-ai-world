@@ -150,6 +150,20 @@ def test_revision_id_fits_alembic_version_and_chains_onto_the_projects_head():
     assert len(script.get_heads()) == 1
 
 
+def test_upgrading_to_0004_alone_does_not_create_a_later_migrations_table(fresh_database):
+    """Regression test (found via 0004b's own CI run): `create_all(checkfirst=True)`
+    used to walk the WHOLE of today's `Base.metadata`, so upgrading to exactly this
+    revision would silently also create `agent_runtime_closures` (0004b's table) the
+    moment that model existed in the codebase -- and then THIS migration's own
+    `downgrade()` could no longer drop `agent_runtime_sessions` (blocked by the
+    incidentally-created table's live FK). `0004`'s `upgrade()` now passes
+    `tables=_NEW_TABLES` so it only ever creates its own three tables, regardless of
+    what a later migration's model declares."""
+    command.upgrade(_alembic(), REVISION)
+
+    assert "agent_runtime_closures" not in fresh_database.table_names()
+
+
 def test_upgrade_from_an_empty_database_creates_the_three_tables_and_every_index(fresh_database):
     command.upgrade(_alembic(), "head")
 

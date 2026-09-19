@@ -41,7 +41,13 @@ _NEW_SESSIONS_INDEX_NAME = "ix_agent_runtime_sessions_open"
 
 def upgrade() -> None:
     bind = op.get_bind()
-    Base.metadata.create_all(bind=bind, checkfirst=True)
+    # `tables=_NEW_TABLES` restricts `create_all` to exactly this migration's own
+    # table -- an unrestricted call walks the WHOLE of today's `Base.metadata`,
+    # which would silently create a still-later migration's table too the moment
+    # its model exists in the codebase (the exact bug this fixes in `0004`'s own
+    # `upgrade()`; see that file's comment). Restricting it here keeps this
+    # migration's own effect exactly scoped even before a `0004c`/`0005` exists.
+    Base.metadata.create_all(bind=bind, checkfirst=True, tables=_NEW_TABLES)
     for table in _NEW_TABLES:
         for index in table.indexes:
             index.create(bind=bind, checkfirst=True)

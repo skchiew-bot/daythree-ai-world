@@ -142,6 +142,12 @@ async def close_task(
         ):
             existing.late_close_at = func.now()
             await session.flush()
+            # Same MissingGreenlet/DetachedInstanceError risk `mission_service.py`'s
+            # own CAS updates already document: assigning `func.now()` leaves the
+            # attribute needing a reload, which a later sync-context read (or a read
+            # after this session closes) cannot perform. Refresh right here, where
+            # the row was actually changed, so every caller gets a real value back.
+            await session.refresh(existing)
         return existing, False
 
     task = await session.get(Task, runtime_session.task_id) if runtime_session.task_id else None
