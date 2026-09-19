@@ -13,7 +13,13 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from contracts.enums import AgentRuntimeKind, AgentRuntimeOutcome
+from contracts.enums import (
+    AgentRuntimeCloseOutcome,
+    AgentRuntimeClosedBy,
+    AgentRuntimeKind,
+    AgentRuntimeOutcome,
+    AgentRuntimeReasonCode,
+)
 from contracts.ids import EntityId
 
 _REF_PATTERN = r"^[A-Za-z0-9._-]{1,64}$"
@@ -72,6 +78,49 @@ class AgentRuntimeSessionUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     outcome: Optional[AgentRuntimeOutcome] = None
+
+
+class AgentRuntimeCloseRequest(BaseModel):
+    """`POST .../subagents/{ref}/close` and `POST .../sessions/{id}/close` (T2
+    deliverable 2). `extra="forbid"` plus this exact field set is the data-warden
+    guard (D28): there is NO `output_text` and NO free-text `reason` field, so a hook
+    trying to send either gets a plain 422 before any route code runs.
+    `tool_call_count` is declared-by-the-hook, never measured by the platform --
+    every place it is shown must say so."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: AgentRuntimeCloseOutcome
+    reason_code: AgentRuntimeReasonCode
+    tool_call_count: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class AgentRuntimeClosureResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: EntityId
+    tenant_id: EntityId
+    runtime_session_id: EntityId
+    task_id: EntityId
+    closed_by: AgentRuntimeClosedBy
+    outcome: AgentRuntimeCloseOutcome
+    reason_code: str
+    tool_call_count: Optional[int]
+    artifact_id: Optional[EntityId]
+    closed_at: datetime
+    late_close_at: Optional[datetime]
+
+
+class HookLossRateResponse(BaseModel):
+    """T2 deliverable 10: computed on read, never a stored counter -- lost means
+    `closed_by='reaper' AND late_close_at IS NULL`, over all subagent closures in
+    `[since, until)`."""
+
+    since: datetime
+    until: datetime
+    lost: int
+    total: int
+    rate: float
 
 
 class AgentRuntimeSessionResponse(BaseModel):

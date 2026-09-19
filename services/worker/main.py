@@ -8,17 +8,25 @@ R0 (ADR-013 F5): a worker executes a task only while it holds that task's Redis 
 sweep runs at startup and then every `ORPHAN_SWEEP_INTERVAL_SECONDS`, because a crashed
 worker's lease outlives the crash by up to its TTL: a sweep at startup alone would skip the
 task and never look again.
+
+T2 (Digital Twin Program): the agent-runtime reaper (`api.services.agent_runtime_closure
+.reap_stale_runtime_sessions`) runs next to R0's sweep on its own timer -- a twin Task has
+no lease at all (it runs outside the platform entirely), so R0's own sweep can never
+recover it; the reaper is what stops a crashed Claude Code hook from leaving a twin Task
+`running` forever.
 """
 from __future__ import annotations
 
 import asyncio
 import signal
 import time
+from datetime import timedelta
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from api.services.agent_runtime_closure import reap_stale_runtime_sessions
 from common.config import get_settings
 from common.db.models import Agent, AgentVersion, Task
 from common.db.session import get_sessionmaker
@@ -40,6 +48,24 @@ ORPHAN_SWEEP_INTERVAL_SECONDS = 10.0
 # many tries; the sweep then fails it with reason `max_requeues`.
 MAX_AUTO_REQUEUES = 10
 EXECUTABLE_STATUSES = frozenset({TaskStatus.queued.value, TaskStatus.running.value})
+
+# The reaper's own query is cheap (one indexed, batch-limited, SKIP LOCKED scan) and the
+# reap window is measured in hours (default `AGENT_RUNTIME_REAP_WINDOW`, 2 hours) -- a
+# minute-scale cadence is frequent enough to reap promptly after the window elapses
+# without adding meaningful DB load between sweeps.
+AGENT_RUNTIME_REAP_SWEEP_INTERVAL_SECONDS = 60.0
+
+
+async def run_agent_runtime_reap_sweep(
+    sessionmaker: async_sessionmaker | None = None, event_publisher=None
+) -> int:
+    settings = get_settings()
+    sessionmaker = sessionmaker or get_sessionmaker()
+    reap_window = timedelta(minutes=settings.agent_runtime_reap_window_minutes)
+    async with sessionmaker() as session:
+        reaped = await reap_stale_runtime_sessions(session, event_publisher, reap_window=reap_window)
+        await session.commit()
+    return reaped
 
 
 async def requeue_orphaned_running_tasks(
@@ -121,8 +147,10 @@ async def run_forever() -> None:
     sessionmaker = get_sessionmaker()
 
     requeued = await requeue_orphaned_running_tasks(redis_client, event_publisher=deps.event_publisher)
-    logger.info("worker_started", requeued_orphaned_tasks=requeued)
+    reaped = await run_agent_runtime_reap_sweep(sessionmaker, event_publisher=deps.event_publisher)
+    logger.info("worker_started", requeued_orphaned_tasks=requeued, reaped_stale_subagents=reaped)
     last_sweep = time.monotonic()
+    last_reap_sweep = time.monotonic()
 
     stop_event = asyncio.Event()
 
@@ -143,6 +171,12 @@ async def run_forever() -> None:
                 await requeue_orphaned_running_tasks(redis_client, event_publisher=deps.event_publisher)
             except Exception:
                 logger.exception("orphan_sweep_failed")
+        if time.monotonic() - last_reap_sweep >= AGENT_RUNTIME_REAP_SWEEP_INTERVAL_SECONDS:
+            last_reap_sweep = time.monotonic()
+            try:
+                await run_agent_runtime_reap_sweep(sessionmaker, event_publisher=deps.event_publisher)
+            except Exception:
+                logger.exception("agent_runtime_reap_sweep_failed")
         try:
             task_id = await dequeue_task(redis_client, timeout_seconds=5)
         except Exception:

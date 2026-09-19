@@ -177,21 +177,40 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_any_existing_table(fr
 
 
 def test_downgrade_drops_only_the_three_tables_and_upgrade_restores_them(fresh_database):
+    """Downgrades run newest-first in a real alembic history: from `head` (today,
+    0004b stacks on top of this migration), downgrading to a named revision undoes
+    EVERYTHING after that revision, not just 0004 in isolation -- so this test
+    downgrades one named revision at a time (`head` -> 0004 -> 0003c), never a
+    relative offset (`-1`), which broke the moment 0004b became the new head (found
+    via 0004b's own CI run: `-1` from head then undid 0004b, not 0004)."""
+    script = ScriptDirectory.from_config(_alembic())
     command.upgrade(_alembic(), "head")
+    assert len(script.get_heads()) == 1
+    head_revision = script.get_heads()[0]
+
     ids = _seed_populated_rows(fresh_database)
     tables_at_head = fresh_database.table_names()
 
-    command.downgrade(_alembic(), "-1")
+    command.downgrade(_alembic(), REVISION)
+
+    assert fresh_database.current_revision() == REVISION
+    assert "agent_runtime_closures" not in fresh_database.table_names()  # 0004b undone
+    assert NEW_TABLES <= fresh_database.table_names()  # 0004's own three tables remain
+    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"
+
+    command.downgrade(_alembic(), PARENT_REVISION)
 
     assert fresh_database.current_revision() == PARENT_REVISION
-    assert tables_at_head - fresh_database.table_names() == NEW_TABLES  # dropped exactly these
+    dropped = tables_at_head - fresh_database.table_names()
+    assert dropped == NEW_TABLES | {"agent_runtime_closures"}  # dropped exactly these, across both steps
     assert fresh_database.table_names() <= tables_at_head  # and created nothing
-    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"
+    assert fresh_database.scalar(f"SELECT title FROM tasks WHERE id = '{ids['task']}'") == "t"  # pre-existing row untouched
 
     command.upgrade(_alembic(), "head")
 
-    assert fresh_database.current_revision() == REVISION
+    assert fresh_database.current_revision() == head_revision
     assert NEW_TABLES <= fresh_database.table_names()
+    assert "agent_runtime_closures" in fresh_database.table_names()
     _assert_all_new_indexes(fresh_database)
 
 
