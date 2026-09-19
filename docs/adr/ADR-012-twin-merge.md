@@ -77,6 +77,15 @@ is minted, destroyed or transferred, and the predecessors can never act again.
    never lazily re-assigned a room.
 8. **Ordering.** `0007` ships after ADR-011's `0005_twin_economy`, so the lineage read is defined
    from the first merge. Merging without a ledger is not offered.
+9. **Merge receipt, fail closed (operator decision O6).** Execute does not require council
+   evidence; the operator's word suffices. In exchange every merge must prove itself. Before the
+   transaction commits it recomputes the lineage balance and asserts that `balance(successor)`
+   equals the sum of every ledger entry across all predecessors plus the successor's own (zero at
+   creation), that every predecessor is `merged` with no active room assignment, and that the
+   `agent.merged` events are staged. Any failed assertion rolls the whole merge back. The response
+   returns a receipt (`merge_id`, predecessor and successor ids, balances before and after, rooms
+   released, event ids), and the receipt can be reproduced afterwards from `agent_merges`, the
+   ledger and `audit_events` alone.
 
 ## Gate Review Outcome (guardian-gatekeeper, 2026-09-18)
 
@@ -150,15 +159,15 @@ phase X1 in the build plan.
 - Predecessor history is never re-attributed: a task closed by A stays A's task. Reports that roll
   up "the successor's work" do so by lineage query, and say so.
 
-## Open decisions for the operator
+## Operator decisions (Chiew Sin Kwang, 2026-09-19)
 
-- **O6.** Whether execute requires council evidence at all, or the operator's word alone suffices
-  (the design allows both).
-- **O7.** Minimum evidence before a council may propose (default proposal: each predecessor has at
-  least 10 accepted artifacts and the pair has shared at least 5 missions in the trailing 60 days).
-- **O8.** Depth cap for the lineage CTE (default 16).
-- **O9.** Whether the successor's display name and description are operator-typed at execute time
-  (default) or drafted by the council for the operator to edit.
+- **O6. Decided:** council evidence is not required to execute a merge; proof that the merge
+  succeeded and an auditable record are enough. Implemented as decision 9 (fail-closed receipt).
+- **O7. Decided:** the council may propose a merge only when each predecessor has at least 10
+  accepted artifacts and the pair has shared at least 5 missions in the trailing 60 days. This
+  gates council proposals only, not operator-initiated merges.
+- **O8. Decided:** lineage depth cap is 16.
+- **O9. Decided:** the operator types the successor's display name and description at execute time.
 
 ## Rollback Path
 

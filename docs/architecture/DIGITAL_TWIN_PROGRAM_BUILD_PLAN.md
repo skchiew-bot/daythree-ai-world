@@ -291,7 +291,10 @@ for a body naming only a proposal reference; 403 for `agent_runtime`; duplicate 
 same idempotency key returns the first result, without it the second is 409; chained merge A+B→C
 then C+D→E gives `balance(E)` equal to the sum over A, B, C, D, E to the cent; concurrent purchase
 against predecessor and successor lets exactly one succeed; `rationale` never appears in
-`audit_events.payload`; `downgrade()` from `0007` lists agents left in `merged`.
+`audit_events.payload`; `downgrade()` from `0007` lists agents left in `merged`. Receipt (ADR-012
+decision 9): the response carries `merge_id`, ids, balances before and after, rooms released and
+event ids; a forced conservation mismatch rolls the whole merge back; the receipt is reproducible
+from `agent_merges`, the ledger and `audit_events` alone.
 
 **Exit criteria.** ADR-012 conditions M1 to M10 each have a named test; typecheck and build green;
 the completion report's twin section states that successor balances include lineage.
@@ -315,7 +318,11 @@ with `status=failed` and the best available cost. `estimate_cost_usd` raises on 
 created_at)` via the ADR-009 migration pattern (`0008` is reserved for ADR-013's tables; the index
 may ship in `0008` or its own `0007b` if R0 lands first, the builder decides and records it). Worker
 task lease or ownership check so a restarted second worker cannot requeue a task another worker is
-executing (`worker/main.py:26-35`, `queue.py`).
+executing (`worker/main.py:26-35`, `queue.py`). Price-table entries in `telemetry.py` are verified
+against the provider's current public pricing page on the day R0 is built, with source URL and date
+in a comment. The operator's provider is OpenAI (ADR-013 O13), so `gpt-4o-mini` and `gpt-4o` are
+checked first, and the builder confirms that `openai_provider.py:31` (`max_tokens`) is accepted by
+every model the operator will use, switching to `max_completion_tokens` where a model requires it.
 
 **Tests.** A task with `max_model_calls=1` and a provider that times out twice makes exactly one
 provider call; `max_model_cost_usd` trips on the second call once the first's cost is committed;
@@ -324,6 +331,7 @@ repair execute counts against the same budget; unpriced model raises; failed att
 integration suites stay green.
 
 **Exit.** Completion report's budget section corrected to say what was enforced before and after.
+No real provider key is set in `.env` until this phase is merged.
 
 **Handoff prompt:** as T1, phase R0, branch `fix/budget-enforcement-r0`, read ADR-013 "Context"
 first; this is a defect fix, keep diffs minimal and do not touch twin code.
@@ -370,7 +378,9 @@ measured", side by side with measured figures. Review-latency metric (time from 
 operator accept/reject) added to the Gate E dashboard.
 
 **Tests.** Period sum matches committed rows to the cent; declared and measured never mix in one
-number; label present in API and UI.
+number; label present in API and UI. Live smoke test, run by the operator locally with the key in
+`.env` (never pasted anywhere): one real OpenAI call capped at a few cents, its recorded
+`estimated_cost` compared with OpenAI's own usage dashboard, the difference noted in the PR.
 
 **Handoff prompt:** as T1, phase R1, branch `feat/rd-r1-metering`.
 

@@ -189,15 +189,17 @@ append-only and unvetted. Conditions adopted:
   carry the "declared, not measured" label wherever the number came from a self-report.
 - The economy can be switched off without touching twins: removing `0005` leaves ADR-010 intact.
 
-## Open decisions for the operator
+## Operator decisions (Chiew Sin Kwang, 2026-09-19)
 
-- **O1.** The initial 5-persona roster (default proposal in the build plan: `planner`, `architect`,
-  `code-reviewer`, `tdd-guide`, `security-reviewer`).
-- **O2.** Gate E thresholds (default proposal: 30 closed twin tasks, 20 operator reviews, measured
-  hook-loss rate under 5% over two weeks).
-- **O3.** The credit unit's display name (default: "credits").
-- **O4.** Council cadence and per-run token budget (default: weekly, hard-capped).
-- **O5.** Which real projects the twins work on first (the build plan assumes this repository).
+- **O1. Decided:** the initial roster is the 5 proposed personas: `planner`, `architect`,
+  `code-reviewer`, `tdd-guide`, `security-reviewer`. The pooled "Bench" twin for the other ~68
+  definitions was floated on 2026-09-18 and is **not decided**; until it is, other definitions
+  activate on first sight up to ADR-010's cap of 25.
+- **O2. Decided:** Gate E thresholds stay at 30 closed twin tasks, 20 operator reviews, and a
+  measured hook-loss rate under 5% over two weeks.
+- **O3. Decided:** the credit unit is called "credits".
+- **O4. Decided:** the council runs weekly with a hard per-run token cap.
+- **O5. Decided:** the twins' first real project is this repository.
 
 ## Rollback Path
 

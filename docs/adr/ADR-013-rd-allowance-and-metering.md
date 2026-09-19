@@ -57,7 +57,8 @@ Six parts, in dependency order. Nothing in parts 2 to 5 ships before part 1 is m
    hard error, never a default price; add an index on `model_invocations(tenant_id, agent_id,
    created_at)`. Exit test: a task with `max_model_calls=1` makes exactly one provider call across
    retries and repair. This is a defect fix to Phase 0 and is recorded as such in the completion
-   report.
+   report. **No real provider key is set in `.env` until R0 is merged**: operator decision O13
+   makes OpenAI the worker's provider, so the first configured key is the first real spend.
 2. **Meter before granting (R1).** Per-twin spend for the current period, derived from the now
    trustworthy rows, shown in the admin UI and the twin's room. For `external_manual` twins the
    figure is the declared flat fee and is labeled "declared, not measured"; declared numbers never
@@ -200,17 +201,24 @@ access control of its own, and that `sql_checkpoint_store.py:30-42` persists ful
 - Amendment to ADR-011 recorded here: M1's profile read uses server-side injection into
   `input_context`, not the `knowledge_read` tool as written.
 
-## Open decisions for the operator
+## Operator decisions (Chiew Sin Kwang, 2026-09-19)
 
-- **O10.** Whether R0 ships now as a standalone fix PR, ahead of the twin phases (recommended: yes,
-  it is a latent defect independent of ADR-013).
-- **O11.** Initial per-twin R&D ceiling and period (default: $2 per twin per week).
-- **O12.** The step bands for `f` (default 0 / 25 / 50 / 100% at 0 / 5 / 15 / 30 credits in the
-  trailing 30 days).
-- **O13.** Whether a real Anthropic key is configured for the worker at all, and in which
-  environment (without it, R1 to R4 run against the mock provider only).
-- **O14.** W1 visual direction (default: keep the current stylized apartment, add lighting, materials,
-  furniture meshes and walk cycles; no photoreal assets) and whether W1 starts before T1.
+- **O10. Decided:** R0 ships now as a standalone fix PR, ahead of the twin phases.
+- **O11. Decided:** initial R&D ceiling is $2 per twin per week.
+- **O12. Decided:** step bands are 0 / 25 / 50 / 100% of the ceiling at 0 / 5 / 15 / 30 credits
+  earned in the trailing 30 days.
+- **O13. Decided:** the worker's provider is **OpenAI** (the operator holds an OpenAI account and
+  key). No Anthropic API key is configured, so worker-run twins use OpenAI-provider model policies;
+  `default_model_name` in `common/config.py` (`claude-sonnet-5`) is irrelevant once a policy names
+  the model. Gemini is deferred until the operator has a key and a reason; adding it is its own
+  small phase (provider class, price rows, registry entry, tests). The key lives only in the
+  gitignored `.env` (compose passes `OPENAI_API_KEY` through), never in chat or a tracked file, and
+  per decision 1 it is not set until R0 is merged. Data-warden D8 applies to OpenAI: its data-handling
+  terms are written into `docs/operator/PROVIDER_TERMS.md` before any profile text or twin note
+  enters a prompt. R&D missions default to the cheapest priced model configured.
+- **O14. Decided:** W1 keeps the stylized apartment and adds lighting, materials, furniture, walk
+  cycles and idle movement; W1 is independent of the twin phases and may start immediately, in
+  parallel with R0 (disjoint files: frontend versus gateway and worker).
 
 ## Rollback Path
 
