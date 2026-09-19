@@ -41,6 +41,12 @@ export class GeometryBatcher {
     this.place(material, geometry, x, y, z, 0);
   }
 
+  /** Adds a caller-built indexed geometry (e.g. a pyramid roof). Ownership passes to the
+   * batcher, which merges and disposes it. */
+  add(material: string, geometry: THREE.BufferGeometry, x: number, y: number, z: number, ry = 0): void {
+    this.place(material, geometry, x, y, z, ry);
+  }
+
   /** Merges each material's parts into one mesh. `castsShadow` decides per material. */
   build(materials: SceneMaterials, castsShadow: (material: string) => boolean): THREE.Group {
     const group = new THREE.Group();
