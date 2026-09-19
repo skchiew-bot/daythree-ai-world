@@ -1,5 +1,6 @@
 """R0 (ADR-013 F5): a worker may execute a task only while it holds that task's lease."""
 import asyncio
+import time
 
 import fakeredis.aioredis
 import pytest
@@ -102,6 +103,7 @@ async def test_run_treats_a_hung_redis_as_a_lost_lease_once_the_ttl_has_passed(r
     lease = _HungRefresh(redis_client, new_id(), ttl_ms=300, refresh_seconds=0.05)
     lease.refresh_timeout_seconds = 0.05
     await lease.acquire()
+    acquired_at = time.monotonic()
     finished = False
 
     async def slow_work():
@@ -112,6 +114,11 @@ async def test_run_treats_a_hung_redis_as_a_lost_lease_once_the_ttl_has_passed(r
     with pytest.raises(LeaseLostError):
         await lease.run(slow_work())
     assert finished is False
+    # The work must stop BEFORE the key can expire (another worker could then take the
+    # task while this one is still calling the provider). The check runs on a cadence of
+    # one refresh interval plus one refresh timeout, so giving up exactly at the TTL is
+    # too late; the heartbeat must leave that much margin.
+    assert time.monotonic() - acquired_at < 0.29
 
 
 @pytest.mark.asyncio

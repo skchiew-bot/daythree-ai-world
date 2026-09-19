@@ -36,10 +36,19 @@ class FakeUsageProvider:
     def __init__(self, usage: BudgetUsage | None = None):
         self.usage = usage or BudgetUsage()
         self.lookups: list = []
+        self.begun: list = []
+        self.finished: list = []
 
     async def usage_for_task(self, task_id):
         self.lookups.append(task_id)
         return self.usage
+
+    async def begin_attempt(self, worst_case):
+        self.begun.append(worst_case)
+        return len(self.begun)
+
+    async def finish_attempt(self, attempt_id, outcome):
+        self.finished.append((attempt_id, outcome))
 
 
 def make_adapter(usage_provider: FakeUsageProvider | None = None) -> tuple[DurableAgentRuntimeAdapter, InMemoryCheckpointStore]:
@@ -161,10 +170,14 @@ class _RecordingGateway:
     def __init__(self):
         self._inner = ModelGateway(providers={"mock": MockModelProvider()})
         self.usages: list[BudgetUsage] = []
+        self.ledgers: list = []
 
-    async def generate(self, request, *, budget_policy, usage, is_retry=False):
+    async def generate(self, request, *, budget_policy, usage, is_retry=False, ledger=None):
         self.usages.append(usage)
-        return await self._inner.generate(request, budget_policy=budget_policy, usage=usage, is_retry=is_retry)
+        self.ledgers.append(ledger)
+        return await self._inner.generate(
+            request, budget_policy=budget_policy, usage=usage, is_retry=is_retry, ledger=ledger
+        )
 
 
 @pytest.mark.asyncio
@@ -180,6 +193,41 @@ async def test_execute_passes_the_providers_usage_to_the_gateway_not_zero():
 
     assert gateway.usages == [usage_provider.usage]
     assert usage_provider.lookups == [context.task_id]
+
+
+@pytest.mark.asyncio
+async def test_every_gateway_call_is_made_with_the_write_ahead_ledger():
+    usage_provider = FakeUsageProvider()
+    gateway = _RecordingGateway()
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=gateway, checkpoint_store=InMemoryCheckpointStore(), usage_provider=usage_provider
+    )
+    await adapter.execute(await adapter.initialize_run(make_context()))
+
+    assert gateway.ledgers == [usage_provider]
+    assert len(usage_provider.begun) == 1 and len(usage_provider.finished) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_model_call_is_made_when_usage_cannot_be_read():
+    class _Boom(FakeUsageProvider):
+        async def usage_for_task(self, task_id):
+            raise ConnectionError("db down")
+
+    class _CountingProvider:
+        calls = 0
+
+        async def generate(self, request):
+            _CountingProvider.calls += 1
+            return await MockModelProvider().generate(request)
+
+    adapter = DurableAgentRuntimeAdapter(
+        model_gateway=ModelGateway(providers={"mock": _CountingProvider()}),
+        checkpoint_store=InMemoryCheckpointStore(), usage_provider=_Boom(),
+    )
+    with pytest.raises(ConnectionError):
+        await adapter.execute(await adapter.initialize_run(make_context()))
+    assert _CountingProvider.calls == 0
 
 
 @pytest.mark.asyncio

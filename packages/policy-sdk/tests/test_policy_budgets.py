@@ -55,3 +55,22 @@ def test_retry_within_limit_is_allowed():
     usage = BudgetUsage(retries_made=1)
     decision = evaluate_budget(POLICY, usage, requested_output_tokens=1000, is_retry=True)
     assert decision.allowed is True
+
+
+# --- R0: the call's own worst-case cost counts against the ceiling ---------------------
+
+
+def test_worst_case_cost_that_would_cross_the_ceiling_is_rejected():
+    usage = BudgetUsage(cost_spent_usd=1.95)
+    decision = evaluate_budget(POLICY, usage, requested_output_tokens=1000, worst_case_cost_usd=0.08)
+    assert decision.allowed is False
+    assert "max_model_cost_usd" in decision.reason
+
+
+def test_worst_case_cost_that_fits_under_the_ceiling_is_allowed():
+    usage = BudgetUsage(cost_spent_usd=1.90)
+    assert evaluate_budget(POLICY, usage, requested_output_tokens=1000, worst_case_cost_usd=0.08).allowed is True
+
+
+def test_worst_case_cost_defaults_to_zero_so_existing_callers_are_unchanged():
+    assert evaluate_budget(POLICY, BudgetUsage(cost_spent_usd=1.99), requested_output_tokens=1000).allowed is True

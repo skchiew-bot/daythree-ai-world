@@ -68,3 +68,59 @@ async def test_reasoning_and_newer_models_use_max_completion_tokens(model):
     await provider.generate(_request(model))
     assert completions.kwargs["max_completion_tokens"] == 777
     assert "max_tokens" not in completions.kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["gpt-4o", "gpt-4o-mini"])
+async def test_temperature_is_sent_to_models_that_accept_it(model):
+    provider, completions = _provider_with_fake_client()
+    await provider.generate(_request(model))
+    assert completions.kwargs["temperature"] == 0.2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["o1", "o3-mini", "o4-mini", "gpt-5-mini"])
+async def test_temperature_is_omitted_for_reasoning_models(model):
+    """Reasoning models reject a non-default temperature with a 400."""
+    provider, completions = _provider_with_fake_client()
+    await provider.generate(_request(model))
+    assert "temperature" not in completions.kwargs
+
+
+def test_the_sdk_client_never_retries_on_its_own(monkeypatch):
+    """Each SDK retry is another billed HTTP request the gateway's ledger cannot see."""
+    seen = {}
+
+    def _fake_client(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", _fake_client)
+    OpenAIProvider(api_key="sk-test-not-a-real-key")
+    assert seen["max_retries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_success_without_usage_is_estimated_conservatively_and_flagged():
+    provider, completions = _provider_with_fake_client()
+    original = completions.create
+
+    async def _no_usage(**kwargs):
+        response = await original(**kwargs)
+        response.usage = None
+        return response
+
+    completions.create = _no_usage
+    response = await provider.generate(_request("gpt-4o"))
+
+    assert response.usage_estimated is True
+    assert response.input_tokens >= 1  # prompt bytes / 3, never zero for a non-empty prompt
+    assert response.output_tokens == 777  # the full max_output_tokens: nothing was reported
+
+
+@pytest.mark.asyncio
+async def test_reported_usage_is_not_flagged_as_estimated():
+    provider, _ = _provider_with_fake_client()
+    response = await provider.generate(_request("gpt-4o"))
+    assert response.usage_estimated is False
+    assert (response.input_tokens, response.output_tokens) == (3, 2)

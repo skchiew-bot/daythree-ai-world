@@ -73,6 +73,21 @@ def test_anything_that_might_have_billed_is_charged_conservatively(error):
     assert cost > 0
 
 
+def test_worst_case_attempt_is_estimated_input_plus_full_max_output():
+    from model_gateway.telemetry import estimate_worst_case_attempt
+
+    assert estimate_worst_case_attempt(
+        "openai", "gpt-4o", system_prompt="a" * 300, user_prompt="", max_output_tokens=1000
+    ) == (100, 1000, Decimal("0.01025"))
+
+
+def test_worst_case_attempt_of_an_unpriced_model_raises():
+    from model_gateway.telemetry import estimate_worst_case_attempt
+
+    with pytest.raises(UnpricedModelError):
+        estimate_worst_case_attempt("openai", "nope", system_prompt="a", user_prompt="", max_output_tokens=1)
+
+
 def test_failed_attempt_on_mock_is_free():
     assert estimate_failed_attempt(
         "mock", "m", system_prompt="x" * 300, user_prompt="", max_output_tokens=1000, error=TimeoutError()

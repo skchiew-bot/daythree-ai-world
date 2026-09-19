@@ -7,9 +7,10 @@ import asyncio
 import dataclasses
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from common.db.models import Task
+from common.db.models import AuditEvent, Task
 from contracts.enums import TaskStatus
 from contracts.model import ModelRequest
 from contracts.policy import BudgetPolicy
@@ -94,46 +95,45 @@ async def test_the_lease_is_released_after_the_task_finishes(db_session, fake_re
 
 
 @pytest.mark.asyncio
-async def test_orphan_requeue_skips_a_task_whose_lease_is_live(db_session, fake_redis, seeded):
+async def test_a_task_that_keeps_coming_back_is_failed_after_the_requeue_cap(
+    db_session, fake_redis, seeded, engine_deps
+):
+    """The sweep runs every few seconds, so a task that fails for a non-model reason on
+    every recovery must not be re-run (and re-announced in the audit trail) forever. Here
+    no worker ever runs it, so the counter can only advance if the sweep itself persists it."""
     task = await _running_task(db_session, seeded)
     sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
-    await TaskLease(fake_redis, task.id).acquire()  # another worker is mid-call on it
+    publisher = engine_deps.event_publisher
 
-    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 0
-    assert await fake_redis.llen(TASK_QUEUE_KEY) == 0
+    for _ in range(MAX_AUTO_REQUEUES):
+        assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker, publisher) == 1
+    await db_session.refresh(task)
+    assert task.retry_count == MAX_AUTO_REQUEUES  # persisted by the sweep, not by a rolled-back worker
+
+    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker, publisher) == 0
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.failed.value
+    assert await fake_redis.llen(TASK_QUEUE_KEY) == MAX_AUTO_REQUEUES  # nothing queued by the last sweep
+
+    events = (
+        await db_session.execute(select(AuditEvent).where(AuditEvent.task_id == task.id))
+    ).scalars().all()
+    failed = [e for e in events if e.event_type == "task.failed"]
+    assert len(failed) == 1 and failed[0].payload["data"] == {"reason": "max_requeues"}  # no free text
+    assert any(e.event_type == "mission.failed" for e in events)
 
 
 @pytest.mark.asyncio
-async def test_orphan_requeue_recovers_a_task_once_its_lease_has_expired(db_session, fake_redis, seeded):
+async def test_a_sweep_recovery_counts_as_one_retry_not_two(db_session, fake_redis, seeded, engine_deps):
     task = await _running_task(db_session, seeded)
     sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
-    await TaskLease(fake_redis, task.id, ttl_ms=50).acquire()  # holder crashed; nobody refreshes it
-    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 0
+    await requeue_orphaned_running_tasks(fake_redis, sessionmaker, engine_deps.event_publisher)
 
-    await asyncio.sleep(0.1)
+    await process_task(fake_redis, sessionmaker, engine_deps, task.id)
 
-    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 1
-    assert await fake_redis.llen(TASK_QUEUE_KEY) == 1
-
-
-@pytest.mark.asyncio
-async def test_orphan_requeue_recovers_a_running_task_with_no_lease_at_all(db_session, fake_redis, seeded):
-    await _running_task(db_session, seeded)
-    sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
-
-    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 1
-
-
-@pytest.mark.asyncio
-async def test_orphan_requeue_gives_up_on_a_task_that_keeps_coming_back(db_session, fake_redis, seeded):
-    """The sweep now runs every few seconds, so a task that fails for a non-model reason on
-    every recovery must not be re-run (and re-announced in the audit trail) forever."""
-    task = await _running_task(db_session, seeded)
-    task.retry_count = MAX_AUTO_REQUEUES
-    await db_session.commit()
-    sessionmaker = async_sessionmaker(db_session.bind, expire_on_commit=False)
-
-    assert await requeue_orphaned_running_tasks(fake_redis, sessionmaker) == 0
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.completed.value
+    assert task.retry_count == 1  # the sweep's bump; the executor must not add a second one
 
 
 @pytest.mark.asyncio
