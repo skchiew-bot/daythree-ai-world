@@ -90,3 +90,11 @@ def test_the_local_only_guard_still_applies_with_an_expiry(script, monkeypatch, 
     assert excinfo.value.code == 2
     assert script._calls == []
     assert _SENTINEL not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["1", "3650"])
+def test_the_smallest_and_largest_allowed_expiries_are_accepted(script, monkeypatch, capsys, value):
+    _run(script, monkeypatch, "--tenant-code", "daythree-hq", "--expires-in-days", value)
+
+    assert script._calls[0]["expires_in_days"] == int(value)
+    assert capsys.readouterr().out.strip() == _SENTINEL

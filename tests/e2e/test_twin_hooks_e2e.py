@@ -118,16 +118,18 @@ class Twin:
         run, runtime, _hb = self.state(session_id)
         self.state_path(session_id).write_text(f"{run} {runtime} 0\n")
 
-    def log_classes(self) -> list[str]:
+    def last_log(self) -> list[str]:
+        """The newest hook log line as [utc, event, class, http-code, pid, ref]."""
         log = self.home / ".hook-debug" / "twin_lifecycle.log"
-        return [line.split(" ")[2] for line in log.read_text().splitlines()] if log.exists() else []
+        return log.read_text().splitlines()[-1].split(" ")
 
 
 @pytest.fixture(scope="module")
 def twin(tmp_path_factory) -> Twin:
     if BASH is None:
         pytest.skip("bash is not available")
-    if not (os.environ.get("CI") or os.environ.get("TWIN_E2E_ALLOW") == "1"):
+    on_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
+    if not (on_ci or os.environ.get("TWIN_E2E_ALLOW") == "1"):
         # This test issues (and revokes) a key and writes twin rows in the stack's own
         # tenant. CI's throwaway stack is the intended target; a developer's local stack
         # can hold real data, so it needs an explicit opt-in.
@@ -192,6 +194,21 @@ def _backdate(ids: list, hours: int = 3) -> None:
         )
 
     _db(work)
+
+
+async def _scan_for_canaries(session) -> dict:
+    """Every table, every row, as text: no CANARY token from any payload may be stored."""
+    hits = {}
+    for table in Base.metadata.sorted_tables:
+        count = (
+            await session.execute(
+                text(f'SELECT count(*) FROM "{table.name}" t WHERE row_to_json(t)::text ILIKE :pattern'),
+                {"pattern": "%CANARY-%"},
+            )
+        ).scalar_one()
+        if count:
+            hits[table.name] = count
+    return hits
 
 
 def _assert_ids_timestamps_and_enums(value, path="payload") -> None:
@@ -273,31 +290,19 @@ def test_one_session_and_two_subagents_give_one_mission_two_hook_closures_and_no
     for event in events:
         _assert_ids_timestamps_and_enums(event.payload)
 
-    async def scan(session):
-        hits = {}
-        for table in Base.metadata.sorted_tables:
-            count = (
-                await session.execute(
-                    text(f'SELECT count(*) FROM "{table.name}" t WHERE row_to_json(t)::text ILIKE :pattern'),
-                    {"pattern": "%CANARY-%"},
-                )
-            ).scalar_one()
-            if count:
-                hits[table.name] = count
-        return hits
-
-    assert _db(scan) == {}, "a canary field reached the database"
+    assert _db(_scan_for_canaries) == {}, "a canary field reached the database"
 
 
 def test_a_silent_subagent_is_reaped_a_late_close_is_200_and_a_heartbeat_keeps_a_session_alive(twin):
     started = dt.datetime.now(dt.timezone.utc)
     silent_session, silent_agent = str(uuid.uuid4()), _new_agent_id()
     live_session, live_agent = str(uuid.uuid4()), _new_agent_id()
+    canaries = _canaries()
 
-    twin.fire("SessionStart", silent_session, source="startup")
-    twin.fire("SubagentStart", silent_session, agent_id=silent_agent, agent_type="code-reviewer")
-    twin.fire("SessionStart", live_session, source="startup")
-    twin.fire("SubagentStart", live_session, agent_id=live_agent, agent_type="tdd-guide")
+    twin.fire("SessionStart", silent_session, source="startup", **canaries)
+    twin.fire("SubagentStart", silent_session, agent_id=silent_agent, agent_type="code-reviewer", **canaries)
+    twin.fire("SessionStart", live_session, source="startup", **canaries)
+    twin.fire("SubagentStart", live_session, agent_id=live_agent, agent_type="tdd-guide", **canaries)
 
     silent_run = twin.state(silent_session)[0]
     live_run = twin.state(live_session)[0]
@@ -340,14 +345,26 @@ def test_a_silent_subagent_is_reaped_a_late_close_is_200_and_a_heartbeat_keeps_a
 
     assert _db(loss_now).lost == 1
 
-    twin.fire("SubagentStop", silent_session, agent_id=silent_agent)  # the hook finally speaks: a late close
+    twin.fire("SubagentStop", silent_session, agent_id=silent_agent, **canaries)  # the hook finally speaks: a late close
+    assert twin.last_log()[2:4] == ["ok", "200"]  # the platform answered the late close with a 200
     late = _closure_for(silent_sub.id)
     assert late.late_close_at is not None and late.closed_by == "reaper"  # still failed, now marked late
     assert _db(loss_now).lost == 0
 
-    twin.fire("SubagentStop", live_session, agent_id=live_agent)
-    twin.fire("SessionEnd", live_session, reason="clear")
+    twin.fire("SubagentStop", live_session, agent_id=live_agent, **canaries)
+    twin.fire("SessionEnd", live_session, reason="clear", **canaries)
     assert _closure_for(live_sub.id).closed_by == "hook"
+
+    # The reaper's and the late close's missions get the same exposure checks as the first test's.
+    async def mission_events(session):
+        ids = [silent_parent.mission_id, live_parent.mission_id]
+        return (await session.execute(select(AuditEvent).where(AuditEvent.mission_id.in_(ids)))).scalars().all()
+
+    events = _db(mission_events)
+    assert events
+    for event in events:
+        _assert_ids_timestamps_and_enums(event.payload)
+    assert _db(_scan_for_canaries) == {}, "a canary field reached the database"
 
 
 def test_the_key_gets_no_access_to_the_operator_routes(twin):
