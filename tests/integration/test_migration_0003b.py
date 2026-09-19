@@ -77,15 +77,20 @@ def _alembic() -> Config:
 
 
 def test_revision_id_fits_alembic_version_and_is_the_only_head():
+    """Targeted at this revision's own invariants only (not "is the current head" —
+    a later migration such as 0003c_projects is expected to move the head forward
+    without breaking this test)."""
     script = ScriptDirectory.from_config(_alembic())
     assert len(REVISION) <= 32
     revision = script.get_revision(REVISION)
     assert revision.down_revision == "0003_agent_room_assignments"
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
 
 
 def test_upgrade_from_an_empty_database_creates_both_indexes(fresh_database):
-    command.upgrade(_alembic(), "head")
+    # Upgrades to this revision explicitly, not "head" — a later migration on top
+    # of 0003b must not make this test assert against the wrong revision.
+    command.upgrade(_alembic(), REVISION)
 
     assert {TASK_INDEX, TENANT_AGENT_INDEX} <= fresh_database.index_names()
     assert fresh_database.current_revision() == REVISION
@@ -99,14 +104,14 @@ def test_upgrade_from_0003_adds_the_indexes_to_an_existing_table(fresh_database)
     fresh_database.execute(f"DROP INDEX IF EXISTS {TENANT_AGENT_INDEX}")
     assert not {TASK_INDEX, TENANT_AGENT_INDEX} & fresh_database.index_names()
 
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert {TASK_INDEX, TENANT_AGENT_INDEX} <= fresh_database.index_names()
     assert fresh_database.current_revision() == REVISION
 
 
 def test_downgrade_drops_only_its_own_indexes(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
     other_before = fresh_database.index_names() - {TASK_INDEX, TENANT_AGENT_INDEX}
     room_indexes_before = fresh_database.index_names("agent_room_assignments")
 

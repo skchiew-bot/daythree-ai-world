@@ -79,15 +79,19 @@ def _alembic() -> Config:
 
 
 def test_revision_id_fits_alembic_version_and_is_the_only_head():
+    """Targeted at this revision's own invariants only — asserting the exact head
+    list (rather than "there is exactly one head") would break the moment a later
+    migration lands on top of 0003c, the same mistake fixed in
+    test_migration_0003b.py by this PR."""
     script = ScriptDirectory.from_config(_alembic())
     assert len(REVISION) <= 32
     revision = script.get_revision(REVISION)
     assert revision.down_revision == PARENT_REVISION
-    assert script.get_heads() == [REVISION]
+    assert len(script.get_heads()) == 1
 
 
 def test_upgrade_from_an_empty_database_creates_both_tables(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert {"projects", "mission_projects"} <= fresh_database.table_names()
     assert fresh_database.current_revision() == REVISION
@@ -113,19 +117,19 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_missions_or_tasks(fre
         f"('{agent_id}', '{tenant_id}', 'AGT-POP', 'Pop Agent', 'active')"
     )
     fresh_database.execute(
-        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, budget_policy) VALUES "
-        f"('{mission_id}', '{tenant_id}', 'MSN-POP', 't', 'o', 'draft', '{{}}')"
+        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, priority, risk_level, budget_policy) VALUES "
+        f"('{mission_id}', '{tenant_id}', 'MSN-POP', 't', 'o', 'draft', 'normal', 'low', '{{}}')"
     )
     fresh_database.execute(
-        f"INSERT INTO tasks (id, mission_id, assigned_agent_id, title, instructions, idempotency_key, budget_policy) "
-        f"VALUES ('{task_id}', '{mission_id}', '{agent_id}', 't', 'i', 'idem-pop', '{{}}')"
+        f"INSERT INTO tasks (id, mission_id, assigned_agent_id, title, instructions, status, retry_count, idempotency_key, budget_policy, input_context) "
+        f"VALUES ('{task_id}', '{mission_id}', '{agent_id}', 't', 'i', 'queued', 0, 'idem-pop', '{{}}', '{{}}')"
     )
     missions_columns_before = {
         r["column_name"]
         for r in _run(fresh_database.dsn, "SELECT column_name FROM information_schema.columns WHERE table_name = 'missions'")
     }
 
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     assert fresh_database.current_revision() == REVISION
     assert {"projects", "mission_projects"} <= fresh_database.table_names()
@@ -139,7 +143,7 @@ def test_upgrade_on_a_populated_database_adds_no_column_to_missions_or_tasks(fre
 
 
 def test_downgrade_drops_both_tables_and_leaves_missions_and_tasks_untouched(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     command.downgrade(_alembic(), PARENT_REVISION)
 
@@ -149,7 +153,7 @@ def test_downgrade_drops_both_tables_and_leaves_missions_and_tasks_untouched(fre
 
 
 def test_composite_fk_rejects_a_mission_project_row_naming_another_tenants_project(fresh_database):
-    command.upgrade(_alembic(), "head")
+    command.upgrade(_alembic(), REVISION)
 
     tenant_a = str(uuid.uuid4())
     tenant_b = str(uuid.uuid4())
@@ -164,8 +168,8 @@ def test_composite_fk_rejects_a_mission_project_row_naming_another_tenants_proje
         f"('{agent_a}', '{tenant_a}', 'AGT-A', 'A', 'active')"
     )
     fresh_database.execute(
-        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, budget_policy) VALUES "
-        f"('{mission_a}', '{tenant_a}', 'MSN-A', 't', 'o', 'draft', '{{}}')"
+        f"INSERT INTO missions (id, tenant_id, mission_code, title, objective, status, priority, risk_level, budget_policy) VALUES "
+        f"('{mission_a}', '{tenant_a}', 'MSN-A', 't', 'o', 'draft', 'normal', 'low', '{{}}')"
     )
     fresh_database.execute(
         f"INSERT INTO projects (id, tenant_id, code, name, status) VALUES "

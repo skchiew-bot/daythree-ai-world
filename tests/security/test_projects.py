@@ -339,3 +339,56 @@ async def test_mission_cannot_link_to_an_archived_project(client, tenant_with_us
         },
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_project_ids_for_missions_never_returns_a_link_outside_its_tenant(
+    tenant_with_users, second_tenant_admin, db_session
+):
+    """Security review follow-up on PR #26 (LOW): `_project_ids_for_missions`
+    (used by both `GET /missions` and every mission response builder) filters
+    `MissionProject.tenant_id` explicitly, matching `agent_rooms.py`'s
+    `_project_id_by_mission`. Calling it with the wrong tenant for an otherwise
+    real mission/project link must return nothing for that mission."""
+    from common.db.models import Agent, AgentVersion, Mission, MissionProject, ModelPolicy
+    from contracts.enums import AgentLifecycleState, AutonomyLevel, MissionStatus
+    from contracts.policy import ToolPolicy
+
+    from api.routes.missions import _project_ids_for_missions
+
+    tenant = tenant_with_users["tenant"]
+    project = Project(id=new_id(), tenant_id=tenant.id, code="TENFLT", name="n", status=ProjectStatus.active.value)
+    db_session.add(project)
+    policy = ModelPolicy(
+        id=new_id(), tenant_id=tenant.id, name="mock-policy-3", primary_provider="mock", primary_model="mock",
+    )
+    db_session.add(policy)
+    await db_session.flush()
+    agent = Agent(
+        id=new_id(), tenant_id=tenant.id, agent_code="AGT-TF", display_name="Agent",
+        lifecycle_state=AgentLifecycleState.active.value,
+    )
+    db_session.add(agent)
+    await db_session.flush()
+    version = AgentVersion(
+        id=new_id(), agent_id=agent.id, version=1, system_prompt="x", runtime_adapter="custom_durable",
+        model_policy_id=policy.id, autonomy_level=AutonomyLevel.a1.value,
+        tool_policy=ToolPolicy.allow_only([]).model_dump(), checksum="x",
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    mission = Mission(
+        id=new_id(), tenant_id=tenant.id, mission_code="MSN-TF", title="t", objective="o",
+        status=MissionStatus.draft.value, budget_policy={}, assigned_agent_id=agent.id,
+    )
+    db_session.add(mission)
+    await db_session.flush()
+    db_session.add(MissionProject(mission_id=mission.id, tenant_id=tenant.id, project_id=project.id))
+    await db_session.commit()
+
+    correct = await _project_ids_for_missions(db_session, [mission.id], tenant.id)
+    assert correct == {mission.id: project.id}
+
+    wrong_tenant = await _project_ids_for_missions(db_session, [mission.id], second_tenant_admin["tenant"].id)
+    assert wrong_tenant == {}
