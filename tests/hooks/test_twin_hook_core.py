@@ -480,16 +480,77 @@ def test_subagent_start_with_a_registered_state_never_registers_a_second_session
     assert kinds == ["session", "subagent"]
 
 
-def test_a_session_whose_registration_never_landed_is_registered_again_before_its_first_subagent(hook):
+_UNREGISTERED_EVENTS = [
+    ("SubagentStart", {"agent_id": "a1b2c3d4e5f60718", "agent_type": "planner"}),
+    ("SubagentStop", {"agent_id": "a1b2c3d4e5f60718"}),
+    ("Stop", {}),
+    ("UserPromptSubmit", {}),
+    ("SessionEnd", {"reason": "clear"}),
+]
+
+
+@pytest.mark.parametrize("event,fields", _UNREGISTERED_EVENTS)
+def test_with_a_state_that_has_no_runtime_id_every_event_but_session_start_sends_nothing(hook, event, fields):
     session_id, run = new_session_id(), new_session_id()
     hook.put_state(session_id, run, "-", 0)
 
-    hook.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+    hook.fire(event, session_id, **fields)
 
-    first, second = hook.requests()
-    assert first["body"] == {"kind": "session", "external_session_ref": run}
-    assert second["body"]["parent_external_session_ref"] == run
-    assert hook.state(session_id)[1] != "-"
+    assert hook.requests() == []
+    assert hook.last_log()[1:4] == [event, "not_registered", "-"]
+
+
+def test_not_registered_counts_as_a_failure_only_for_a_lost_subagent(hook):
+    session_id, run = new_session_id(), new_session_id()
+    hook.put_state(session_id, run, "-", 0)
+
+    for event, fields in _UNREGISTERED_EVENTS[:-1]:
+        hook.fire(event, session_id, **fields)
+
+    assert hook.failure_count("SubagentStart") == 1 and hook.failure_count("SubagentStop") == 1
+    assert hook.failure_count("Stop") == 0 and hook.failure_count("UserPromptSubmit") == 0
+
+
+def test_session_end_with_an_unregistered_state_still_deletes_the_state_file(hook):
+    session_id = new_session_id()
+    hook.put_state(session_id, new_session_id(), "-", 0)
+
+    hook.fire("SessionEnd", session_id, reason="clear")
+
+    assert hook.state(session_id) is None and hook.requests() == []
+
+
+@pytest.mark.parametrize("source", ["compact", "startup"])
+def test_session_start_with_an_unregistered_state_registers_the_same_run_once(hook, source):
+    session_id, run = new_session_id(), new_session_id()
+    hook.put_state(session_id, run, "-", 0)
+
+    hook.fire("SessionStart", session_id, source=source)
+
+    assert hook.requests() == [
+        {"method": "POST", "path": SESSIONS, "body": {"kind": "session", "external_session_ref": run}}
+    ]
+    assert hook.state(session_id)[0] == run and hook.state(session_id)[1] != "-"
+
+
+@pytest.mark.parametrize("source", ["resume", "clear", "fork"])
+def test_resume_clear_and_fork_still_mint_a_new_run_over_an_unregistered_state(hook, source):
+    session_id, run = new_session_id(), new_session_id()
+    hook.put_state(session_id, run, "-", 0)
+
+    hook.fire("SessionStart", session_id, source=source)
+
+    assert hook.state(session_id)[0] != run and len(hook.requests()) == 1
+
+
+def test_a_not_registered_log_line_follows_the_fixed_grammar(hook):
+    session_id = new_session_id()
+    hook.put_state(session_id, new_session_id(), "-", 0)
+    hook.fire("SubagentStart", session_id, agent_id=new_agent_id())
+
+    (line,) = hook.log_file.read_text().splitlines()
+
+    assert LOG_LINE.match(line), line
 
 
 def test_session_end_removes_the_state_file_and_a_second_one_sends_nothing(hook):

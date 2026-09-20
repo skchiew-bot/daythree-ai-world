@@ -42,7 +42,14 @@
 # State and log (gitignored, ids and enums only, never a secret):
 #   .hook-debug/twin-state/<claude-session-id>   "run-uuid runtime-uuid|- last-heartbeat-epoch"
 #   .hook-debug/twin_lifecycle.log               "UTC event class http-code pid [8-char ref]"
+#       (class is an enum such as ok, throttled, no_state, not_registered, conn_fail)
 #   .hook-debug/twin-failures/<event>            one epoch line per failure, counted at Gate E
+#
+# Registration happens in exactly two places: a SessionStart event, and the 409
+# `parent_session_ended` recovery on a SubagentStart. If the platform was unreachable at
+# SessionStart the state keeps `run -` (no runtime id) and every later event of that session
+# (SubagentStart, SubagentStop, Stop, UserPromptSubmit, SessionEnd) sends nothing and logs
+# `not_registered`; that session's subagents are untracked until its next SessionStart.
 #
 # Known limits: the log and the failure files are trimmed by rewriting them past 256 KiB; a line
 # appended by a parallel hook during that rewrite can be lost (the state file, which matters, is
@@ -166,6 +173,9 @@ finish() {
   log_line "$1" "${2:--}" "$ref"
   case $1 in
     ok | throttled | ignored | duplicate | reused | reregistered) ;;
+    not_registered) # a lost subagent counts; a skipped heartbeat or session end is only noise
+      case $EVENT in SubagentStart | SubagentStop) bump_failure ;; esac
+      ;;
     *) bump_failure ;;
   esac
   exit 0
@@ -362,25 +372,6 @@ register_session() { # run-uuid -> REG_RT ; 0 on a 2xx carrying a valid runtime 
   return 0
 }
 
-# State exists but the session never registered (the platform was unreachable at start, so
-# the state has no runtime id): re-POST the SAME minted run uuid already in that state, at
-# most once per invocation. The server is idempotent on that ref, so this can never create a
-# second Mission. Never called when there is no state file (that is a logged miss, T3-F12),
-# and never by a heartbeat that already has a runtime id. The attempt is stamped in the state
-# BEFORE the call and stays stamped on failure, so an outage costs one slow call per throttle
-# window (300 s on a heartbeat, 60 s on a subagent start), not one per event.
-ensure_session() {
-  now_epoch
-  write_state "$S_RUN" - "$NOW"
-  if register_session "$S_RUN"; then
-    S_RT=$REG_RT
-    now_epoch
-    write_state "$S_RUN" "$S_RT" "$NOW"
-  else
-    fail_from_response
-  fi
-}
-
 # ---------------------------------------------------------------- event handlers
 
 on_session_start() {
@@ -388,10 +379,13 @@ on_session_start() {
   source=$(pair_get "$PAIRS" source)
   case $source in startup | resume | clear | compact | fork) ;; *) finish bad_source ;; esac
   read_state
-  if [ "$source" = compact ] && [ "$S_OK" = 1 ]; then LOG_REF=$S_RUN; finish reused; fi
-  if [ "$source" = startup ] && [ "$S_OK" = 1 ]; then
+  # A state with a runtime id is registered: compact reuses it, a repeated startup is a
+  # duplicate. A state WITHOUT one (the last registration failed) registers the SAME run uuid
+  # again (the server is idempotent on it, so it can never create a second Mission).
+  if [ "$source" = compact ] && [ "$S_OK" = 1 ] && [ "$S_RT" != - ]; then LOG_REF=$S_RUN; finish reused; fi
+  if [ "$source" = startup ] && [ "$S_OK" = 1 ] && [ "$S_RT" != - ]; then LOG_REF=$S_RUN; finish duplicate; fi
+  if { [ "$source" = startup ] || [ "$source" = compact ]; } && [ "$S_OK" = 1 ]; then
     LOG_REF=$S_RUN
-    if [ "$S_RT" != - ]; then finish duplicate; fi
     run=$S_RUN
   else
     mint_uuid
@@ -404,8 +398,8 @@ on_session_start() {
     finish ok "$HTTP_CODE"
   fi
   class_for_code "$HTTP_CODE"
-  now_epoch
-  case $CLASS in conn_fail | server_error) write_state "$run" - "$NOW" ;; esac
+  # Keep the minted run so the next SessionStart can register the same one; no runtime id yet.
+  case $CLASS in conn_fail | server_error) write_state "$run" - 0 ;; esac
   finish "$CLASS" "$HTTP_CODE"
 }
 
@@ -428,14 +422,9 @@ on_subagent_start() {
   # state was lost): log a miss and send nothing. A session is never registered from a
   # subagent event.
   if ! read_state; then finish no_state; fi
-  if [ "$S_RT" = - ]; then
-    # The session never registered. Retry that at most once a minute: while the platform is
-    # down, each subagent start must not add another slow call.
-    now_epoch
-    elapsed=$((NOW - 10#$S_HB))
-    if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt 60 ]; then finish backoff; fi
-    ensure_session
-  fi
+  # The session's registration never landed: it has no Mission on the platform to put a Task
+  # under, and only SessionStart registers a session. Send nothing.
+  if [ "$S_RT" = - ]; then finish not_registered; fi
   post_subagent "$ref" "$S_RUN" "$frag"
   case $HTTP_CODE in
     2??) finish ok "$HTTP_CODE" ;;
@@ -468,6 +457,8 @@ on_subagent_stop() {
   ref=$(pair_get "$PAIRS" agent_id)
   if [[ ! $ref =~ $REF_RE ]]; then finish bad_ref; fi
   LOG_REF=$ref
+  # A session whose registration never landed has no subagents on the platform: send nothing.
+  if read_state && [ "$S_RT" = - ]; then finish not_registered; fi
   # Declared, not measured: the payload carries no outcome and no tool-call count, so the
   # hook reports a completed close with a fixed reason and nothing else.
   api_call POST "/api/v1/agent-runtime/subagents/$ref/close" '{"outcome":"completed","reason_code":"hook_reported"}'
@@ -482,16 +473,13 @@ on_heartbeat() {
   local elapsed
   if ! read_state; then finish no_state; fi
   LOG_REF=$S_RUN
+  if [ "$S_RT" = - ]; then finish not_registered; fi # a heartbeat is never a registration
   now_epoch
   elapsed=$((NOW - 10#$S_HB))
   if [ "$elapsed" -ge 0 ] && [ "$elapsed" -lt "$HEARTBEAT_SECONDS" ]; then finish throttled; fi
-  if [ "$S_RT" = - ]; then
-    ensure_session # stamps the attempt first; a successful registration counts as the heartbeat
-    finish ok "$HTTP_CODE"
-  fi
   # Stamp the attempt, not the success: a platform outage must not add a slow call to every
   # prompt. The reaper window (2 hours) is far longer than this interval. Re-read first: a
-  # SessionEnd or a re-registration that ran in parallel must not be overwritten.
+  # SessionEnd or a 409 recovery that ran in parallel must not be overwritten.
   local run=$S_RUN
   if ! read_state || [ "$S_RUN" != "$run" ]; then finish no_state; fi
   write_state "$S_RUN" "$S_RT" "$NOW"
@@ -511,7 +499,7 @@ on_session_end() {
   CLEANUP_STATE=1 # the state file goes on every path from here, even a corrupt one
   if ! read_state; then finish no_state; fi
   LOG_REF=$S_RUN
-  if [ "$S_RT" = - ]; then finish no_state; fi
+  if [ "$S_RT" = - ]; then finish not_registered; fi # nothing to end; the state file still goes
   api_call PATCH "/api/v1/agent-runtime/sessions/$S_RT" "{\"outcome\":\"$outcome\"}"
   case $HTTP_CODE in 2??) finish ok "$HTTP_CODE" ;; esac
   fail_from_response

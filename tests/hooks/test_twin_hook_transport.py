@@ -137,15 +137,24 @@ def test_a_platform_with_no_listener_is_a_quiet_counted_failure(tmp_path):
     assert hook.failure_count("SessionStart") == 1
 
 
-def test_a_registration_that_could_not_connect_leaves_a_recoverable_state(tmp_path):
+def test_a_failed_session_start_registration_leaves_the_state_at_run_dash(tmp_path):
     hook = Hook(tmp_path, dry_run=False)
     hook.write_key_file(f"http://127.0.0.1:{_free_port()}")
     session_id = new_session_id()
 
     hook.fire("SessionStart", session_id, source="startup")
 
-    run, runtime, _heartbeat = hook.state(session_id)
-    assert runtime == "-" and run != session_id
+    run, runtime, heartbeat = hook.state(session_id)
+    assert runtime == "-" and heartbeat == 0 and run != session_id
+
+
+def test_a_5xx_session_start_registration_also_leaves_the_state_at_run_dash(live, stub):
+    stub.on("POST", SESSIONS, (500, "{}"))
+    session_id = new_session_id()
+
+    live.fire("SessionStart", session_id, source="startup")
+
+    assert live.state(session_id)[1:] == ("-", 0) and live.last_log()[2] == "server_error"
 
 
 def test_a_client_error_on_registration_leaves_no_state(live, stub):
@@ -434,34 +443,64 @@ def test_a_key_file_with_windows_line_endings_still_works(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Limited re-registration (coordinator decision): only the SAME run, only when the state has
-# no runtime id, at most once per invocation, never with no state at all
+# Registration happens only at SessionStart and in the 409 recovery (operator decision)
 # ---------------------------------------------------------------------------
 
 
-def test_re_registration_re_posts_only_the_run_already_in_the_state_and_only_once(live, stub):
+def _tripwire(stub: Stub) -> list:
+    """Make any request the stub receives a recorded failure (and answer 500 so it is loud)."""
+    hits: list = []
+
+    def responder(request):
+        hits.append((request["method"], request["path"]))
+        return 500, '{"detail":"a test that must never be hit was hit"}'
+
+    stub.responder = responder
+    return hits
+
+
+@pytest.mark.parametrize(
+    "event,fields",
+    [
+        ("SubagentStart", {"agent_id": "a1b2c3d4e5f60718", "agent_type": "planner"}),
+        ("SubagentStop", {"agent_id": "a1b2c3d4e5f60718"}),
+        ("Stop", {}),
+        ("UserPromptSubmit", {}),
+        ("SessionEnd", {"reason": "clear"}),
+    ],
+)
+def test_with_a_state_that_has_no_runtime_id_no_event_but_session_start_makes_any_request(live, stub, event, fields):
+    hits = _tripwire(stub)
     session_id, run = new_session_id(), str(uuid.uuid4())
     live.put_state(session_id, run, "-", 0)
-    stub.on("POST", SESSIONS, (403, '{"detail":"forbidden"}'))
 
-    live.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+    live.fire(event, session_id, **fields)
 
-    assert len(stub.seen) == 1  # one re-POST, no retry on a 4xx, and the subagent is never sent
-    assert json.loads(stub.seen[0]["body"]) == {"kind": "session", "external_session_ref": run}
-    assert live.state(session_id)[:2] == (run, "-")  # still the same run, still unregistered
+    assert hits == [] and stub.seen == []
+    assert live.last_log()[2] == "not_registered"
 
 
-def test_re_registration_reuses_the_same_run_for_the_session_and_its_subagent(live, stub):
+def test_session_start_compact_with_an_unregistered_state_registers_once_with_the_same_run(live, stub):
+    session_id, run = new_session_id(), str(uuid.uuid4())
+    live.put_state(session_id, run, "-", 0)
+    stub.on("POST", SESSIONS, CREATED)
+
+    live.fire("SessionStart", session_id, source="compact")
+
+    assert stub.bodies("POST", SESSIONS) == [{"kind": "session", "external_session_ref": run}]
+    assert live.state(session_id)[:2] == (run, RUNTIME_ID)  # the same run, now with its runtime id
+
+
+def test_after_that_registration_the_session_works_normally(live, stub):
     session_id, run = new_session_id(), str(uuid.uuid4())
     live.put_state(session_id, run, "-", 0)
     stub.on("POST", SESSIONS, CREATED, (201, "{}"))
 
-    live.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
+    live.fire("SessionStart", session_id, source="compact")
+    live.fire("SubagentStart", session_id, agent_id="a1b2c3d4e5f60718", agent_type="planner")
 
     first, second = stub.bodies("POST", SESSIONS)
-    assert first == {"kind": "session", "external_session_ref": run}
-    assert second["parent_external_session_ref"] == run  # one Mission's worth of refs, never a second run
-    assert live.state(session_id)[:2] == (run, RUNTIME_ID)
+    assert first["external_session_ref"] == run and second["parent_external_session_ref"] == run
 
 
 def test_a_heartbeat_with_a_runtime_id_never_re_posts(live, stub):
@@ -566,58 +605,34 @@ def _hold_hook(tmp_path):
     return hook, listener
 
 
-def test_a_registration_outage_costs_one_slow_call_then_every_event_is_quick(tmp_path):
+def test_a_platform_that_never_answers_costs_one_attempt_at_session_start_and_nothing_afterwards(tmp_path):
     hook, listener = _hold_hook(tmp_path)
-    session_id, run = new_session_id(), str(uuid.uuid4())
-    hook.put_state(session_id, run, "-", 0)
+    session_id = new_session_id()
     elapsed = {}
 
     try:
         for label, event, fields in (
+            ("start", "SessionStart", {"source": "startup"}),
             ("stop", "Stop", {}),
             ("prompt", "UserPromptSubmit", {}),
             ("subagent", "SubagentStart", {"agent_id": new_agent_id(), "agent_type": "planner"}),
-            ("stop-again", "Stop", {}),
+            ("subagent-stop", "SubagentStop", {"agent_id": new_agent_id()}),
+            ("end", "SessionEnd", {"reason": "clear"}),
         ):
             started = time.monotonic()
             hook.fire(event, session_id, **fields)
             elapsed[label] = time.monotonic() - started
+            if label == "start":
+                assert hook.state(session_id)[1:] == ("-", 0)
         connections = listener.connections
     finally:
         listener.close()
 
-    assert connections == 1  # one registration attempt in total, never a second
-    assert elapsed["stop"] < 6  # the 2 s attempt (no retry: the budget is spent), not two of them
-    assert max(elapsed["prompt"], elapsed["subagent"], elapsed["stop-again"]) < elapsed["stop"] + 1
-    assert [line[2] for line in hook.log_lines()] == ["conn_fail", "throttled", "backoff", "throttled"]
-    assert hook.state(session_id)[:2] == (run, "-") and hook.state(session_id)[2] > 0  # the attempt is stamped
-
-
-def test_a_failed_registration_stamps_the_state_so_the_next_minute_of_subagents_back_off(tmp_path):
-    hook, listener = _hold_hook(tmp_path)
-    session_id = new_session_id()
-
-    try:
-        hook.fire("SessionStart", session_id, source="startup")
-        hook.fire("SubagentStart", session_id, agent_id=new_agent_id(), agent_type="planner")
-        connections = listener.connections
-    finally:
-        listener.close()
-
-    assert connections == 1
-    assert [line[2] for line in hook.log_lines()] == ["conn_fail", "backoff"]
-
-
-def test_twenty_stop_events_with_an_unregistered_session_make_at_most_one_registration_post(live, stub):
-    session_id, run = new_session_id(), str(uuid.uuid4())
-    live.put_state(session_id, run, "-", 0)
-    stub.on("POST", SESSIONS, (403, '{"detail":"forbidden"}'))
-
-    for _ in range(20):
-        live.fire("Stop", session_id)
-
-    assert len([r for r in stub.seen if r["method"] == "POST"]) <= 1
-    assert live.state(session_id)[1] == "-"
+    assert connections == 1  # the SessionStart's single attempt (no retry after a 2 s hang), nothing else
+    assert elapsed["start"] < 8  # one 2 s attempt plus process start-up on a slow machine
+    assert max(v for k, v in elapsed.items() if k != "start") < 5  # nothing afterwards waits on the network
+    assert [line[2] for line in hook.log_lines()] == ["conn_fail"] + ["not_registered"] * 5
+    assert hook.state(session_id) is None  # SessionEnd still removed the state file
 
 
 def test_two_parallel_subagent_starts_on_an_ended_run_share_one_new_run(live, stub):
