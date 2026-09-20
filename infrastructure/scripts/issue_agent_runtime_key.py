@@ -22,6 +22,7 @@ Safety:
 
 Usage:
     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq
+    python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq --expires-in-days 90
     python infrastructure/scripts/issue_agent_runtime_key.py --tenant-code daythree-hq --revoke <key-id>
 """
 from __future__ import annotations
@@ -31,7 +32,7 @@ import asyncio
 import secrets
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 from sqlalchemy import select
@@ -46,6 +47,7 @@ from contracts.ids import new_id
 logger = structlog.get_logger(__name__)
 
 _LOCAL_HOST_MARKERS = ("localhost", "127.0.0.1")
+_MAX_EXPIRES_IN_DAYS = 3650
 
 
 def _is_local_database_url(url: str) -> bool:
@@ -88,10 +90,11 @@ async def _ensure_service_user(session, tenant: Tenant) -> User:
     return user
 
 
-async def _issue_key(session, user: User, label: str) -> str:
+async def _issue_key(session, user: User, label: str, expires_in_days: int | None = None) -> str:
     secret = secrets.token_urlsafe(32)
+    expires_at = None if expires_in_days is None else datetime.now(timezone.utc) + timedelta(days=expires_in_days)
     key = AgentRuntimeApiKey(
-        id=new_id(), user_id=user.id, key_hash=sha256_hex(secret), label=label,
+        id=new_id(), user_id=user.id, key_hash=sha256_hex(secret), label=label, expires_at=expires_at,
     )
     session.add(key)
     await session.flush()
@@ -99,15 +102,16 @@ async def _issue_key(session, user: User, label: str) -> str:
     return f"dtk_{key.id.hex}_{secret}"
 
 
-async def issue(tenant_code: str, *, label: str) -> str:
+async def issue(tenant_code: str, *, label: str, expires_in_days: int | None = None) -> str:
     """Always additive -- never revokes an existing key. Safe to call again for a
     tenant that already has a live key: rotation is issue-new-then-revoke-old, and the
-    old key stays valid until a separate `revoke(...)` call names it."""
+    old key stays valid until a separate `revoke(...)` call names it. `expires_in_days`
+    (T3-F18) stores an expiry that many days ahead; omitted means the key never expires."""
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
         tenant = await _get_tenant(session, tenant_code)
         user = await _ensure_service_user(session, tenant)
-        token = await _issue_key(session, user, label)
+        token = await _issue_key(session, user, label, expires_in_days)
         await session.commit()
         return token
 
@@ -137,6 +141,10 @@ def main() -> None:
     parser.add_argument("--tenant-code", required=True)
     parser.add_argument("--label", default="issued via issue_agent_runtime_key.py")
     parser.add_argument(
+        "--expires-in-days", type=int, default=None, metavar="N",
+        help=f"Expire the new key N days from now (1-{_MAX_EXPIRES_IN_DAYS}); omitted means it never expires.",
+    )
+    parser.add_argument(
         "--revoke", metavar="KEY_ID", default=None,
         help="Revoke this key id for the tenant instead of issuing a new one.",
     )
@@ -145,6 +153,8 @@ def main() -> None:
         help="Required to run against a DATABASE_URL that is not localhost/127.0.0.1.",
     )
     args = parser.parse_args()
+    if args.expires_in_days is not None and not 1 <= args.expires_in_days <= _MAX_EXPIRES_IN_DAYS:
+        parser.error(f"--expires-in-days must be between 1 and {_MAX_EXPIRES_IN_DAYS}.")
 
     settings = get_settings()
     if not args.allow_remote and not _is_local_database_url(settings.database_url):
@@ -160,7 +170,8 @@ def main() -> None:
         print(f"Revoked key {args.revoke} for tenant {args.tenant_code}.")
         return
 
-    token = asyncio.run(issue(args.tenant_code, label=args.label))
+    issue_kwargs = {} if args.expires_in_days is None else {"expires_in_days": args.expires_in_days}
+    token = asyncio.run(issue(args.tenant_code, label=args.label, **issue_kwargs))
     print(token)
 
 
